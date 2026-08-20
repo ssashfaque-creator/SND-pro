@@ -12,6 +12,8 @@ htmlcov/
 *.sqlite
 *.sqlite3
 .DS_Store
+data/sample/*
+!data/sample/.gitkeep
 data/processed/
 data/incoming/*
 !data/incoming/.gitkeep

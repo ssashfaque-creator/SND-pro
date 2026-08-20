@@ -26,6 +26,9 @@ def test_full_pipeline_detects_injected_signals(demo, tmp_path):
     assert not loaded.empty, f"expected trade-load anomaly, got {anomalies.head().to_dict()}"
     assert "trade_loading" in set(loaded["kind"]) | types
 
+    alamdar = insights[insights["entity_id"].astype(str).str.contains("Alamdar", na=False)]
+    assert not alamdar.empty or "divergence" in types
+
     lapsed_flags = []
     if not anomalies.empty:
         lapsed_flags += anomalies[anomalies["store_id"] == "T0001999002"]["kind"].tolist()

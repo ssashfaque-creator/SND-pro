@@ -137,10 +137,10 @@ def build_universe(n_shops: int = 160, seed: int = 7) -> pd.DataFrame:
             "store_id": "T0001999001",
             "store_name": "Dump Corner Store",
             "distributor": "Agha Traders (Quetta)",
-            "dsr_name": "ASHRAF KHAN",
+            "dsr_name": "IMRAN BALOCH",
             "zone": "West",
             "city": "Quetta",
-            "section": "Alamdar Road",
+            "section": "Jinnah Road",
         }
     )
     rows[2].update(
@@ -203,7 +203,7 @@ def simulate_sales(stores: pd.DataFrame, start: str = "2024-01", end: str = "202
             base *= 1.0 + 0.004 * (p - periods[0]).n
             base *= float(rng.lognormal(0, 0.18))
             # Alamdar Road local failure in last 4 months while Quetta still OK.
-            if shop["section"] == "Alamdar Road" and months_from_end <= 3 and sid not in {"T0001999001"}:
+            if shop["section"] == "Alamdar Road" and months_from_end <= 3 and sid != "T0001999001":
                 base *= 0.55
             # Lapsed mart: last 4 months zero after being regular.
             if sid == "T0001999002" and months_from_end <= 3:

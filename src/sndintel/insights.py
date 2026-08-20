@@ -35,7 +35,7 @@ def compile_insights(
     kpis = build_kpi_snapshots(shop_month, stores, sales, period, prev)
     rows: list[dict[str, Any]] = []
     rows += _coverage_insights(kpis, stores, shop_month, period)
-    rows += _divergence_insights(kpis, period)
+    rows += _divergence_insights(kpis, shop_month, period)
     rows += _anomaly_insights(anomalies, shop_month, period)
     rows += _segment_insights(segments, shop_month, period)
     rows += _cannibalization_insights(sales, period, prev)
@@ -99,7 +99,7 @@ def build_kpi_snapshots(
     )
 
     grains = {
-        "national": [None],
+        "national": None,
         "zone": "zone",
         "city": "city",
         "section": "section",
@@ -108,9 +108,13 @@ def build_kpi_snapshots(
     }
     for grain, col in grains.items():
         if col is None:
-            groups = [( "ALL", current, previous, yoy, universe )]
+            groups = [("ALL", current, previous, yoy, universe)]
         else:
-            keys = sorted(set(universe[col].dropna().unique()) | set(current[col].dropna().unique()))
+            if col not in universe.columns and col not in current.columns:
+                continue
+            uni_keys = set(universe[col].dropna().unique()) if col in universe.columns else set()
+            cur_keys = set(current[col].dropna().unique()) if col in current.columns else set()
+            keys = sorted({str(k) for k in (uni_keys | cur_keys)})
             groups = []
             for key in keys:
                 groups.append(
@@ -232,41 +236,74 @@ def _coverage_insights(kpis: pd.DataFrame, stores: pd.DataFrame, shop_month: pd.
     return rows
 
 
-def _divergence_insights(kpis: pd.DataFrame, period: str) -> list[dict]:
+def _divergence_insights(kpis: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> list[dict]:
+    """Flag local execution misses: a section/DSR down while its city/distributor is not.
+
+    Parent rates exclude shops whose latest drop is > 4x their own prior month so a
+    single stock dump cannot make every other beat look like a failure.
+    """
     rows = []
-    sections = kpis[(kpis["grain"] == "section") & (kpis["period"] == period)].copy()
-    cities = kpis[(kpis["grain"] == "city") & (kpis["period"] == period)].set_index("grain_id")
-    national = kpis[(kpis["grain"] == "national") & (kpis["period"] == period)]
-    nat_mom = float(national["mom_pct"].iloc[0]) if not national.empty and pd.notna(national["mom_pct"].iloc[0]) else 0.0
-    # Need city on section — join via volume-weighted guess from kpi alone isn't enough.
-    # Use section vs national as a robust fallback, plus city if we stored it.
-    for _, r in sections.iterrows():
-        mom = r["mom_pct"]
-        if mom is None or pd.isna(mom):
+    prev = previous_period(period)
+    cur = shop_month[shop_month["period"] == period].copy()
+    prv = shop_month[shop_month["period"] == prev].copy()
+    if cur.empty or prv.empty:
+        return rows
+
+    merged = cur.merge(prv[["store_id", "volume_mt"]], on="store_id", how="left", suffixes=("", "_prev"))
+    merged["volume_mt_prev"] = merged["volume_mt_prev"].fillna(0)
+    dump_ids = set(
+        merged.loc[
+            (merged["volume_mt_prev"] > 0.02) & (merged["volume_mt"] >= merged["volume_mt_prev"] * 4),
+            "store_id",
+        ]
+    )
+    parent = merged[~merged["store_id"].isin(dump_ids)] if dump_ids else merged
+
+    def _mom(frame: pd.DataFrame) -> float | None:
+        a = float(frame["volume_mt"].sum())
+        b = float(frame["volume_mt_prev"].sum()) if "volume_mt_prev" in frame.columns else 0.0
+        if b <= 0:
+            return None
+        return (a - b) / b * 100
+
+    nat_mom = _mom(parent)
+    for section, part in parent.groupby("section"):
+        if part["volume_mt"].sum() < 0.25:
             continue
-        parent_mom = nat_mom
-        parent_name = "national"
-        gap = float(mom) - parent_mom
-        if abs(gap) < DIVERGENCE_GAP_PP:
+        mom = _mom(part)
+        if mom is None:
             continue
-        if r["volume_mt"] < 0.3:
-            continue
+        city = part["city"].dropna().mode()
+        city_name = str(city.iloc[0]) if len(city) else None
+        city_part = parent[parent["city"] == city_name] if city_name else parent
+        parent_mom = _mom(city_part)
+        parent_label = city_name or "national"
+        if parent_mom is None:
+            parent_mom = nat_mom or 0.0
+            parent_label = "national"
+        gap = float(mom) - float(parent_mom)
         if gap <= -DIVERGENCE_GAP_PP and mom < 0:
             rows.append(
                 _insight(
                     type="divergence",
                     severity="critical" if gap <= -25 else "high",
                     entity_type="section",
-                    entity_id=r["grain_id"],
-                    title=f"{r['grain_id']} is diverging vs the market",
+                    entity_id=str(section),
+                    title=f"{section} is diverging vs {parent_label}",
                     narrative=(
-                        f"Section {r['grain_id']} is {mom:.1f}% MoM while {parent_name} is {parent_mom:.1f}% "
-                        f"(gap {gap:.1f} pp) on {r['volume_mt']:.2f} MT. This looks like a local execution miss, "
-                        "not a category headwind."
+                        f"Section {section} is {mom:.1f}% MoM while {parent_label} is {parent_mom:.1f}% "
+                        f"(gap {gap:.1f} pp) on {part['volume_mt'].sum():.2f} MT. This looks like a local "
+                        "execution miss, not a category headwind."
                     ),
                     action="Ride-with the DSR, check competitor activity, and compare billed vs universe shops in this section.",
                     metric_value=abs(gap),
-                    metrics={"section_mom": mom, "parent_mom": parent_mom, "gap_pp": gap, "volume_mt": r["volume_mt"]},
+                    metrics={
+                        "section_mom": mom,
+                        "parent_mom": parent_mom,
+                        "parent": parent_label,
+                        "gap_pp": gap,
+                        "volume_mt": float(part["volume_mt"].sum()),
+                    },
                 )
             )
         elif gap >= DIVERGENCE_GAP_PP and mom > 5:
@@ -275,10 +312,10 @@ def _divergence_insights(kpis: pd.DataFrame, period: str) -> list[dict]:
                     type="local_outperformance",
                     severity="positive",
                     entity_type="section",
-                    entity_id=r["grain_id"],
-                    title=f"{r['grain_id']} is outrunning the market",
+                    entity_id=str(section),
+                    title=f"{section} is outrunning {parent_label}",
                     narrative=(
-                        f"Section {r['grain_id']} grew {mom:.1f}% MoM vs {parent_mom:.1f}% {parent_name}. "
+                        f"Section {section} grew {mom:.1f}% MoM vs {parent_mom:.1f}% in {parent_label}. "
                         "Replicate callage, assortment, and scheme execution from this pocket."
                     ),
                     action="Document what the DSR changed this month and copy it to peer sections.",
@@ -286,32 +323,41 @@ def _divergence_insights(kpis: pd.DataFrame, period: str) -> list[dict]:
                     metrics={"section_mom": mom, "parent_mom": parent_mom, "gap_pp": gap},
                 )
             )
-    # DSR vs distributor
+
     dsrs = kpis[(kpis["grain"] == "dsr") & (kpis["period"] == period)]
-    dist = kpis[(kpis["grain"] == "distributor") & (kpis["period"] == period)]
-    dist_mom = float(dist["mom_pct"].mean()) if not dist.empty else nat_mom
     for _, r in dsrs.iterrows():
         if pd.isna(r["mom_pct"]) or r["volume_mt"] < 0.4:
             continue
-        gap = float(r["mom_pct"]) - (dist_mom if pd.notna(dist_mom) else 0)
-        if gap <= -DIVERGENCE_GAP_PP and r["mom_pct"] < 0:
+        part = parent[parent["dsr_name"] == r["grain_id"]]
+        dist_name = part["distributor"].dropna().mode()
+        dist_label = str(dist_name.iloc[0]) if len(dist_name) else "peers"
+        dist_part = parent[parent["distributor"] == dist_label] if dist_label != "peers" else parent
+        dist_mom = _mom(dist_part)
+        if dist_mom is None:
+            continue
+        gap = float(r["mom_pct"]) - float(dist_mom)
+        # DSR MoM still includes dumps; recompute from stripped parent.
+        dsr_mom = _mom(part)
+        if dsr_mom is None:
+            continue
+        gap = dsr_mom - dist_mom
+        if gap <= -DIVERGENCE_GAP_PP and dsr_mom < 0:
             rows.append(
                 _insight(
                     type="dsr_underperformance",
                     severity="high",
                     entity_type="dsr",
                     entity_id=r["grain_id"],
-                    title=f"{r['grain_id']} is lagging peer volume",
+                    title=f"{r['grain_id']} is lagging {dist_label}",
                     narrative=(
-                        f"{r['grain_id']} is {r['mom_pct']:.1f}% MoM versus distributor/market {dist_mom:.1f}%. "
+                        f"{r['grain_id']} is {dsr_mom:.1f}% MoM versus {dist_label} {dist_mom:.1f}%. "
                         f"Strike {r['strike_rate']*100:.0f}%, drop size {r['drop_size']:.2f} MT."
                     ),
                     action="Coaching focus: unbilled regulars first, then drop-size on billed shops.",
                     metric_value=abs(gap),
-                    metrics={"mom_pct": r["mom_pct"], "strike_rate": r["strike_rate"], "drop_size": r["drop_size"]},
+                    metrics={"mom_pct": dsr_mom, "parent_mom": dist_mom, "strike_rate": r["strike_rate"], "drop_size": r["drop_size"]},
                 )
             )
-    _ = cities  # reserved for future city-joined divergence
     return rows
 
 
@@ -673,6 +719,7 @@ def _whitespace_insights(stores: pd.DataFrame, shop_month: pd.DataFrame, period:
     if len(never):
         by_city = never.groupby("city").size().sort_values(ascending=False)
         top_city = by_city.index[0] if len(by_city) else "unknown"
+        pocket_n = int(by_city.iloc[0]) if len(by_city) else 0
         rows.append(
             _insight(
                 type="whitespace",
@@ -682,7 +729,7 @@ def _whitespace_insights(stores: pd.DataFrame, shop_month: pd.DataFrame, period:
                 title=f"{len(never)} universe shops have never been billed",
                 narrative=(
                     f"{len(never)} outlets sit on the master list with zero history. "
-                    f"Largest pocket: {top_city} ({int(by_city.iloc[0]) if len(by_city) else 0)} shops. "
+                    f"Largest pocket: {top_city} ({pocket_n}) shops. "
                     f"{len(missed)} shops (including lapsed) were not billed in {period}."
                 ),
                 action="Give each DSR a top-20 never-billed list in their own section — do not spray the whole universe.",
