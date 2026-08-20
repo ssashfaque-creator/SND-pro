@@ -13,6 +13,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from sndintel.briefing import GLOSSARY, build_strategy_pack, excel_bytes, html_bytes
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
@@ -246,7 +247,6 @@ def _page_strategy(data, latest, period, mtd, ledger):
         st.info(banner_text(ledger, period))
 
     units = data.get("units", pd.DataFrame())
-    targets = data.get("targets", pd.DataFrame())
     if units is None or units.empty:
         st.warning(
             "No scorecards yet. If sales are already in the warehouse, rebuild below. "
@@ -344,13 +344,41 @@ def _page_strategy(data, latest, period, mtd, ledger):
             + pace_note
         )
 
+    pack = build_strategy_pack(
+        units,
+        data.get("shop_month", pd.DataFrame()),
+        situation=sit_df,
+        ledger=ledger,
+        period=period,
+    )
+    cdl, cdr = st.columns(2)
+    with cdl:
+        st.download_button(
+            "Download strategy pack (Excel)",
+            excel_bytes(pack),
+            file_name=f"SND_strategy_{period}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+    with cdr:
+        st.download_button(
+            "Download printable briefing (HTML → Print to PDF)",
+            html_bytes(pack),
+            file_name=f"SND_strategy_{period}.html",
+            mime="text/html",
+        )
+    st.caption(
+        "Excel is the working file (filters, one sheet per layer). "
+        "HTML opens in a browser — File → Print → Save as PDF for a board pack."
+    )
+
+    st.markdown("##### 1. The country — every city")
+    st.caption(
+        "Start here. **Extra vs country** is the local problem after national weather. "
+        "**Recoverable** is that hole as a positive number. **AMS** is the average of the last three closed months."
+    )
     left, right = st.columns((1.4, 1))
     with left:
-        st.subheader("Exceptions vs fair share")
-        st.caption(
-            "Fair share = this unit’s last-year mix × what the parent billed now. "
-            "Negative = worse than the parent (the local problem). Bars sum to ~0."
-        )
         if cities.empty:
             st.write("No city rows.")
         else:
@@ -365,47 +393,15 @@ def _page_strategy(data, latest, period, mtd, ledger):
                 y=ycol,
                 color=color,
                 color_discrete_map=cmap,
-                labels={ycol: "vs fair share (MT)", "city": ""},
+                labels={ycol: "Extra vs country (MT)", "city": ""},
             )
-            fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-30)
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-30)
             fig.add_hline(y=0, line_color="#94a3b8", line_width=1)
             st.plotly_chart(fig, use_container_width=True)
-            cols = [
-                c
-                for c in [
-                    "grain_id",
-                    "zone",
-                    "volume_mt",
-                    "share_expected_mt",
-                    "isolated_mt",
-                    "z_score",
-                    "situation",
-                    "coverage_effect_mt",
-                    "velocity_effect_mt",
-                    "mix_effect_mt",
-                    "wd",
-                    "diagnosis",
-                    "verdict",
-                ]
-                if c in cities.columns
-            ]
-            st.dataframe(
-                cities[cols].rename(
-                    columns={
-                        "grain_id": "city",
-                        "share_expected_mt": "fair_share",
-                        "isolated_mt": "vs_parent",
-                        "coverage_effect_mt": "coverage",
-                        "velocity_effect_mt": "velocity",
-                        "mix_effect_mt": "mix",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
+        _strategy_table(pack.cities)
     with right:
-        st.subheader("Why the extra hole (drivers)")
-        st.caption("Coverage = fewer/more billed doors. Velocity = drop size on the same numeric base. Mix = SKU shift vs national.")
+        st.markdown("**Why the extra hole**")
+        st.caption("Coverage = fewer billed doors. Drop size = smaller drops on the same doors. Mix = SKU shift.")
         lag = cities[cities["situation"] == "lagging"] if "situation" in cities.columns else cities.head(4)
         if lag.empty:
             lag = cities.head(4)
@@ -425,132 +421,51 @@ def _page_strategy(data, latest, period, mtd, ledger):
                 barmode="relative",
                 labels={"grain_id": "", "mt": "MT"},
             )
-            fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-25)
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-25)
             st.plotly_chart(fig, use_container_width=True)
         trend = data["shop_month"].groupby("period", as_index=False)["volume_mt"].sum().sort_values("period")
         fig = px.line(trend, x="period", y="volume_mt", markers=True, labels={"volume_mt": "MT", "period": ""})
-        fig.update_layout(height=220, margin=dict(l=10, r=10, t=30, b=10), title="National volume")
+        fig.update_layout(height=200, margin=dict(l=10, r=10, t=30, b=10), title="National volume")
         st.plotly_chart(fig, use_container_width=True)
-        season = data.get("seasonality", pd.DataFrame())
-        if season is not None and not season.empty and "month" in season.columns:
-            nat_s = season[season["grain"] == "national"].copy()
-            if not nat_s.empty:
-                names = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
-                         7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
-                nat_s["month_name"] = nat_s["month"].map(names)
-                nat_s = nat_s.sort_values("month")
-                fig = px.bar(
-                    nat_s,
-                    x="month_name",
-                    y="seasonal_index",
-                    labels={"seasonal_index": "index (1.0 = average month)", "month_name": ""},
-                    title=f"Calendar seasonality learned from {n_hist or 'warehouse'} months",
-                )
-                fig.add_hline(y=1.0, line_color="#94a3b8", line_width=1)
-                fig.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fig, use_container_width=True)
-                st.caption(
-                    "August vs January is estimated from every closed month in the warehouse. "
-                    "Day 20’s share of August is not — that needs mid-month MTD cuts."
-                )
-        if targets is not None and not targets.empty:
-            shops = targets[targets["grain"] == "shop"].copy()
-            show_cols = [
-                c
-                for c in ["rank", "city", "entity_name", "distributor", "dsr_name", "volume_mt", "ly_mt", "isolated_mt", "action"]
-                if c in shops.columns
-            ]
-            st.subheader("Must-visit (behind their city)")
-            st.dataframe(shops[show_cols].head(25).rename(columns={"entity_name": "shop", "isolated_mt": "vs_city"}), use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download named targets CSV",
-                targets.to_csv(index=False).encode("utf-8"),
-                file_name=f"focus_targets_{period}.csv",
-                mime="text/csv",
-            )
 
-    st.subheader("Open an exception — named people and doors")
-    show_cities = cities
-    if "situation" in cities.columns and (cities["situation"] == "lagging").any():
-        show_cities = pd.concat(
-            [
-                cities[cities["situation"] == "lagging"],
-                cities[cities["situation"] == "outperforming"].head(2),
-            ]
-        ).drop_duplicates("grain_id")
-    for i, city in enumerate(show_cities.itertuples(index=False)):
-        sit_l = str(getattr(city, "situation", "") or "")
-        iso = float(getattr(city, "isolated_mt", city.gap_mt) or 0)
-        color = SITUATION_COLOR.get(sit_l, "#334155")
-        label = (
-            f"{city.grain_id}: {sit_l.replace('_', ' ') or city.verdict} · "
-            f"{iso:+.1f} MT vs fair share · {str(city.diagnosis).replace('_', ' ')}"
-        )
-        with st.expander(label, expanded=i == 0 and sit_l == "lagging"):
-            st.markdown(
-                f"<span style='color:{color};font-weight:700;text-transform:uppercase;letter-spacing:0.06em'>"
-                f"{sit_l.replace('_', ' ') or 'city'} · {str(city.diagnosis).replace('_', ' ')}</span>",
-                unsafe_allow_html=True,
-            )
-            st.write(city.do_this_week)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Distributors (vs this city)**")
-                dist = units[(units["grain"] == "distributor") & (units["parent_id"] == city.grain_id)].copy()
-                if "isolated_mt" in dist.columns:
-                    dist = dist.sort_values("isolated_mt")
-                else:
-                    dist = dist.sort_values("gap_mt")
-                if dist.empty:
-                    st.caption("No distributor slice.")
-                else:
-                    dcols = [c for c in ["grain_id", "volume_mt", "share_expected_mt", "isolated_mt", "situation", "diagnosis"] if c in dist.columns]
-                    st.dataframe(
-                        dist[dcols].rename(columns={"grain_id": "distributor", "share_expected_mt": "fair_share", "isolated_mt": "vs_city"}).head(12),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                st.markdown("**Sections**")
-                sec = units[(units["grain"] == "section") & (units["parent_id"] == city.grain_id)].copy()
-                if "isolated_mt" in sec.columns:
-                    sec = sec.sort_values("isolated_mt")
-                if sec.empty:
-                    st.caption("No section slice.")
-                else:
-                    scols = [c for c in ["grain_id", "volume_mt", "isolated_mt", "situation"] if c in sec.columns]
-                    st.dataframe(
-                        sec[scols].rename(columns={"grain_id": "section", "isolated_mt": "vs_city"}).head(10),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-            with c2:
-                st.markdown("**DSRs (vs this city)**")
-                dsr = units[(units["grain"] == "dsr") & (units["parent_id"] == city.grain_id)].copy()
-                if "isolated_mt" in dsr.columns:
-                    dsr = dsr.sort_values("isolated_mt")
-                if dsr.empty:
-                    st.caption("No DSR slice.")
-                else:
-                    rcols = [c for c in ["grain_id", "volume_mt", "share_expected_mt", "isolated_mt", "situation"] if c in dsr.columns]
-                    st.dataframe(
-                        dsr[rcols].rename(columns={"grain_id": "dsr", "share_expected_mt": "fair_share", "isolated_mt": "vs_city"}).head(12),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                st.markdown("**Must-visit shops (vs this city)**")
-                if targets is None or targets.empty:
-                    st.caption("No named shops.")
-                else:
-                    hit = targets[(targets["city"] == city.grain_id) & (targets["grain"] == "shop")]
-                    if hit.empty:
-                        st.caption("No shop exception in this city.")
-                    else:
-                        hcols = [c for c in ["entity_name", "distributor", "dsr_name", "volume_mt", "ly_mt", "isolated_mt", "action"] if c in hit.columns]
-                        st.dataframe(
-                            hit[hcols].rename(columns={"entity_name": "shop", "isolated_mt": "vs_city"}),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+    st.markdown("##### 2. Lagging cities — distributors")
+    st.caption(
+        "Only cities on the lagging list, broken by distributor. "
+        "These are the first calls — not every distributor in the country."
+    )
+    if pack.city_distributors.empty:
+        st.info("No lagging city, or no distributor inside those cities is behind the city.")
+    else:
+        _strategy_table(pack.city_distributors)
+
+    st.markdown("##### 3. Those distributors — lagging shops")
+    st.caption(
+        "Doors behind their city, limited to the distributors above. "
+        "**Recoverable** is the volume you get back if the door merely matches the city."
+    )
+    if pack.city_distributor_shops.empty:
+        st.info("No material lagging shops under those distributors.")
+    else:
+        _strategy_table(pack.city_distributor_shops, height=360)
+
+    st.markdown("##### 4. Every lagging distributor (all cities)")
+    st.caption(
+        "Distributors behind their own city even when the city moved with the country. "
+        "Section 2 only showed distributors in lagging cities."
+    )
+    _strategy_table(pack.lagging_distributors)
+
+    st.markdown("##### 5. Every lagging DSR (all cities)")
+    st.caption("Salespeople behind their city. Ride-with this list.")
+    _strategy_table(pack.lagging_dsrs.head(60))
+
+    st.markdown("##### 6. Every lagging shop worth a visit")
+    st.caption("Material doors behind their city. Tiny 0.02 MT shops are excluded so Eva Foods is not buried.")
+    _strategy_table(pack.lagging_shops.head(80), height=420)
+
+    with st.expander("How to read the columns", expanded=False):
+        for term, meaning in GLOSSARY:
+            st.markdown(f"**{term}.** {meaning}")
 
     _rescore_button()
 
@@ -564,6 +479,19 @@ def _page_strategy(data, latest, period, mtd, ledger):
                 st.markdown(f"**{rec.title}** · _{rec.severity} · {rec.type}_")
                 st.write(rec.narrative)
                 st.caption(rec.action)
+
+
+def _strategy_table(df: pd.DataFrame, height: int = 320):
+    if df is None or df.empty:
+        st.caption("No rows at this layer.")
+        return
+    cfg = {}
+    for col in df.columns:
+        if "(MT)" in str(col):
+            cfg[col] = st.column_config.NumberColumn(col, format="%.2f")
+        elif str(col).endswith("%") or str(col) == "Strike %":
+            cfg[col] = st.column_config.NumberColumn(col, format="%.0f")
+    st.dataframe(df, use_container_width=True, hide_index=True, height=min(height, 80 + 28 * max(3, len(df))), column_config=cfg)
 
 
 def _rescore_button():

@@ -211,44 +211,29 @@ def serve_api(port: int = 8080):
 
 
 @app.command("export-excel")
-def export_excel(path: Path = typer.Argument(Path("SND_intelligence_brief.xlsx"))):
-    """Write a multi-sheet Excel briefing for sales managers."""
+def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
+    """Write the strategy pack: country → lagging cities → people → doors, plus a printable HTML."""
     init_db()
     with connect() as conn:
-        insights = read_sql(conn, "SELECT * FROM insights ORDER BY rank_score DESC")
-        kpis = read_sql(conn, "SELECT * FROM kpi_snapshots")
-        anomalies = read_sql(conn, "SELECT * FROM anomalies")
-        segments = read_sql(conn, "SELECT * FROM shop_segments")
-        shops = read_sql(
-            conn,
-            """
-            SELECT s.*, g.segment, m.volume_mt AS last_volume, m.period AS last_period
-            FROM stores s
-            LEFT JOIN shop_segments g ON g.store_id = s.store_id
-            LEFT JOIN shop_month m ON m.store_id = s.store_id
-            WHERE m.period = (SELECT MAX(period) FROM shop_month)
-            """,
-        )
+        units = read_sql(conn, "SELECT * FROM unit_scorecards")
+        shop_month = read_sql(conn, "SELECT * FROM shop_month")
         try:
-            units = read_sql(conn, "SELECT * FROM unit_scorecards ORDER BY grain, gap_mt")
+            situation = read_sql(conn, "SELECT * FROM situation_brief")
         except Exception:
-            units = pd.DataFrame()
-        try:
-            targets = read_sql(conn, "SELECT * FROM focus_targets ORDER BY rank")
-        except Exception:
-            targets = pd.DataFrame()
+            situation = pd.DataFrame()
+        ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
+    from sndintel.briefing import build_strategy_pack, write_excel, write_html
+    from sndintel.features import latest_period
+
+    period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+    pack = build_strategy_pack(units, shop_month, situation=situation, ledger=ledger, period=period)
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        insights.to_excel(writer, sheet_name="Insights", index=False)
-        kpis.to_excel(writer, sheet_name="KPIs", index=False)
-        if not units.empty:
-            units.to_excel(writer, sheet_name="City_to_DSR", index=False)
-        if not targets.empty:
-            targets.to_excel(writer, sheet_name="Named_targets", index=False)
-        anomalies.to_excel(writer, sheet_name="Anomalies", index=False)
-        segments.to_excel(writer, sheet_name="Segments", index=False)
-        shops.to_excel(writer, sheet_name="Shop Scorecard", index=False)
+    write_excel(pack, path)
+    html_path = path.with_suffix(".html")
+    write_html(pack, html_path)
     console.print(f"Wrote {path}")
+    console.print(f"Wrote {html_path}  (open and File → Print → Save as PDF)")
 
 
 @app.command()
