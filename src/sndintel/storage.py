@@ -105,14 +105,14 @@ CREATE TABLE IF NOT EXISTS features_shop_month (
     vs_section_pct REAL,
     vs_city_pct REAL,
     cv_6m REAL,
-        recency_months INTEGER,
-        billed_rate_12 REAL,
-        top_sku_share REAL,
-        first_period TEXT,
-        months_on_file INTEGER,
-        yoy_comparable INTEGER,
-        PRIMARY KEY (store_id, period)
-    );
+    recency_months INTEGER,
+    billed_rate_12 REAL,
+    top_sku_share REAL,
+    first_period TEXT,
+    months_on_file INTEGER,
+    yoy_comparable INTEGER,
+    PRIMARY KEY (store_id, period)
+);
 
 CREATE TABLE IF NOT EXISTS forecasts (
     entity_type TEXT NOT NULL,
@@ -173,6 +173,18 @@ CREATE TABLE IF NOT EXISTS insights (
 CREATE INDEX IF NOT EXISTS idx_insights_rank ON insights(rank_score DESC);
 CREATE INDEX IF NOT EXISTS idx_insights_type ON insights(type);
 
+CREATE TABLE IF NOT EXISTS period_ledger (
+    period TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    source_file TEXT,
+    execution_date TEXT,
+    ingested_at TEXT,
+    n_fact_rows INTEGER,
+    volume_mt REAL,
+    as_of_day INTEGER,
+    days_in_month INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS kpi_snapshots (
     period TEXT NOT NULL,
     grain TEXT NOT NULL,
@@ -185,6 +197,12 @@ CREATE TABLE IF NOT EXISTS kpi_snapshots (
     sku_depth REAL,
     mom_pct REAL,
     yoy_pct REAL,
+    period_status TEXT,
+    as_of_day INTEGER,
+    days_in_month INTEGER,
+    run_rate_mt REAL,
+    comparable_mom_pct REAL,
+    run_rate_yoy_pct REAL,
     PRIMARY KEY (period, grain, grain_id)
 );
 """
@@ -217,6 +235,15 @@ def init_db(path: Optional[Path] = None) -> Path:
         _ensure_column(conn, "features_shop_month", "first_period", "TEXT")
         _ensure_column(conn, "features_shop_month", "months_on_file", "INTEGER")
         _ensure_column(conn, "features_shop_month", "yoy_comparable", "INTEGER")
+        for col, ddl in (
+            ("period_status", "TEXT"),
+            ("as_of_day", "INTEGER"),
+            ("days_in_month", "INTEGER"),
+            ("run_rate_mt", "REAL"),
+            ("comparable_mom_pct", "REAL"),
+            ("run_rate_yoy_pct", "REAL"),
+        ):
+            _ensure_column(conn, "kpi_snapshots", col, ddl)
     return db_path
 
 

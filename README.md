@@ -87,6 +87,15 @@ snd-intel watch --once
 
 JSON API (for a future agent): `snd-intel serve-api` then `GET /brief`, `/insights`, `/focus`, `/shops/{id}`, `/search?q=trade+loading`.
 
+## How a new file is applied
+
+The Google Drive sample is July + August in one extract. The next file you drop will often be **August only** (or a later cut of the same month as MTD grows).
+
+- Every calendar month **present in the file** is replaced in full. That is how MTD works: 20 Aug 0.60 MT at a shop becomes 0.95 MT when the 20 Aug extract is superseded. Shops that drop off that month’s extract are removed from that month, not left as stale MTD.
+- Months **not** in the file stay as they are. July does not change when you upload August.
+- Insights are rebuilt from the **whole warehouse** (closed July + open August MTD + any earlier history), not from the new file in isolation.
+- If the SSRS header has `Execution Date & Time` before month-end, that month is tagged `mtd_open`. Briefings use run-rate vs last year’s **closed** August instead of comparing 20 days to 31.
+
 ## Strategy questions this is built to answer
 
 | Question | Where it shows up |
@@ -106,7 +115,8 @@ JSON API (for a future agent): `snd-intel serve-api` then `GET /brief`, `/insigh
 src/sndintel/
   ingest/ssrs.py       SSRS chrome stripper + column inference
   ingest/shops.py      Universe parser
-  ingest/pipeline.py   SQLite upsert → features → models → insights
+  ingest/pipeline.py   Snapshot-replace months in the file → features → models → insights
+  mtd.py               Closed vs open MTD from SSRS execution date
   features.py          Shop-month panel, lags, z-scores
   models.py            XGBoost, Isolation Forest, K-Means
   insights.py          Ranked narratives + KPI snapshots

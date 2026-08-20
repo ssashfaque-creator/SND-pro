@@ -12,6 +12,7 @@ import pandas as pd
 from sndintel.config import DIVERGENCE_GAP_PP, MIN_VOLUME_FLAG_MT
 from sndintel.features import latest_period, previous_period
 from sndintel.io_utils import shift_period
+from sndintel.mtd import period_state
 from sndintel.storage import dumps
 
 
@@ -27,23 +28,26 @@ def compile_insights(
     forecasts: pd.DataFrame,
     anomalies: pd.DataFrame,
     segments: pd.DataFrame,
+    ledger: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (insights, kpi_snapshots)."""
+    """Return (insights, kpi_snapshots). Insights always cover the full warehouse."""
     period = latest_period(shop_month)
     if not period:
         return pd.DataFrame(), pd.DataFrame()
     prev = previous_period(period)
-    kpis = build_kpi_snapshots(shop_month, stores, sales, period, prev)
+    mtd = period_state(ledger, period)
+    kpis = build_kpi_snapshots(shop_month, stores, sales, period, prev, mtd=mtd)
     rows: list[dict[str, Any]] = []
-    rows += _coverage_insights(kpis, stores, shop_month, period)
-    rows += _divergence_insights(kpis, shop_month, period)
-    rows += _anomaly_insights(anomalies, shop_month, period)
+    rows += _position_insights(shop_month, ledger, period, mtd)
+    rows += _coverage_insights(kpis, stores, shop_month, period, mtd)
+    rows += _divergence_insights(kpis, shop_month, period, mtd)
+    rows += _anomaly_insights(anomalies, shop_month, period, mtd)
     rows += _segment_insights(segments, shop_month, period)
     rows += _cannibalization_insights(sales, period, prev)
     rows += _pareto_insights(shop_month, period)
-    rows += _forecast_gap_insights(forecasts, shop_month, period)
+    rows += _forecast_gap_insights(forecasts, shop_month, period, mtd)
     rows += _positive_insights(kpis, segments, shop_month, period)
-    rows += _volume_bridge_insights(shop_month, period)
+    rows += _volume_bridge_insights(shop_month, period, mtd)
     rows += _whitespace_insights(stores, shop_month, period)
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -57,7 +61,11 @@ def compile_insights(
     ]
     # Boost volume-backed operational issues.
     frame.loc[frame["type"].isin(["trade_loading", "drop_off", "divergence", "coverage_gap"]), "rank_score"] += 10
+    frame.loc[frame["type"] == "warehouse_position", "rank_score"] += 55
     frame.loc[frame["severity"] == "positive", "rank_score"] = frame.loc[frame["severity"] == "positive", "rank_score"].clip(upper=45)
+    frame.loc[frame["type"] == "warehouse_position", "rank_score"] = frame.loc[
+        frame["type"] == "warehouse_position", "rank_score"
+    ].clip(lower=90)
     frame = frame.sort_values("rank_score", ascending=False).reset_index(drop=True)
     keep = [
         "run_id",
@@ -83,12 +91,15 @@ def build_kpi_snapshots(
     sales: pd.DataFrame,
     period: str,
     prev: str,
+    mtd: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     frames = []
     current = shop_month[shop_month["period"] == period]
     previous = shop_month[shop_month["period"] == prev]
     yoy_period = f"{int(period[:4]) - 1}-{period[5:]}"
     yoy = shop_month[shop_month["period"] == yoy_period]
+    mtd = mtd or {"open": False, "factor": 1.0, "status": "closed", "as_of_day": None, "days_in_month": None}
+    factor = float(mtd.get("factor") or 1.0) if mtd.get("open") else 1.0
 
     universe = stores.copy() if stores is not None else pd.DataFrame(columns=["store_id", "zone", "city", "section", "dsr_name", "distributor"])
     if universe.empty:
@@ -139,6 +150,9 @@ def build_kpi_snapshots(
             yoy_vol = float(yy["volume_mt"].sum()) if yy is not None and not yy.empty else 0.0
             mom = (vol - prev_vol) / prev_vol * 100 if prev_vol else None
             yoy_pct = (vol - yoy_vol) / yoy_vol * 100 if yoy_vol else None
+            run_rate = vol * factor
+            comparable_mom = (run_rate - prev_vol) / prev_vol * 100 if prev_vol else None
+            run_rate_yoy = (run_rate - yoy_vol) / yoy_vol * 100 if yoy_vol else None
             frames.append(
                 {
                     "period": period,
@@ -152,6 +166,12 @@ def build_kpi_snapshots(
                     "sku_depth": depth if depth == depth else 0.0,
                     "mom_pct": mom,
                     "yoy_pct": yoy_pct,
+                    "period_status": mtd.get("status") or "closed",
+                    "as_of_day": mtd.get("as_of_day"),
+                    "days_in_month": mtd.get("days_in_month"),
+                    "run_rate_mt": run_rate,
+                    "comparable_mom_pct": comparable_mom,
+                    "run_rate_yoy_pct": run_rate_yoy,
                 }
             )
 
@@ -164,6 +184,7 @@ def build_kpi_snapshots(
             vol = float(part["volume_mt"].sum())
             prev_vol = float(prv_s.loc[prv_s["sku"] == sku, "volume_mt"].sum()) if not prv_s.empty else 0.0
             yoy_vol = float(yy_s.loc[yy_s["sku"] == sku, "volume_mt"].sum()) if not yy_s.empty else 0.0
+            run_rate = vol * factor
             frames.append(
                 {
                     "period": period,
@@ -177,9 +198,136 @@ def build_kpi_snapshots(
                     "sku_depth": 1.0,
                     "mom_pct": (vol - prev_vol) / prev_vol * 100 if prev_vol else None,
                     "yoy_pct": (vol - yoy_vol) / yoy_vol * 100 if yoy_vol else None,
+                    "period_status": mtd.get("status") or "closed",
+                    "as_of_day": mtd.get("as_of_day"),
+                    "days_in_month": mtd.get("days_in_month"),
+                    "run_rate_mt": run_rate,
+                    "comparable_mom_pct": (run_rate - prev_vol) / prev_vol * 100 if prev_vol else None,
+                    "run_rate_yoy_pct": (run_rate - yoy_vol) / yoy_vol * 100 if yoy_vol else None,
                 }
             )
     return pd.DataFrame(frames)
+
+
+def _vol(shop_month: pd.DataFrame, period: str) -> float:
+    part = shop_month[shop_month["period"] == period]
+    return float(part["volume_mt"].sum()) if not part.empty else 0.0
+
+
+def _position_insights(
+    shop_month: pd.DataFrame,
+    ledger: pd.DataFrame | None,
+    period: str,
+    mtd: dict[str, Any],
+) -> list[dict]:
+    """Overall warehouse position: closed months + open MTD, not just the latest file."""
+    yoy_p = shift_period(period, -12)
+    prev = previous_period(period)
+    cur_vol = _vol(shop_month, period)
+    ly_vol = _vol(shop_month, yoy_p)
+    prev_vol = _vol(shop_month, prev)
+    year = int(period[:4])
+    ytd_periods = sorted(
+        p for p in shop_month["period"].dropna().unique() if str(p).startswith(str(year)) and str(p) <= period
+    )
+    closed_ytd = [p for p in ytd_periods if p != period or not mtd.get("open")]
+    if mtd.get("open"):
+        closed_ytd = [p for p in ytd_periods if p != period]
+    ytd_closed_vol = sum(_vol(shop_month, p) for p in closed_ytd)
+    ytd_closed_ly = sum(_vol(shop_month, shift_period(p, -12)) for p in closed_ytd)
+    ytd_actual = ytd_closed_vol + (cur_vol if mtd.get("open") else 0.0)
+    if not mtd.get("open"):
+        ytd_actual = ytd_closed_vol
+    ytd_ly_same_months = sum(_vol(shop_month, shift_period(p, -12)) for p in ytd_periods)
+    run_rate = cur_vol * float(mtd.get("factor") or 1.0)
+    run_yoy = (run_rate - ly_vol) / ly_vol * 100 if ly_vol else None
+    raw_yoy = (cur_vol - ly_vol) / ly_vol * 100 if ly_vol else None
+    closed_ytd_pct = (ytd_closed_vol - ytd_closed_ly) / ytd_closed_ly * 100 if ytd_closed_ly else None
+
+    bits = []
+    if mtd.get("open") and mtd.get("as_of_day") and mtd.get("days_in_month"):
+        bits.append(
+            f"{period} is open MTD: {cur_vol:.1f} MT billed through day {mtd['as_of_day']} of "
+            f"{mtd['days_in_month']} (run-rate {run_rate:.1f} MT if the remaining days hold this pace)."
+        )
+        if ly_vol:
+            bits.append(
+                f"Last year {yoy_p} closed at {ly_vol:.1f} MT. Raw MTD vs that full month is "
+                f"{raw_yoy:+.1f}%; that is not a like-for-like miss. Run-rate vs closed {yoy_p} is "
+                f"{run_yoy:+.1f}%."
+            )
+        if prev_vol:
+            bits.append(f"Previous month {prev} closed at {prev_vol:.1f} MT.")
+    else:
+        bits.append(f"{period} closed at {cur_vol:.1f} MT.")
+        if ly_vol:
+            bits.append(f"Vs {yoy_p} ({ly_vol:.1f} MT) that is {raw_yoy:+.1f}% YoY.")
+        if prev_vol:
+            mom = (cur_vol - prev_vol) / prev_vol * 100
+            bits.append(f"Vs {prev} ({prev_vol:.1f} MT) that is {mom:+.1f}% MoM.")
+
+    if closed_ytd:
+        last_closed = closed_ytd[-1]
+        bits.append(
+            f"Closed YTD through {last_closed}: {ytd_closed_vol:.1f} MT"
+            + (f" vs {ytd_closed_ly:.1f} MT last year ({closed_ytd_pct:+.1f}%)." if ytd_closed_ly else ".")
+        )
+    if mtd.get("open"):
+        bits.append(
+            f"Calendar YTD including this MTD: {ytd_actual:.1f} MT"
+            + (f" vs {ytd_ly_same_months:.1f} MT across the same months last year (last year's August is a full month)." if ytd_ly_same_months else ".")
+        )
+    bits.append(
+        "These numbers are the full warehouse after applying the latest extract as the new truth "
+        "for the months it contained — other months were left untouched."
+    )
+
+    if mtd.get("open") and run_yoy is not None and run_yoy <= -10:
+        severity = "high"
+        title = f"Warehouse on a short run-rate in {period}"
+    elif mtd.get("open"):
+        severity = "medium"
+        title = f"Warehouse position · {mtd.get('label') or period}"
+    elif raw_yoy is not None and raw_yoy <= -10:
+        severity = "high"
+        title = f"Warehouse closed {period} behind last year"
+    else:
+        severity = "medium"
+        title = f"Warehouse position · {period} closed"
+
+    return [
+        _insight(
+            type="warehouse_position",
+            severity=severity,
+            entity_type="national",
+            entity_id="ALL",
+            title=title,
+            narrative=" ".join(bits),
+            action=(
+                "Read MTD against run-rate and last closed month, not against a full August last year. "
+                "A later extract this month replaces August in full; July will not change."
+                if mtd.get("open")
+                else "Use closed-month YoY and YTD for the board pack; drill into sections that diverge from this national picture."
+            ),
+            metric_value=abs(float(run_yoy if mtd.get("open") and run_yoy is not None else raw_yoy or cur_vol)),
+            metrics={
+                "current_mt": cur_vol,
+                "run_rate_mt": run_rate,
+                "ly_mt": ly_vol,
+                "prev_mt": prev_vol,
+                "raw_yoy_pct": raw_yoy,
+                "run_rate_yoy_pct": run_yoy,
+                "closed_ytd_mt": ytd_closed_vol,
+                "closed_ytd_ly_mt": ytd_closed_ly,
+                "closed_ytd_pct": closed_ytd_pct,
+                "ytd_with_mtd_mt": ytd_actual,
+                "open_mtd": bool(mtd.get("open")),
+                "as_of_day": mtd.get("as_of_day"),
+                "days_in_month": mtd.get("days_in_month"),
+                "closed_ytd_periods": closed_ytd,
+            },
+        )
+    ]
 
 
 def _insight(**kwargs) -> dict[str, Any]:
@@ -191,7 +339,13 @@ def _insight(**kwargs) -> dict[str, Any]:
     return kwargs
 
 
-def _coverage_insights(kpis: pd.DataFrame, stores: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> list[dict]:
+def _coverage_insights(
+    kpis: pd.DataFrame,
+    stores: pd.DataFrame,
+    shop_month: pd.DataFrame,
+    period: str,
+    mtd: dict[str, Any] | None = None,
+) -> list[dict]:
     rows = []
     dsr = kpis[(kpis["grain"] == "dsr") & (kpis["period"] == period)].copy()
     if dsr.empty:
@@ -217,8 +371,11 @@ def _coverage_insights(kpis: pd.DataFrame, stores: pd.DataFrame, shop_month: pd.
                 metrics={"strike_rate": r["strike_rate"], "universe": r["universe_outlets"], "volume_mt": r["volume_mt"]},
             )
         )
-    saturated = dsr[(dsr["strike_rate"] >= 0.8) & (dsr["mom_pct"].fillna(0) < -8) & (dsr["volume_mt"] >= 0.5)]
+    mom_col = "comparable_mom_pct" if mtd and mtd.get("open") and "comparable_mom_pct" in dsr.columns else "mom_pct"
+    saturated = dsr[(dsr["strike_rate"] >= 0.8) & (dsr[mom_col].fillna(0) < -8) & (dsr["volume_mt"] >= 0.5)]
     for _, r in saturated.head(5).iterrows():
+        mom_val = r[mom_col]
+        pace_note = " run-rate MoM" if mtd and mtd.get("open") else " MoM"
         rows.append(
             _insight(
                 type="saturated_beat",
@@ -227,18 +384,28 @@ def _coverage_insights(kpis: pd.DataFrame, stores: pd.DataFrame, shop_month: pd.
                 entity_id=r["grain_id"],
                 title=f"{r['grain_id']} is covering the universe but losing volume",
                 narrative=(
-                    f"Strike rate is {r['strike_rate']*100:.0f}% yet MoM volume is {r['mom_pct']:.1f}%. "
+                    f"Strike rate is {r['strike_rate']*100:.0f}% yet{pace_note} volume is {mom_val:.1f}%. "
                     "Coverage is not the constraint — drop size or mix is slipping."
+                    + (
+                        f" {mtd['label']} — not a closed month."
+                        if mtd and mtd.get("open")
+                        else ""
+                    )
                 ),
                 action="Protect drop size: check stock-outs, competitor schemes, and over-frequent small drops.",
-                metric_value=abs(float(r["mom_pct"] or 0)),
-                metrics={"strike_rate": r["strike_rate"], "mom_pct": r["mom_pct"]},
+                metric_value=abs(float(mom_val or 0)),
+                metrics={"strike_rate": r["strike_rate"], "mom_pct": mom_val},
             )
         )
     return rows
 
 
-def _divergence_insights(kpis: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> list[dict]:
+def _divergence_insights(
+    kpis: pd.DataFrame,
+    shop_month: pd.DataFrame,
+    period: str,
+    mtd: dict[str, Any] | None = None,
+) -> list[dict]:
     """Flag local execution misses: a section/DSR down while its city/distributor is not.
 
     Parent rates exclude shops whose latest drop is > 4x their own prior month so a
@@ -260,9 +427,11 @@ def _divergence_insights(kpis: pd.DataFrame, shop_month: pd.DataFrame, period: s
         ]
     )
     parent = merged[~merged["store_id"].isin(dump_ids)] if dump_ids else merged
+    factor = float(mtd.get("factor") or 1.0) if mtd and mtd.get("open") else 1.0
+    as_of_note = f" ({mtd['label']})" if mtd and mtd.get("open") else ""
 
     def _mom(frame: pd.DataFrame) -> float | None:
-        a = float(frame["volume_mt"].sum())
+        a = float(frame["volume_mt"].sum()) * factor
         b = float(frame["volume_mt_prev"].sum()) if "volume_mt_prev" in frame.columns else 0.0
         if b <= 0:
             return None
@@ -288,13 +457,13 @@ def _divergence_insights(kpis: pd.DataFrame, shop_month: pd.DataFrame, period: s
             rows.append(
                 _insight(
                     type="divergence",
-                    severity="critical" if gap <= -25 else "high",
+                    severity="high" if (mtd and mtd.get("open")) or gap > -25 else "critical" if gap <= -25 else "high",
                     entity_type="section",
                     entity_id=str(section),
                     title=f"{section} is diverging vs {parent_label}",
                     narrative=(
                         f"Section {section} is {mom:.1f}% MoM while {parent_label} is {parent_mom:.1f}% "
-                        f"(gap {gap:.1f} pp) on {part['volume_mt'].sum():.2f} MT. This looks like a local "
+                        f"(gap {gap:.1f} pp) on {part['volume_mt'].sum():.2f} MT{as_of_note}. This looks like a local "
                         "execution miss, not a category headwind."
                     ),
                     action="Ride-with the DSR, check competitor activity, and compare billed vs universe shops in this section.",
@@ -317,7 +486,8 @@ def _divergence_insights(kpis: pd.DataFrame, shop_month: pd.DataFrame, period: s
                     entity_id=str(section),
                     title=f"{section} is outrunning {parent_label}",
                     narrative=(
-                        f"Section {section} grew {mom:.1f}% MoM vs {parent_mom:.1f}% in {parent_label}. "
+                        f"Section {section} grew {mom:.1f}% MoM vs {parent_mom:.1f}% in {parent_label}"
+                        f"{as_of_note}. "
                         "Replicate callage, assortment, and scheme execution from this pocket."
                     ),
                     action="Document what the DSR changed this month and copy it to peer sections.",
@@ -352,7 +522,8 @@ def _divergence_insights(kpis: pd.DataFrame, shop_month: pd.DataFrame, period: s
                     entity_id=r["grain_id"],
                     title=f"{r['grain_id']} is lagging {dist_label}",
                     narrative=(
-                        f"{r['grain_id']} is {dsr_mom:.1f}% MoM versus {dist_label} {dist_mom:.1f}%. "
+                        f"{r['grain_id']} is {dsr_mom:.1f}% MoM versus {dist_label} {dist_mom:.1f}%"
+                        f"{as_of_note}. "
                         f"Strike {r['strike_rate']*100:.0f}%, drop size {r['drop_size']:.2f} MT."
                     ),
                     action="Coaching focus: unbilled regulars first, then drop-size on billed shops.",
@@ -363,7 +534,12 @@ def _divergence_insights(kpis: pd.DataFrame, shop_month: pd.DataFrame, period: s
     return rows
 
 
-def _anomaly_insights(anomalies: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> list[dict]:
+def _anomaly_insights(
+    anomalies: pd.DataFrame,
+    shop_month: pd.DataFrame,
+    period: str,
+    mtd: dict[str, Any] | None = None,
+) -> list[dict]:
     rows = []
     if anomalies is None or anomalies.empty:
         return rows
@@ -396,6 +572,11 @@ def _anomaly_insights(anomalies: pd.DataFrame, shop_month: pd.DataFrame, period:
                         f"{store_name} ({sid}) took {vol:.2f} MT in {period} versus a typical drop of {exp:.2f} MT "
                         f"({multiple:.1f}x). DSR {dsr}, section {section}. This pattern is classic trade-loading — "
                         "volume that will likely reverse next month if it is not genuine offtake."
+                        + (
+                            f" Already this large with {mtd['label']} remaining — more concerning than a closed-month dump."
+                            if mtd and mtd.get("open")
+                            else ""
+                        )
                     ),
                     action="Check invoice vs. shop storage, scheme-driven forward buy, and next-month returns/zero bill.",
                     metric_value=vol - exp,
@@ -414,6 +595,11 @@ def _anomaly_insights(anomalies: pd.DataFrame, shop_month: pd.DataFrame, period:
                     narrative=(
                         f"{store_name} billed {vol:.2f} MT vs expected {exp:.2f} MT in {period}. "
                         f"DSR {dsr} / {section}. Treat as a recovery call, not a lost account, until proven otherwise."
+                        + (
+                            f" Extract is {mtd['label']}; they may still bill before month-end."
+                            if mtd and mtd.get("open")
+                            else ""
+                        )
                     ),
                     action="Must-visit this week. Confirm stock, credit, and competitor fill-in.",
                     metric_value=exp - vol,
@@ -636,20 +822,31 @@ def _pareto_insights(shop_month: pd.DataFrame, period: str) -> list[dict]:
     return rows
 
 
-def _forecast_gap_insights(forecasts: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> list[dict]:
+def _forecast_gap_insights(
+    forecasts: pd.DataFrame,
+    shop_month: pd.DataFrame,
+    period: str,
+    mtd: dict[str, Any] | None = None,
+) -> list[dict]:
     if forecasts is None or forecasts.empty:
         return []
     f = forecasts[(forecasts["entity_type"] == "shop") & (forecasts["period"] == period)].copy()
     if f.empty:
         return []
     names = shop_month.drop_duplicates("store_id").set_index("store_id")
-    f["abs_resid"] = f["residual"].abs()
+    pace = 1.0
+    if mtd and mtd.get("open") and mtd.get("as_of_day") and mtd.get("days_in_month"):
+        pace = mtd["as_of_day"] / mtd["days_in_month"]
+    f["prorated"] = f["predicted"] * pace
+    f["pace_resid"] = f["actual"] - f["prorated"]
+    f["abs_resid"] = f["pace_resid"].abs()
     big = f[f["abs_resid"] >= max(MIN_VOLUME_FLAG_MT, 0.08)].sort_values("abs_resid", ascending=False).head(10)
     rows = []
     for _, r in big.iterrows():
         sid = r["entity_id"]
         name = names.loc[sid, "store_name"] if sid in names.index else sid
-        direction = "above" if r["residual"] > 0 else "below"
+        direction = "ahead of" if r["pace_resid"] > 0 else "behind"
+        pace_note = f" vs prorated MTD baseline {r['prorated']:.2f} MT" if pace < 1 else f" vs model {r['predicted']:.2f} MT"
         rows.append(
             _insight(
                 type="forecast_gap",
@@ -659,12 +856,12 @@ def _forecast_gap_insights(forecasts: pd.DataFrame, shop_month: pd.DataFrame, pe
                 entity_name=name,
                 title=f"{name} is {direction} the expected baseline",
                 narrative=(
-                    f"Actual {r['actual']:.2f} MT vs model {r['predicted']:.2f} MT "
-                    f"({r['residual']:+.2f} MT, {r.get('residual_pct') or 0:+.0f}%)."
+                    f"Actual {r['actual']:.2f} MT{pace_note} "
+                    f"({r['pace_resid']:+.2f} MT). Full-month model {r['predicted']:.2f} MT."
                 ),
-                action="If above: confirm genuine offtake. If below: recovery call before month close.",
+                action="If ahead: confirm genuine offtake. If behind: recovery call before month close.",
                 metric_value=float(r["abs_resid"]),
-                metrics={"actual": r["actual"], "predicted": r["predicted"], "model": r.get("model")},
+                metrics={"actual": r["actual"], "predicted": r["predicted"], "prorated": r["prorated"], "model": r.get("model")},
             )
         )
     return rows
@@ -673,7 +870,8 @@ def _forecast_gap_insights(forecasts: pd.DataFrame, shop_month: pd.DataFrame, pe
 def _positive_insights(kpis: pd.DataFrame, segments: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> list[dict]:
     rows = []
     dsr = kpis[(kpis["grain"] == "dsr") & (kpis["period"] == period)].copy()
-    winners = dsr[(dsr["mom_pct"].fillna(0) >= 10) & (dsr["volume_mt"] >= 0.5)].sort_values("mom_pct", ascending=False)
+    mom_col = "comparable_mom_pct" if "comparable_mom_pct" in dsr.columns else "mom_pct"
+    winners = dsr[(dsr[mom_col].fillna(0) >= 10) & (dsr["volume_mt"] >= 0.5)].sort_values(mom_col, ascending=False)
     for _, r in winners.head(5).iterrows():
         rows.append(
             _insight(
@@ -683,16 +881,17 @@ def _positive_insights(kpis: pd.DataFrame, segments: pd.DataFrame, shop_month: p
                 entity_id=r["grain_id"],
                 title=f"{r['grain_id']} is having a strong month",
                 narrative=(
-                    f"+{r['mom_pct']:.1f}% MoM, {r['volume_mt']:.2f} MT, strike {r['strike_rate']*100:.0f}%, "
+                    f"+{r[mom_col]:.1f}% MoM, {r['volume_mt']:.2f} MT, strike {r['strike_rate']*100:.0f}%, "
                     f"drop size {r['drop_size']:.2f} MT."
                 ),
                 action="Ask what changed (new shops, mix, scheme) and brief peer DSRs.",
-                metric_value=float(r["mom_pct"]),
-                metrics={"mom_pct": r["mom_pct"], "volume_mt": r["volume_mt"]},
+                metric_value=float(r[mom_col]),
+                metrics={"mom_pct": r[mom_col], "volume_mt": r["volume_mt"]},
             )
         )
     sku = kpis[(kpis["grain"] == "sku") & (kpis["period"] == period)].copy()
-    sku_w = sku[(sku["mom_pct"].fillna(0) >= 15) & (sku["volume_mt"] >= 1)].sort_values("mom_pct", ascending=False)
+    sku_mom = "comparable_mom_pct" if "comparable_mom_pct" in sku.columns else "mom_pct"
+    sku_w = sku[(sku[sku_mom].fillna(0) >= 15) & (sku["volume_mt"] >= 1)].sort_values(sku_mom, ascending=False)
     for _, r in sku_w.head(4).iterrows():
         rows.append(
             _insight(
@@ -701,25 +900,31 @@ def _positive_insights(kpis: pd.DataFrame, segments: pd.DataFrame, shop_month: p
                 entity_type="sku",
                 entity_id=r["grain_id"],
                 title=f"{r['grain_id']} is carrying growth",
-                narrative=f"{r['grain_id']} {r['mom_pct']:+.1f}% MoM on {r['volume_mt']:.2f} MT across {int(r['billed_outlets'])} shops.",
+                narrative=f"{r['grain_id']} {r[sku_mom]:+.1f}% MoM on {r['volume_mt']:.2f} MT across {int(r['billed_outlets'])} shops.",
                 action="Ensure supply; do not starve a winning SKU to push a slower pack.",
-                metric_value=float(r["mom_pct"]),
-                metrics={"mom_pct": r["mom_pct"], "volume_mt": r["volume_mt"]},
+                metric_value=float(r[sku_mom]),
+                metrics={"mom_pct": r[sku_mom], "volume_mt": r["volume_mt"]},
             )
         )
     return rows
 
 
-def _volume_bridge_insights(shop_month: pd.DataFrame, period: str) -> list[dict]:
+def _volume_bridge_insights(
+    shop_month: pd.DataFrame,
+    period: str,
+    mtd: dict[str, Any] | None = None,
+) -> list[dict]:
     """Split YoY movement into continuing shops vs new areas vs lost shops.
 
     A store that first appears this year is expansion, not 'growth from zero'.
+    Open MTD is compared on a run-rate basis against last year's closed month.
     """
     yoy_p = shift_period(period, -12)
     cur = shop_month[shop_month["period"] == period]
     ly = shop_month[shop_month["period"] == yoy_p]
     if cur.empty or ly.empty:
         return []
+    factor = float(mtd.get("factor") or 1.0) if mtd and mtd.get("open") else 1.0
     cur_ids = set(cur.loc[cur["billed"] == 1, "store_id"])
     ly_ids = set(ly.loc[ly["billed"] == 1, "store_id"])
     continuing = cur_ids & ly_ids
@@ -731,28 +936,53 @@ def _volume_bridge_insights(shop_month: pd.DataFrame, period: str) -> list[dict]
     cont_ly = float(ly.loc[ly["store_id"].isin(continuing), "volume_mt"].sum())
     new_vol = float(cur.loc[cur["store_id"].isin(new_ids), "volume_mt"].sum())
     lost_vol = float(ly.loc[ly["store_id"].isin(lost_ids), "volume_mt"].sum())
-    like_pct = (cont_now - cont_ly) / cont_ly * 100 if cont_ly else None
-    headline = (cur_vol - ly_vol) / ly_vol * 100 if ly_vol else None
+    paced_cur = cur_vol * factor
+    paced_cont = cont_now * factor
+    like_pct = (paced_cont - cont_ly) / cont_ly * 100 if cont_ly else None
+    headline = (paced_cur - ly_vol) / ly_vol * 100 if ly_vol else None
+    raw_headline = (cur_vol - ly_vol) / ly_vol * 100 if ly_vol else None
+    if mtd and mtd.get("open"):
+        narrative = (
+            f"{mtd['label']}: billed {cur_vol:.1f} MT so far vs {ly_vol:.1f} MT closed in {yoy_p} "
+            f"(raw {raw_headline:+.1f}% — not like-for-like). "
+            f"At this pace the month would land at {paced_cur:.1f} MT ({headline:+.1f}% vs {yoy_p}). "
+            f"Like-for-like shops billed in both years: {cont_now:.1f} MTD vs {cont_ly:.1f} MT last year"
+            + (f" (run-rate {like_pct:+.1f}%). " if like_pct is not None else ". ")
+            + f"New shops (not billed in {yoy_p}): {len(new_ids)} / {new_vol:.1f} MT MTD. "
+            f"Shops billed last year but not yet this MTD: {len(lost_ids)} / {lost_vol:.1f} MT last year — "
+            "some of those may still bill before month-end. "
+            "New areas are counted as expansion, not as a recovery from zero."
+        )
+        action = (
+            "Do not brief a YoY miss from raw MTD vs a full last-year month. "
+            "Coach like-for-like drop size; treat unbilled-this-MTD shops as still recoverable."
+        )
+        title = f"YoY volume bridge · {mtd['label']}"
+    else:
+        narrative = (
+            f"{period} is {cur_vol:.1f} MT vs {ly_vol:.1f} MT in {yoy_p} "
+            f"({headline:+.1f}% headline). "
+            f"Like-for-like (shops billed in both years): {cont_now:.1f} vs {cont_ly:.1f} MT"
+            + (f" ({like_pct:+.1f}%). " if like_pct is not None else ". ")
+            + f"New shops (not billed in {yoy_p}): {len(new_ids)} / {new_vol:.1f} MT. "
+            f"Lost shops: {len(lost_ids)} / {lost_vol:.1f} MT. "
+            "New areas are counted as expansion, not as a recovery from zero."
+        )
+        action = "Coach lost-shop recovery separately from like-for-like drop size. Do not target YoY on shops that were not on file last year."
+        title = f"YoY volume bridge vs {yoy_p}"
     rows = [
         _insight(
             type="volume_bridge",
             severity="high" if (headline or 0) < -10 else "medium",
             entity_type="national",
             entity_id="ALL",
-            title=f"YoY volume bridge vs {yoy_p}",
-            narrative=(
-                f"{period} is {cur_vol:.1f} MT vs {ly_vol:.1f} MT in {yoy_p} "
-                f"({headline:+.1f}% headline). "
-                f"Like-for-like (shops billed in both years): {cont_now:.1f} vs {cont_ly:.1f} MT"
-                + (f" ({like_pct:+.1f}%). " if like_pct is not None else ". ")
-                + f"New shops (not billed in {yoy_p}): {len(new_ids)} / {new_vol:.1f} MT. "
-                f"Lost shops: {len(lost_ids)} / {lost_vol:.1f} MT. "
-                "New areas are counted as expansion, not as a recovery from zero."
-            ),
-            action="Coach lost-shop recovery separately from like-for-like drop size. Do not target YoY on shops that were not on file last year.",
+            title=title,
+            narrative=narrative,
+            action=action,
             metric_value=abs(float(headline or 0)),
             metrics={
                 "headline_yoy_pct": headline,
+                "raw_yoy_pct": raw_headline,
                 "like_for_like_pct": like_pct,
                 "continuing_shops": len(continuing),
                 "new_shops": len(new_ids),
@@ -760,7 +990,9 @@ def _volume_bridge_insights(shop_month: pd.DataFrame, period: str) -> list[dict]
                 "new_mt": new_vol,
                 "lost_mt": lost_vol,
                 "current_mt": cur_vol,
+                "run_rate_mt": paced_cur,
                 "ly_mt": ly_vol,
+                "open_mtd": bool(mtd.get("open")) if mtd else False,
             },
         )
     ]

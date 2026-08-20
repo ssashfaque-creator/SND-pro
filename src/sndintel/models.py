@@ -118,7 +118,12 @@ def forecast_shop_month(features: pd.DataFrame, shop_month: pd.DataFrame) -> pd.
     return out
 
 
-def detect_anomalies(features: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> pd.DataFrame:
+def detect_anomalies(
+    features: pd.DataFrame,
+    shop_month: pd.DataFrame,
+    period: str,
+    mtd_open: bool = False,
+) -> pd.DataFrame:
     """Isolation Forest on shop-normalized latest-month vectors, plus rule tags."""
     if features.empty:
         return pd.DataFrame()
@@ -180,10 +185,12 @@ def detect_anomalies(features: pd.DataFrame, shop_month: pd.DataFrame, period: s
             continue
         if expected > 0 and volume >= expected * 2.5 and volume >= 0.05:
             kinds.append("trade_loading")
-        if expected > 0.05 and volume <= expected * 0.4:
-            kinds.append("drop_off")
-        if volume == 0 and (row.get("billed_rate_12") or 0) >= 0.5 and comparable:
-            kinds.append("lapse")
+        # Incomplete MTD: a quiet shop may still bill before month-end.
+        if not mtd_open:
+            if expected > 0.05 and volume <= expected * 0.4:
+                kinds.append("drop_off")
+            if volume == 0 and (row.get("billed_rate_12") or 0) >= 0.5 and comparable:
+                kinds.append("lapse")
         cv = row.get("cv_6m")
         if pd.notna(cv) and float(cv) >= 1.2 and volume >= 0.05:
             kinds.append("lumpy")

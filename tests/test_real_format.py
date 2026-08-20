@@ -12,7 +12,7 @@ def _write_ragged_csv(path: Path) -> Path:
     # Parameter rows are narrower than the tablix — this is what pandas' C engine rejects.
     lines = [
         "txtRectangle,txtFooter,txtCulture",
-        "Shop SKU Wise Sale,User ID: shahmir,UOM: Tons",
+        "Shop SKU Wise Sale,User ID: shahmir,UOM: Tons,Execution Date & Time: 20/08/2026 14:03:11",
         "",
         "txtCorner_0,txtCorner_1,txt_cDISTRIBUTOR_NAME,txt_cDSR_NAME,txt_cSECTION_LONG_DESCRIPTION,txt_cPOP_Code,txt_cPOP_NAME,txt_cSKU_LONG_DESCRIPTION,txt_Calendar_Year,txt_Calendar_Month,uval_MTD_Secondary_Sales_UOM,txt_GrandTotal_Calendar_Year_1,val_TotalC_0_0,val_TotalC_1_0,txt_totalPOP_NAME_14,val_shop_total",
         "DISTRIBUTOR NAME,DSR NAME,Agha Traders,ASHRAF KHAN,Alamdar Road,T0001601401000016136,Hameed GS,Maan Banaspati Pouch 1X5Kg,2025,July,,2025 Total,,0.05,Hameed GS Total,0.05",
@@ -27,6 +27,7 @@ def test_ragged_csv_year_group_volume(tmp_path):
     csv_path = _write_ragged_csv(tmp_path / "sale.csv")
     df, report = parse_sales_file(csv_path)
     assert report.strategy == "ssrs_field_ids"
+    assert report.params.get("execution_date") == "20/08/2026"
     hameed = df[df["store_id"] == "T0001601401000016136"].sort_values("period")
     assert list(hameed["period"]) == ["2025-07", "2026-07"]
     # 2025 MTD column empty — must read val_TotalC_1_0, not drop the row.

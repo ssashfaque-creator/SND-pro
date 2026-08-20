@@ -13,7 +13,8 @@ from rich.table import Table
 
 from sndintel import __version__
 from sndintel.config import SAMPLE_DIR
-from sndintel.ingest.pipeline import load_brief, load_kpis, run_pipeline
+from sndintel.ingest.pipeline import load_brief, load_kpis, load_ledger, run_pipeline
+from sndintel.mtd import banner_text, period_state
 from sndintel.sampledata import generate_demo_files
 from sndintel.storage import connect, init_db, read_sql
 from sndintel.watch import scan_once, watch_forever
@@ -60,13 +61,23 @@ def brief(limit: int = typer.Option(20, help="How many ranked insights to show")
         console.print("No insights yet. Run [bold]snd-intel demo[/] or [bold]snd-intel ingest[/].")
         raise typer.Exit(1)
     kpis = load_kpis()
-    national = kpis[kpis["grain"] == "national"]
+    ledger = load_ledger()
+    national = kpis[kpis["grain"] == "national"].sort_values("period")
     if not national.empty:
-        row = national.iloc[0]
+        row = national.iloc[-1]
+        state = period_state(ledger, row["period"])
+        vol_label = f"{row['volume_mt']:.1f} MT"
+        if state["open"] and pd.notna(row.get("run_rate_mt")):
+            vol_label = f"{row['volume_mt']:.1f} MT MTD (run-rate {row['run_rate_mt']:.1f})"
+        yoy_txt = row["yoy_pct"] if pd.notna(row["yoy_pct"]) else "n/a"
+        if state["open"] and pd.notna(row.get("run_rate_yoy_pct")):
+            yoy_txt = f"run-rate {row['run_rate_yoy_pct']:+.1f}%"
+        console.print(banner_text(ledger, row["period"]))
         console.print(
-            f"[bold]Period {row['period']}[/]  volume {row['volume_mt']:.1f} MT  "
+            f"[bold]Period {row['period']}[/]  volume {vol_label}  "
             f"strike {row['strike_rate']*100:.0f}%  billed {int(row['billed_outlets'])}/{int(row['universe_outlets'])}  "
-            f"MoM {row['mom_pct'] if pd.notna(row['mom_pct']) else 'n/a'}"
+            f"MoM {row['comparable_mom_pct'] if pd.notna(row.get('comparable_mom_pct')) else (row['mom_pct'] if pd.notna(row['mom_pct']) else 'n/a')}  "
+            f"YoY {yoy_txt}"
         )
     table = Table(title="Ranked insights", show_lines=False)
     table.add_column("Sev", width=8)

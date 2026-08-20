@@ -13,6 +13,7 @@ from sndintel.ingest.shops import parse_shop_master
 from sndintel.ingest.ssrs import parse_sales_file
 from sndintel.insights import compile_insights
 from sndintel.models import cluster_shops, detect_anomalies, forecast_shop_month
+from sndintel.mtd import open_mtd_period, parse_execution_date, run_rate_factor
 from sndintel.storage import (
     connect,
     init_db,
@@ -39,6 +40,10 @@ def run_pipeline(
     shop_report = None
     if shop_path:
         shops, shop_report = parse_shop_master(shop_path)
+
+    touched_periods: list[str] = []
+    open_period: Optional[str] = None
+    execution = None
 
     with connect(db_path) as conn:
         cur = conn.execute(
@@ -122,6 +127,15 @@ def run_pipeline(
             facts = sales.copy()
             facts["source_file"] = sales_path.name
             facts["ingested_at"] = utcnow()
+            touched_periods = sorted(facts["period"].dropna().unique().tolist())
+            # Snapshot replace: the extract is the new truth for every month it contains.
+            # An August-only file updates August MTD and leaves July (and older) untouched.
+            if touched_periods:
+                placeholders = ", ".join("?" * len(touched_periods))
+                conn.execute(
+                    f"DELETE FROM sales_facts WHERE period IN ({placeholders})",
+                    tuple(touched_periods),
+                )
             upsert_dataframe(
                 conn,
                 "sales_facts",
@@ -143,6 +157,40 @@ def run_pipeline(
                 ],
                 ["store_id", "sku", "period"],
             )
+            execution = parse_execution_date(sales_report.params)
+            open_period = open_mtd_period(touched_periods, execution)
+            for per in touched_periods:
+                part = facts[facts["period"] == per]
+                status = "mtd_open" if per == open_period else "closed"
+                as_of = days = None
+                if status == "mtd_open":
+                    _factor, as_of, days = run_rate_factor(execution, per)
+                conn.execute(
+                    """INSERT INTO period_ledger
+                       (period, status, source_file, execution_date, ingested_at, n_fact_rows, volume_mt, as_of_day, days_in_month)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(period) DO UPDATE SET
+                         status=excluded.status,
+                         source_file=excluded.source_file,
+                         execution_date=excluded.execution_date,
+                         ingested_at=excluded.ingested_at,
+                         n_fact_rows=excluded.n_fact_rows,
+                         volume_mt=excluded.volume_mt,
+                         as_of_day=excluded.as_of_day,
+                         days_in_month=excluded.days_in_month
+                    """,
+                    (
+                        per,
+                        status,
+                        sales_path.name,
+                        execution.strftime("%Y-%m-%d") if execution else None,
+                        utcnow(),
+                        int(len(part)),
+                        float(part["volume_mt"].sum()),
+                        as_of,
+                        days,
+                    ),
+                )
 
         stores_df = read_sql(conn, "SELECT * FROM stores")
         facts_df = read_sql(conn, "SELECT * FROM sales_facts")
@@ -163,7 +211,10 @@ def run_pipeline(
             "zone",
             "city",
         ]
-        replace_table(conn, "shop_month", shop_month[shop_cols])
+        if not shop_month.empty:
+            replace_table(conn, "shop_month", shop_month[shop_cols])
+        else:
+            replace_table(conn, "shop_month", pd.DataFrame(columns=shop_cols))
 
         feats = build_features(shop_month, facts_df)
         replace_table(conn, "features_shop_month", feats)
@@ -172,14 +223,32 @@ def run_pipeline(
         forecasts = forecast_shop_month(feats, shop_month)
         replace_table(conn, "forecasts", forecasts)
 
-        anomalies = detect_anomalies(feats, shop_month, period) if period else pd.DataFrame()
+        ledger = read_sql(conn, "SELECT * FROM period_ledger")
+        latest_open = None
+        if not ledger.empty and "status" in ledger.columns:
+            open_rows = ledger[ledger["status"] == "mtd_open"]
+            if not open_rows.empty:
+                latest_open = str(open_rows["period"].max())
+        anomalies = (
+            detect_anomalies(feats, shop_month, period, mtd_open=bool(period and period == latest_open))
+            if period
+            else pd.DataFrame()
+        )
         replace_table(conn, "anomalies", anomalies)
 
         segments = cluster_shops(feats, shop_month, period) if period else pd.DataFrame()
         replace_table(conn, "shop_segments", segments)
 
         insights, kpis = compile_insights(
-            run_id, facts_df, stores_df, shop_month, feats, forecasts, anomalies, segments
+            run_id,
+            facts_df,
+            stores_df,
+            shop_month,
+            feats,
+            forecasts,
+            anomalies,
+            segments,
+            ledger=ledger,
         )
         conn.execute("DELETE FROM insights")
         if not insights.empty:
@@ -200,6 +269,8 @@ def run_pipeline(
             "sales_warnings": sales_report.warnings,
             "shop_strategy": shop_report.strategy if shop_report else None,
             "shop_clean_rows": shop_report.n_clean_rows if shop_report else None,
+            "replaced_periods": touched_periods,
+            "open_mtd_period": open_period,
         }
         conn.execute(
             """UPDATE pipeline_runs
@@ -227,6 +298,8 @@ def run_pipeline(
         "parser": sales_report.strategy,
         "processed_copy": str(dest) if dest else None,
         "warnings": sales_report.warnings,
+        "replaced_periods": touched_periods,
+        "open_mtd_period": open_period,
     }
 
 
@@ -244,3 +317,9 @@ def load_kpis(db_path: Optional[str | Path] = None) -> pd.DataFrame:
     init_db(db_path)
     with connect(db_path) as conn:
         return read_sql(conn, "SELECT * FROM kpi_snapshots")
+
+
+def load_ledger(db_path: Optional[str | Path] = None) -> pd.DataFrame:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        return read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")

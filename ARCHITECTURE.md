@@ -12,7 +12,8 @@ Shop master ───┘
 
 - Parsers are heuristic. They do not assume column G; they look for SSRS field ids, then human headers, then a positional distributor + POP-code + year/month + numeric MTD pattern.
 - Totals (any header containing `Total`) and repeated A–F labels are dropped.
-- Facts are upserted on `(store_id, sku, period)` so a new monthly extract overwrites that month and leaves history intact.
+- Facts for months **in the incoming file** are snapshot-replaced (DELETE then insert). An August-only extract is the new truth for August MTD and **leaves July (and every other month) untouched**. Shop–SKU lines that disappear from the new extract are removed, not left as stale MTD.
+- `period_ledger` records whether each month is `closed` or `mtd_open` (SSRS execution date before month-end). Insights for an open month use run-rate vs last year's closed month, not raw MTD vs a full August.
 - Indexes: `store_id`, `section`, `city`, `period`.
 - Shop-month panel starts at each outlet's **first billed month**. Leading zeros are not invented for areas that were not on the file yet. Later gaps *after* that first bill are real zeros (skipped / lapsed).
 - On ingest we materialise composite metrics: calendar-aware lags (MoM and YoY, not "12 rows back"), 3/6-month rolling mean and median, own z-score, recency, 12-month billed rate, top-SKU share, vs-section / vs-city, `yoy_comparable` flag.
@@ -44,12 +45,14 @@ Each module writes rows into `insights` with `type`, `severity`, `entity_*`, `na
 - **Whitespace** — master shops with zero sales history.
 - **Pareto** — top 20% billed shops’ volume share.
 - **Positive copy-ables** — DSR/SKU/section outperformance.
+- **Warehouse position** — closed YTD plus open MTD run-rate vs last year. Always ranked first so the briefing is the overall book, not “what was in the latest file”.
+- **Volume bridge** — like-for-like vs new vs lost; open MTD is paced, and unbilled-this-MTD shops are not called lost yet.
 
 ## 4. Execution
 
 - CLI `snd-intel ingest` / `watch` / `demo` / `brief` / `dashboard` / `serve-api` / `query` / `export-excel`.
 - Drop folder `data/incoming`. Marker files `*.done` prevent double processing.
-- Delta scoring is implicit: the new file is upserted, features use prior months as baseline, only residuals and new flags are ranked.
+- Delta scoring is implicit: months in the new file replace that month’s facts, features use the full history as baseline, and insights are rebuilt for the **overall warehouse**.
 - Agent contract: FastAPI read models over SQLite. Do not let an LLM parse Excel; let it `GET /search?q=` and `GET /shops/{id}`.
 
 ## 5. What this cannot see (and should not fake)

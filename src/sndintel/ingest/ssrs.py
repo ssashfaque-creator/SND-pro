@@ -194,6 +194,15 @@ def _extract_params(raw: pd.DataFrame) -> dict:
             params[key.lower().replace(" ", "_")] = m.group(1).strip()
     if "Shop SKU Wise" in blob:
         params["report_name"] = "Shop SKU Wise Execution Report"
+    exec_m = re.search(
+        r"Execution Date(?:\s*&\s*Time)?\s*:\s*(\d{1,2}/\d{1,2}/\d{4})(?:\s+(\d{1,2}:\d{2}:\d{2}))?",
+        blob,
+        flags=re.I,
+    )
+    if exec_m:
+        params["execution_date"] = exec_m.group(1)
+        if exec_m.group(2):
+            params["execution_time"] = exec_m.group(2)
     return params
 
 

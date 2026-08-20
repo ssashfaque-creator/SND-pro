@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from sndintel.mtd import banner_text, period_state
 from sndintel.storage import connect, init_db, read_sql
 
 st.set_page_config(page_title="SND Intelligence", layout="wide", page_icon="▣")
@@ -34,6 +35,7 @@ def load_all():
             "stores": read_sql(conn, "SELECT * FROM stores"),
             "forecasts": read_sql(conn, "SELECT * FROM forecasts"),
             "runs": read_sql(conn, "SELECT * FROM pipeline_runs ORDER BY run_id DESC LIMIT 5"),
+            "ledger": read_sql(conn, "SELECT * FROM period_ledger ORDER BY period"),
         }
 
 
@@ -56,17 +58,38 @@ if kpis.empty or shop_month.empty:
 national = kpis[kpis["grain"] == "national"].sort_values("period")
 latest = national.iloc[-1]
 period = latest["period"]
+ledger = data.get("ledger", pd.DataFrame())
+mtd = period_state(ledger, period)
 
 st.title("SND Intelligence")
 st.caption(
-    f"Secondary sales briefing for **{period}** · volumes in metric tons · "
-    "shop × SKU execution data scored against each outlet's own history."
+    f"Secondary sales briefing for **{mtd['label'] or period}** · volumes in metric tons · "
+    "shop × SKU execution data scored against each outlet's own history. "
+    "Insights cover the **full warehouse**, not only the latest file."
 )
+if mtd["open"]:
+    st.info(banner_text(ledger, period))
+elif not ledger.empty:
+    st.caption(banner_text(ledger, period))
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Volume", metric_or_dash(latest["volume_mt"], "{:.1f}", " MT"))
-c2.metric("MoM", metric_or_dash(latest["mom_pct"], "{:+.1f}", "%"))
-c3.metric("YoY", metric_or_dash(latest["yoy_pct"], "{:+.1f}", "%"))
+vol_help = "Billed MTD in this extract" if mtd["open"] else "Closed-month volume"
+c1.metric(
+    "Volume (MTD)" if mtd["open"] else "Volume",
+    metric_or_dash(latest["volume_mt"], "{:.1f}", " MT"),
+    help=vol_help,
+)
+mom_val = latest["comparable_mom_pct"] if mtd["open"] and "comparable_mom_pct" in latest.index else latest["mom_pct"]
+c2.metric(
+    "MoM (run-rate)" if mtd["open"] else "MoM",
+    metric_or_dash(mom_val, "{:+.1f}", "%"),
+)
+yoy_val = latest["run_rate_yoy_pct"] if mtd["open"] and "run_rate_yoy_pct" in latest.index else latest["yoy_pct"]
+c3.metric(
+    "YoY (run-rate)" if mtd["open"] else "YoY",
+    metric_or_dash(yoy_val, "{:+.1f}", "%"),
+    help="Run-rate vs last year's closed month when the latest period is still open MTD",
+)
 c4.metric(
     "Strike rate",
     metric_or_dash(latest["strike_rate"] * 100, "{:.0f}", "%"),
