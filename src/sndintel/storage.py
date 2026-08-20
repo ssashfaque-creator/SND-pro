@@ -248,9 +248,23 @@ CREATE TABLE IF NOT EXISTS unit_scorecards (
     seasonal_mom_index REAL,
     mom_expected_mt REAL,
     mom_gap_mt REAL,
+    seasonal_index REAL,
+    seasonal_typical_mt REAL,
     situation TEXT,
     metrics_json TEXT,
     PRIMARY KEY (period, grain, grain_id, parent_id)
+);
+
+CREATE TABLE IF NOT EXISTS seasonality_index (
+    period TEXT NOT NULL,
+    grain TEXT NOT NULL,
+    grain_id TEXT NOT NULL DEFAULT '',
+    month INTEGER NOT NULL,
+    seasonal_index REAL NOT NULL,
+    typical_mt REAL,
+    n_obs INTEGER,
+    credibility REAL,
+    PRIMARY KEY (period, grain, grain_id, month)
 );
 
 CREATE INDEX IF NOT EXISTS idx_units_grain ON unit_scorecards(grain, gap_mt);
@@ -378,6 +392,8 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("seasonal_mom_index", "REAL"),
             ("mom_expected_mt", "REAL"),
             ("mom_gap_mt", "REAL"),
+            ("seasonal_index", "REAL"),
+            ("seasonal_typical_mt", "REAL"),
             ("situation", "TEXT"),
         ):
             _ensure_column(conn, "unit_scorecards", col, ddl)

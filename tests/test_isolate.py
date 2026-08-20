@@ -10,7 +10,6 @@ from sndintel.isolate import (
     coverage_velocity,
     empirical_bayes,
     intra_month_fraction,
-    intra_month_prior,
     situation_brief,
 )
 
@@ -104,16 +103,20 @@ def test_empirical_bayes_shrinks_tiny_shops():
     assert abs(big) > 9
 
 
-def test_intra_month_prior_is_back_loaded_vs_linear():
-    day20 = intra_month_prior(20, 31)
-    linear = 20 / 31
-    assert day20 < linear  # month-end loading
-    assert 0.5 < day20 < 0.64
+def test_open_mtd_uses_elapsed_days_not_a_shipped_curve():
+    """Month-end totals cannot teach day 20. No handmade GT knot curve."""
     frac, src = intra_month_fraction(20, 31, None, open_mtd=True)
-    assert src == "snd_intra_month_prior"
-    assert abs(frac - day20) < 1e-9
+    assert src == "elapsed_days"
+    assert abs(frac - 20 / 31) < 1e-9
     closed, src2 = intra_month_fraction(20, 31, None, open_mtd=False)
     assert closed == 1.0 and src2 == "closed"
+    # A single month-end observation must not interpolate day 20 to 100%.
+    month_end_only = pd.DataFrame(
+        [{"period": "2025-08", "as_of_day": 31, "days_in_month": 31, "volume_mt": 100.0}]
+    )
+    frac3, src3 = intra_month_fraction(20, 31, month_end_only, open_mtd=True)
+    assert src3 == "elapsed_days"
+    assert abs(frac3 - 20 / 31) < 1e-9
 
 
 def test_hierarchy_isolates_shop_inside_a_city():

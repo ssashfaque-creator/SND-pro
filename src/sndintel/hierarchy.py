@@ -2,7 +2,9 @@
 
 Not a canned strategy. Every row is computed from the warehouse:
 
-* Expected = last-year same month (prorated if MTD is still open).
+* Expected is learned from the warehouse: typical same calendar month across
+  all history, blended with destationalized recent trend × this month's index.
+  Last year is one input, not the only one.
 * National hole = sum of city holes (additive waterfall).
 * Inside a city, hole = like-for-like drop size + lost-shop volume − new volume.
 * Diagnosis is whichever component dominates — drop size vs coverage vs whitespace.
@@ -29,7 +31,6 @@ from sndintel.isolate import (
     attach_mix,
     attach_seasonal_mom,
     empirical_bayes,
-    intra_month_fraction,
     k_from_ly,
     rewrite_action,
     seasonal_mom_expected,
@@ -37,6 +38,7 @@ from sndintel.isolate import (
     sku_industry_mix,
 )
 from sndintel.mtd import period_state
+from sndintel.season import apply_city_expected, fit_seasonality, intra_month_fraction, scale_children_expected
 from sndintel.storage import dumps
 
 
@@ -86,6 +88,8 @@ UNIT_COLUMNS = [
     "seasonal_mom_index",
     "mom_expected_mt",
     "mom_gap_mt",
+    "seasonal_index",
+    "seasonal_typical_mt",
     "situation",
     "metrics_json",
 ]
@@ -123,6 +127,7 @@ class HierarchyPack:
     national: dict[str, Any]
     units: pd.DataFrame = field(default_factory=pd.DataFrame)
     targets: pd.DataFrame = field(default_factory=pd.DataFrame)
+    seasonality: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def build_hierarchy_pack(
@@ -173,6 +178,8 @@ def build_hierarchy_pack(
     city_units["parent_grain"] = "national"
     city_units["parent_id"] = "ALL"
     city_units["city"] = city_units["grain_id"]
+    season = fit_seasonality(sm, period)
+    city_units = apply_city_expected(city_units, season, pace)
     nat_now = float(city_units["volume_mt"].sum())
     nat_ly = float(city_units["ly_mt"].sum())
     city_k = k_from_ly(city_units["ly_mt"], default=1.0)
@@ -197,6 +204,7 @@ def build_hierarchy_pack(
     dist_units["parent_grain"] = "city"
     dist_units["parent_id"] = dist_units["city"].astype(str)
     dist_units["grain_id"] = dist_units["distributor"].astype(str)
+    dist_units = scale_children_expected(dist_units, city_units, pace)
     dist_units = _enrich_children(dist_units, city_units, default_k=0.5)
     dist_units["intra_month_frac"] = pace
     dist_units["contrib_national_gap"] = dist_units["isolated_mt"]
@@ -208,6 +216,7 @@ def build_hierarchy_pack(
     dsr_units["parent_grain"] = "city"
     dsr_units["parent_id"] = dsr_units["city"].astype(str)
     dsr_units["grain_id"] = dsr_units["dsr_name"].astype(str)
+    dsr_units = scale_children_expected(dsr_units, city_units, pace)
     dsr_units = _enrich_children(dsr_units, city_units, default_k=0.2)
     dsr_units["intra_month_frac"] = pace
     dsr_units["contrib_national_gap"] = dsr_units["isolated_mt"]
@@ -219,6 +228,7 @@ def build_hierarchy_pack(
     section_units["parent_grain"] = "city"
     section_units["parent_id"] = section_units["city"].astype(str)
     section_units["grain_id"] = section_units["section"].astype(str)
+    section_units = scale_children_expected(section_units, city_units, pace)
     section_units = _enrich_children(section_units, city_units, default_k=0.3)
     section_units["intra_month_frac"] = pace
     section_units["contrib_national_gap"] = section_units["isolated_mt"]
@@ -236,6 +246,8 @@ def build_hierarchy_pack(
         nat_row["focus_score"] = 0.0
         nat_row["situation"] = "with_market"
         nat_row["intra_month_frac"] = pace
+        nat_row["seasonal_typical_mt"] = season.expected_full_national
+        nat_row["seasonal_index"] = season.national_index.get(season.month, 1.0)
         nat_row = apply_coverage_velocity(nat_row)
         nat_row = _annotate_units(nat_row, mtd, grain_label="national")
         nat_row = _rewrite_actions(nat_row, mtd, "national")
@@ -254,7 +266,9 @@ def build_hierarchy_pack(
     national = {
         "volume_mt": nat_now,
         "ly_mt": nat_ly,
-        "expected_mt": nat_ly * pace,
+        "expected_mt": (season.expected_full_national * pace)
+        if season.expected_full_national
+        else nat_ly * pace,
         "run_rate_mt": nat_now * factor,
         "gap_mt": nat_gap,
         "n_cities": int(city_units["grain_id"].nunique()) if not city_units.empty else 0,
@@ -265,9 +279,22 @@ def build_hierarchy_pack(
         "verdict": str(nat_row.iloc[0]["verdict"]) if not nat_row.empty else "watch",
         "intra_month_frac": pace,
         "intra_month_source": intra_src,
+        "n_history_periods": season.n_periods,
+        "n_same_month": season.n_same_month,
+        "seasonality_source": season.source,
+        "seasonal_index": season.national_index.get(season.month, 1.0),
+        "as_of_day": mtd.get("as_of_day"),
     }
     national.update(situation_brief(national, city_units))
-    return HierarchyPack(period=period, yoy_period=yoy_p, mtd=mtd, national=national, units=units, targets=targets)
+    return HierarchyPack(
+        period=period,
+        yoy_period=yoy_p,
+        mtd=mtd,
+        national=national,
+        units=units,
+        targets=targets,
+        seasonality=season.table,
+    )
 
 
 def _mode_or_first(s: pd.Series):

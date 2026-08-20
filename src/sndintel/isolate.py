@@ -16,12 +16,12 @@ with a robust z so we only brief statistically unusual units.
 
 Seasonality:
 
-* Calendar month is already controlled by YoY same-month.
-* Jul→Aug shape is controlled by last year's same transition (seasonal MoM).
-* Intra-month is *not* in a Shop SKU Wise snapshot (that file is MTD, not daily
-  invoices). We persist every MTD cut and, once two closed months have a curve,
-  use the empirical fraction of the month billed by this day. Until then we use
-  a documented GT secondary prior (back-loaded vs linear 20/31).
+* Calendar-month shape is **learned from every month in the warehouse** (typical
+  August, city indices shrunk toward national) — not last year alone, and not a
+  curve shipped in the code.
+* Intra-month day shape is learned from mid-month MTD cuts when they exist.
+  Month-end totals cannot teach day 20. If those cuts are missing, open MTD
+  uses elapsed calendar days of the *learned* typical month.
 """
 
 from __future__ import annotations
@@ -32,16 +32,7 @@ import numpy as np
 import pandas as pd
 
 from sndintel.io_utils import shift_period
-
-
-# Prior for a typical Pakistan GT edible-oil month: schemes and loading sit
-# in the last third. Day 20/31 ≈ 58% of the month, not 64.5% linear.
-_INTRA_KNOTS = (
-    (0.0, 0.0),
-    (10 / 31, 0.25),
-    (20 / 31, 0.58),
-    (1.0, 1.0),
-)
+from sndintel.season import intra_month_fraction  # re-export for callers / tests
 
 
 def parent_index(parent_now: float, parent_ly: float, floor: float = 1e-6) -> float:
@@ -107,64 +98,6 @@ def weighted_distribution(lost_mt: float, ly_mt: float) -> float | None:
     if ly_mt <= 1e-9:
         return None
     return 1.0 - max(0.0, float(lost_mt or 0.0)) / ly_mt
-
-
-def intra_month_prior(as_of_day: int | float, days_in_month: int | float) -> float:
-    """Back-loaded GT cumulative fraction of a closed month by this day."""
-    days = float(days_in_month or 0.0)
-    day = float(as_of_day or 0.0)
-    if days <= 0:
-        return 1.0
-    x = min(max(day / days, 0.0), 1.0)
-    xs = [p[0] for p in _INTRA_KNOTS]
-    ys = [p[1] for p in _INTRA_KNOTS]
-    return float(np.interp(x, xs, ys))
-
-
-def intra_month_fraction(
-    as_of_day: int | float | None,
-    days_in_month: int | float | None,
-    observations: pd.DataFrame | None = None,
-    open_mtd: bool = False,
-) -> tuple[float, str]:
-    """Fraction of a full month that should already be billed by as_of_day."""
-    if not open_mtd or not as_of_day or not days_in_month:
-        return 1.0, "closed"
-    as_of = int(as_of_day)
-    days = int(days_in_month)
-    emp = _empirical_mtd_frac(observations, as_of, days)
-    if emp is not None:
-        return emp, "empirical_mtd_curve"
-    return intra_month_prior(as_of, days), "snd_intra_month_prior"
-
-
-def _empirical_mtd_frac(obs: pd.DataFrame | None, as_of: int, days: int) -> float | None:
-    if obs is None or obs.empty or "period" not in obs.columns:
-        return None
-    need = {"as_of_day", "volume_mt"}
-    if not need.issubset(obs.columns):
-        return None
-    fracs = []
-    for _, g in obs.groupby("period"):
-        g = g.dropna(subset=["as_of_day", "volume_mt"]).sort_values("as_of_day")
-        if g.empty:
-            continue
-        closed = g[g["as_of_day"] >= days]
-        if closed.empty:
-            continue
-        final = float(closed["volume_mt"].iloc[-1])
-        if final <= 0:
-            continue
-        days_s = pd.to_numeric(g["as_of_day"], errors="coerce")
-        vols = pd.to_numeric(g["volume_mt"], errors="coerce")
-        mask = days_s.notna() & vols.notna()
-        if mask.sum() < 1:
-            continue
-        v = float(np.interp(as_of, days_s[mask].to_numpy(), vols[mask].to_numpy()))
-        fracs.append(min(max(v / final, 0.01), 0.99))
-    if len(fracs) < 2:
-        return None
-    return float(np.median(fracs))
 
 
 def apply_shift_share(
@@ -343,7 +276,8 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
     if weather_dir == "declining":
         weather = (
             f"{label}: the country billed {vol:.1f} MT against {expected:.1f} expected "
-            f"(last year {ly:.1f} MT, {pct:+.0f}%). That is the weather. "
+            f"from {int(national.get('n_history_periods') or 0)} months of history "
+            f"(last year {ly:.1f} MT, {pct:+.0f}% vs expected). That is the weather. "
             "A city that is simply down with the country is not a local fire."
         )
     elif weather_dir == "growing":
@@ -356,13 +290,20 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
             f"{label}: the country is roughly on last year's book ({vol:.1f} vs {expected:.1f} MT). "
             "Focus on units that are off that fair share."
         )
-    if intra_src == "snd_intra_month_prior":
+    if intra_src == "learned_mtd_cuts":
         weather += (
-            " Open MTD uses a back-loaded intra-month prior (day 20 ≈ 58% of August, not 20/31 linear). "
-            "Each extra MTD cut we ingest replaces that prior with your real curve."
+            f" Open MTD is paced from mid-month cuts already in your warehouse "
+            f"(day {national.get('as_of_day')}: {float(national.get('intra_month_frac') or 0)*100:.0f}% of a full month)."
+        )
+    elif intra_src == "elapsed_days":
+        weather += (
+            f" Typical {label[:7] if label else 'month'} is learned from "
+            f"{int(national.get('n_history_periods') or 0)} months on file. "
+            "No mid-month MTD cuts are stored, so the open month is elapsed calendar days "
+            "of that learned typical month — not a loading curve we specified."
         )
     elif intra_src == "empirical_mtd_curve":
-        weather += " Open MTD is paced off your own historical intra-month billing curve, not a straight line."
+        weather += " Open MTD is paced off your own historical intra-month billing curve."
 
     lag = pd.DataFrame()
     beat = pd.DataFrame()

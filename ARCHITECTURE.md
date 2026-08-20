@@ -40,7 +40,7 @@ Each module writes rows into `insights` with `type`, `severity`, `entity_*`, `na
 
 - **Fair-share isolation (shift-share)** — city / distributor / DSR / shop residual versus parent current book × last-year mix. Residuals sum to ~0. National declining → extra-declining units are the problem. National growing → slower-growth units are the problem. Empirical-Bayes shrinkage stops 0.02 MT shops from ranking above Eva Foods.
 - **Coverage × velocity × mix** — CPG volume identity plus SKU industry-mix versus national SKU trends.
-- **Seasonality** — YoY same month; seasonal MoM from last year's Jul→Aug shape; intra-month from empirical MTD cuts or a documented back-loaded GT prior (not linear 20/31).
+- **Seasonality** — calendar-month index and typical same-month level are **learned from every month in the warehouse** (city indices shrink toward national). Last year is one input, not the only one. Intra-month day shape is learned from mid-month MTD cuts when they exist; month-end totals cannot teach day 20, so open MTD then uses elapsed calendar days of the learned typical month. No shipped GT loading curve.
 - **Exception briefing** — `situation_brief` headline / weather / problem / do-this-week. Cities that moved with the market are not a hit-list.
 
 - **Micro vs macro** — section/DSR MoM minus national MoM. Gap ≥ 15 pp and local decline → execution failure, not category weather.

@@ -194,12 +194,10 @@ def test_open_mtd_prorates_expected():
     )
     pack = build_hierarchy_pack(pd.DataFrame(rows), _stores(rows), ledger=ledger)
     khi = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Karachi")].iloc[0]
-    from sndintel.isolate import intra_month_prior
-
-    expected = 31.0 * intra_month_prior(10, 31)
+    expected = 31.0 * (10 / 31)
     assert abs(float(khi["expected_mt"]) - expected) < 0.05
-    # Back-loaded prior is below linear 10/31, so we do not invent a -21 MT hole vs full last year.
-    assert float(khi["expected_mt"]) < 10.0
+    assert pack.national["intra_month_source"] == "elapsed_days"
+    # Elapsed days of last August, not a hole vs the full closed month.
     assert float(khi["gap_mt"]) > -21
 
 
@@ -210,9 +208,12 @@ def test_pipeline_persists_scorecards_and_rescore_does_not_need_a_file(demo, tmp
     with connect(db) as conn:
         units = read_sql(conn, "SELECT * FROM unit_scorecards")
         targets = read_sql(conn, "SELECT * FROM focus_targets")
+        season = read_sql(conn, "SELECT * FROM seasonality_index")
         conn.execute("DELETE FROM unit_scorecards")
         conn.execute("DELETE FROM focus_targets")
     assert "city" in set(units["grain"])
+    assert not season.empty
+    assert "national" in set(season["grain"])
     assert result["n_targets"] == len(targets) or not targets.empty or result["n_cities"] >= 1
     scored = rescore_warehouse(db)
     assert scored["parser"] == "rescore"

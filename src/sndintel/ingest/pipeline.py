@@ -356,6 +356,11 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
     )
     replace_table(conn, "unit_scorecards", pack.units)
     replace_table(conn, "focus_targets", pack.targets)
+    season_df = pack.seasonality if pack.seasonality is not None else pd.DataFrame()
+    if season_df is not None and not season_df.empty and "period" not in season_df.columns:
+        season_df = season_df.copy()
+        season_df["period"] = pack.period
+    replace_table(conn, "seasonality_index", season_df)
     sit = pd.DataFrame(
         [
             {

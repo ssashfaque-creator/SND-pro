@@ -87,6 +87,10 @@ def load_all():
             data["situation"] = read_sql(conn, "SELECT * FROM situation_brief")
         except Exception:
             data["situation"] = pd.DataFrame()
+        try:
+            data["seasonality"] = read_sql(conn, "SELECT * FROM seasonality_index")
+        except Exception:
+            data["seasonality"] = pd.DataFrame()
     return data
 
 
@@ -234,8 +238,9 @@ def _kpi_row(latest, mtd):
 def _page_strategy(data, latest, period, mtd, ledger):
     st.title("Briefing")
     st.caption(
-        f"**{mtd['label'] or period}** · exceptions after national weather and seasonality — "
-        "not a raw last-year comparison. Cities that moved with the country are not a local fire."
+        f"**{mtd['label'] or period}** · expected is the typical same calendar month from every month "
+        "in your warehouse — not last year alone, and not a loading curve we specified. "
+        "Cities that moved with the country are not a local fire."
     )
     if mtd["open"]:
         st.info(banner_text(ledger, period))
@@ -265,12 +270,18 @@ def _page_strategy(data, latest, period, mtd, ledger):
     problem = sit["problem"] if sit is not None else ""
     action = sit["action_summary"] if sit is not None else ""
     extra = float(nat["isolated_mt"]) if nat is not None and "isolated_mt" in nat.index else 0.0
+    n_hist = 0
+    n_same = 0
+    intra_src = ""
     if sit is not None:
         try:
             import json as _json
 
             meta = _json.loads(sit["metrics_json"]) if sit.get("metrics_json") else {}
             extra = float(meta.get("extra_hole_mt") or extra)
+            n_hist = int(meta.get("n_history_periods") or 0)
+            n_same = int(meta.get("n_same_month") or 0)
+            intra_src = str(meta.get("intra_month_source") or "")
         except Exception:
             pass
 
@@ -294,8 +305,19 @@ def _page_strategy(data, latest, period, mtd, ledger):
     c1, c2, c3, c4, c5 = st.columns(5)
     if nat is not None:
         c1.metric("Billed", metric_or_dash(nat["volume_mt"], "{:.1f}", " MT"))
-        c2.metric("Seasonal expected", metric_or_dash(nat["expected_mt"], "{:.1f}", " MT"))
-        c3.metric("vs last year", metric_or_dash(nat["gap_mt"], "{:+.1f}", " MT"))
+        hist_help = (
+            f"Typical same calendar month from {n_hist} months in the warehouse"
+            if n_hist
+            else "Typical same calendar month from warehouse history"
+        )
+        if n_same:
+            hist_help += f" ({n_same} prior {period[5:7] if period else 'same'} months, not last year alone)"
+        c2.metric(
+            "Seasonal expected",
+            metric_or_dash(nat["expected_mt"], "{:.1f}", " MT"),
+            help=hist_help,
+        )
+        c3.metric("Gap vs expected", metric_or_dash(nat["gap_mt"], "{:+.1f}", " MT"))
         extra_val = extra if extra else (
             float(cities.loc[cities["situation"] == "lagging", "isolated_mt"].sum())
             if "situation" in cities.columns
@@ -306,6 +328,21 @@ def _page_strategy(data, latest, period, mtd, ledger):
         c5.metric("Exception cities", str(n_lag))
     else:
         _kpi_row(latest, mtd)
+
+    if n_hist:
+        pace_note = ""
+        if intra_src == "elapsed_days":
+            pace_note = (
+                " Open month is elapsed calendar days of that typical month — "
+                "month-end totals cannot teach day-of-month loading."
+            )
+        elif intra_src == "learned_mtd_cuts":
+            pace_note = " Open month is paced from mid-month MTD cuts already in the warehouse."
+        st.caption(
+            f"Seasonality fitted on **{n_hist} months** already in the warehouse"
+            + (f", including **{n_same} prior same calendar months**." if n_same else ".")
+            + pace_note
+        )
 
     left, right = st.columns((1.4, 1))
     with left:
@@ -394,6 +431,28 @@ def _page_strategy(data, latest, period, mtd, ledger):
         fig = px.line(trend, x="period", y="volume_mt", markers=True, labels={"volume_mt": "MT", "period": ""})
         fig.update_layout(height=220, margin=dict(l=10, r=10, t=30, b=10), title="National volume")
         st.plotly_chart(fig, use_container_width=True)
+        season = data.get("seasonality", pd.DataFrame())
+        if season is not None and not season.empty and "month" in season.columns:
+            nat_s = season[season["grain"] == "national"].copy()
+            if not nat_s.empty:
+                names = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+                         7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+                nat_s["month_name"] = nat_s["month"].map(names)
+                nat_s = nat_s.sort_values("month")
+                fig = px.bar(
+                    nat_s,
+                    x="month_name",
+                    y="seasonal_index",
+                    labels={"seasonal_index": "index (1.0 = average month)", "month_name": ""},
+                    title=f"Calendar seasonality learned from {n_hist or 'warehouse'} months",
+                )
+                fig.add_hline(y=1.0, line_color="#94a3b8", line_width=1)
+                fig.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(
+                    "August vs January is estimated from every closed month in the warehouse. "
+                    "Day 20’s share of August is not — that needs mid-month MTD cuts."
+                )
         if targets is not None and not targets.empty:
             shops = targets[targets["grain"] == "shop"].copy()
             show_cols = [
@@ -698,6 +757,15 @@ def _page_warehouse(data):
     if not ledger.empty:
         st.subheader("Months on file")
         st.dataframe(ledger, use_container_width=True, hide_index=True)
+        st.caption(
+            f"{len(ledger)} months in the warehouse. Scorecards learn calendar-month seasonality from these totals. "
+            "A day-of-month loading curve is learned only when mid-month MTD cuts exist for the same month."
+        )
+    season = data.get("seasonality", pd.DataFrame())
+    if season is not None and not season.empty:
+        st.subheader("Learned seasonal index")
+        show = season[season["grain"].isin(["national", "city"])].copy()
+        st.dataframe(show.sort_values(["grain", "grain_id", "month"]), use_container_width=True, hide_index=True)
     st.caption("Updating the app does not wipe this warehouse. Use Strategy → Rebuild scorecards if the briefing looks stale.")
     runs = data["runs"]
     if not runs.empty:
