@@ -87,6 +87,47 @@ snd-intel watch --once
 
 JSON API (for a future agent): `snd-intel serve-api` then `GET /brief`, `/insights`, `/focus`, `/shops/{id}`, `/search?q=trade+loading`.
 
+## Install on a Mac (no git)
+
+The warehouse is **not** stored in the app folder. It lives at:
+
+`~/Library/Application Support/SND Intelligence/warehouse.db`
+
+Updating the app replaces code only. You do not re-upload July (or any closed month).
+
+**Install once** — paste into Terminal:
+
+```bash
+mkdir -p ~/sndintel /tmp/sndintel-dl
+curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/fmcg-sales-intelligence-9302.zip" -o /tmp/sndintel-dl/app.zip
+unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
+SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
+rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
+cd ~/sndintel
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -e .
+snd-intel app
+```
+
+If `curl` cannot see GitHub (private repo), download the ZIP from the GitHub page in your browser, unzip it, then `rsync` that folder to `~/sndintel` and run the `python3 -m venv` lines.
+
+In the app: **Upload files** → shop list once, then the sales extract. Later months: sales file only.
+
+**Update the app later** (warehouse stays):
+
+```bash
+curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/fmcg-sales-intelligence-9302.zip" -o /tmp/sndintel-dl/app.zip
+unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
+SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
+rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
+cd ~/sndintel
+source .venv/bin/activate
+pip install -e .
+snd-intel app
+```
+
 ## How a new file is applied
 
 The Google Drive sample is July + August in one extract. The next file you drop will often be **August only** (or a later cut of the same month as MTD grows).
@@ -116,6 +157,9 @@ src/sndintel/
   ingest/ssrs.py       SSRS chrome stripper + column inference
   ingest/shops.py      Universe parser
   ingest/pipeline.py   Snapshot-replace months in the file → features → models → insights
+  materiality.py       Pareto core / middle / long-tail (not every quiet shop is 'lost')
+  strategy.py          Five-play briefing
+  ui/app.py            Local app: upload + strategy pack
   mtd.py               Closed vs open MTD from SSRS execution date
   features.py          Shop-month panel, lags, z-scores
   models.py            XGBoost, Isolation Forest, K-Means

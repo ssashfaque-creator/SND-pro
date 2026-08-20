@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sndintel import __version__
-from sndintel.config import SAMPLE_DIR
+from sndintel.config import SAMPLE_DIR, DATA_DIR, DB_PATH
 from sndintel.ingest.pipeline import load_brief, load_kpis, load_ledger, run_pipeline
 from sndintel.mtd import banner_text, period_state
 from sndintel.sampledata import generate_demo_files
@@ -108,11 +108,23 @@ def watch_cmd(
 def dashboard(
     port: int = typer.Option(8501, help="Streamlit port"),
 ):
-    """Launch the interactive briefing app."""
+    """Launch the interactive briefing app (same as `snd-intel app`)."""
+    _launch_app(port)
+
+
+@app.command("app")
+def app_cmd(
+    port: int = typer.Option(8501, help="Streamlit port"),
+):
+    """Open the local app: upload files and the strategy briefing."""
+    _launch_app(port)
+
+
+def _launch_app(port: int) -> None:
     import subprocess
     import sys
 
-    app_path = Path(__file__).resolve().parent / "dashboard_app.py"
+    app_path = Path(__file__).resolve().parent / "ui" / "app.py"
     raise typer.Exit(
         subprocess.call(
             [
@@ -124,10 +136,21 @@ def dashboard(
                 "--server.port",
                 str(port),
                 "--server.headless",
-                "true",
+                "false",
+                "--server.maxUploadSize",
+                "500",
+                "--browser.gatherUsageStats",
+                "false",
             ]
         )
     )
+
+
+@app.command("where")
+def where_cmd():
+    """Print where the warehouse is stored (survives app updates)."""
+    console.print(f"data_dir  {DATA_DIR}")
+    console.print(f"warehouse {DB_PATH}")
 
 
 @app.command("serve-api")

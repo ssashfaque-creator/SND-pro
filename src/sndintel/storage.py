@@ -185,6 +185,23 @@ CREATE TABLE IF NOT EXISTS period_ledger (
     days_in_month INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS strategy_plays (
+    play_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER,
+    slot INTEGER,
+    theme TEXT,
+    title TEXT,
+    why TEXT,
+    do_this_week TEXT,
+    owner TEXT,
+    period TEXT,
+    metric_value REAL,
+    shops_json TEXT,
+    metrics_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_plays_slot ON strategy_plays(slot);
+
 CREATE TABLE IF NOT EXISTS kpi_snapshots (
     period TEXT NOT NULL,
     grain TEXT NOT NULL,

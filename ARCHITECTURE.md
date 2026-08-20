@@ -46,12 +46,14 @@ Each module writes rows into `insights` with `type`, `severity`, `entity_*`, `na
 - **Pareto** — top 20% billed shops’ volume share.
 - **Positive copy-ables** — DSR/SKU/section outperformance.
 - **Warehouse position** — closed YTD plus open MTD run-rate vs last year. Always ranked first so the briefing is the overall book, not “what was in the latest file”.
-- **Volume bridge** — like-for-like vs new vs lost; open MTD is paced, and unbilled-this-MTD shops are not called lost yet.
+- **Volume bridge** — like-for-like vs new vs lost, split by Pareto **core / middle / tail**. Micro shops are one coverage KPI (weighted distribution), not a lost-account dump. Irregular billers are not treated as lapses.
+- **Strategy plays** — at most five: close the month, protect the base, recover material volume, fix the beat, long-tail coverage / mix / people. Must-visit lists are material shops only.
 
 ## 4. Execution
 
-- CLI `snd-intel ingest` / `watch` / `demo` / `brief` / `dashboard` / `serve-api` / `query` / `export-excel`.
-- Drop folder `data/incoming`. Marker files `*.done` prevent double processing.
+- CLI `snd-intel app` / `ingest` / `watch` / `demo` / `brief` / `where`.
+- On a Mac the warehouse is `~/Library/Application Support/SND Intelligence/warehouse.db` so unzipping a new app build does not wipe history.
+- Local UI: upload shop list once, then incremental sales extracts. Drop folder `incoming/` still works.
 - Delta scoring is implicit: months in the new file replace that month’s facts, features use the full history as baseline, and insights are rebuilt for the **overall warehouse**.
 - Agent contract: FastAPI read models over SQLite. Do not let an LLM parse Excel; let it `GET /search?q=` and `GET /shops/{id}`.
 

@@ -12,6 +12,7 @@ import pandas as pd
 from sndintel.config import DIVERGENCE_GAP_PP, MIN_VOLUME_FLAG_MT
 from sndintel.features import latest_period, previous_period
 from sndintel.io_utils import shift_period
+from sndintel.materiality import classify_gap_shops, must_visit_recoveries
 from sndintel.mtd import period_state
 from sndintel.storage import dumps
 
@@ -47,7 +48,7 @@ def compile_insights(
     rows += _pareto_insights(shop_month, period)
     rows += _forecast_gap_insights(forecasts, shop_month, period, mtd)
     rows += _positive_insights(kpis, segments, shop_month, period)
-    rows += _volume_bridge_insights(shop_month, period, mtd)
+    rows += _volume_bridge_insights(shop_month, period, mtd, features)
     rows += _whitespace_insights(stores, shop_month, period)
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -60,8 +61,9 @@ def compile_insights(
         for s, v in zip(frame["severity"], frame["metric_value"])
     ]
     # Boost volume-backed operational issues.
-    frame.loc[frame["type"].isin(["trade_loading", "drop_off", "divergence", "coverage_gap"]), "rank_score"] += 10
+    frame.loc[frame["type"].isin(["trade_loading", "drop_off", "divergence", "coverage_gap", "recover_material"]), "rank_score"] += 10
     frame.loc[frame["type"] == "warehouse_position", "rank_score"] += 55
+    frame.loc[frame["type"].isin(["long_tail_coverage"]), "rank_score"] += 8
     frame.loc[frame["severity"] == "positive", "rank_score"] = frame.loc[frame["severity"] == "positive", "rank_score"].clip(upper=45)
     frame.loc[frame["type"] == "warehouse_position", "rank_score"] = frame.loc[
         frame["type"] == "warehouse_position", "rank_score"
@@ -913,11 +915,11 @@ def _volume_bridge_insights(
     shop_month: pd.DataFrame,
     period: str,
     mtd: dict[str, Any] | None = None,
+    features: pd.DataFrame | None = None,
 ) -> list[dict]:
-    """Split YoY movement into continuing shops vs new areas vs lost shops.
+    """YoY bridge with weighted distribution: material recoveries vs long-tail coverage.
 
-    A store that first appears this year is expansion, not 'growth from zero'.
-    Open MTD is compared on a run-rate basis against last year's closed month.
+    Tiny shops are not listed as lost accounts. Their combined volume is one coverage KPI.
     """
     yoy_p = shift_period(period, -12)
     cur = shop_month[shop_month["period"] == period]
@@ -925,50 +927,63 @@ def _volume_bridge_insights(
     if cur.empty or ly.empty:
         return []
     factor = float(mtd.get("factor") or 1.0) if mtd and mtd.get("open") else 1.0
-    cur_ids = set(cur.loc[cur["billed"] == 1, "store_id"])
-    ly_ids = set(ly.loc[ly["billed"] == 1, "store_id"])
+    gap = classify_gap_shops(shop_month, period, features)
+    cur_ids = set(cur.loc[cur["billed"] == 1, "store_id"].astype(str))
+    ly_ids = set(ly.loc[ly["billed"] == 1, "store_id"].astype(str))
     continuing = cur_ids & ly_ids
     new_ids = cur_ids - ly_ids
-    lost_ids = ly_ids - cur_ids
     cur_vol = float(cur["volume_mt"].sum())
     ly_vol = float(ly["volume_mt"].sum())
-    cont_now = float(cur.loc[cur["store_id"].isin(continuing), "volume_mt"].sum())
-    cont_ly = float(ly.loc[ly["store_id"].isin(continuing), "volume_mt"].sum())
-    new_vol = float(cur.loc[cur["store_id"].isin(new_ids), "volume_mt"].sum())
-    lost_vol = float(ly.loc[ly["store_id"].isin(lost_ids), "volume_mt"].sum())
+    cont_now = float(cur.loc[cur["store_id"].astype(str).isin(continuing), "volume_mt"].sum())
+    cont_ly = float(ly.loc[ly["store_id"].astype(str).isin(continuing), "volume_mt"].sum())
+    new_vol = float(cur.loc[cur["store_id"].astype(str).isin(new_ids), "volume_mt"].sum())
+    lost_vol = (
+        gap["volumes"]["lost_core"]
+        + gap["volumes"]["lost_middle"]
+        + gap["volumes"]["lost_tail"]
+        + gap["volumes"]["lost_occasional"]
+    )
     paced_cur = cur_vol * factor
     paced_cont = cont_now * factor
     like_pct = (paced_cont - cont_ly) / cont_ly * 100 if cont_ly else None
     headline = (paced_cur - ly_vol) / ly_vol * 100 if ly_vol else None
     raw_headline = (cur_vol - ly_vol) / ly_vol * 100 if ly_vol else None
+    c = gap["counts"]
+    v = gap["volumes"]
+    quiet_word = "not yet billed this MTD" if mtd and mtd.get("open") else "unbilled vs last year"
+    split = (
+        f"Of shops {quiet_word}: {c['lost_core']} core / {v['lost_core']:.1f} MT, "
+        f"{c['lost_middle']} productive-middle / {v['lost_middle']:.1f} MT, "
+        f"{c['lost_tail']} micro shops / {v['lost_tail']:.1f} MT, "
+        f"{c['lost_occasional']} already-irregular / {v['lost_occasional']:.1f} MT. "
+        "Put core+middle on must-visit. Treat the micro shops as a coverage KPI — together they matter, "
+        "individually they should not flood the briefing."
+    )
     if mtd and mtd.get("open"):
         narrative = (
             f"{mtd['label']}: billed {cur_vol:.1f} MT so far vs {ly_vol:.1f} MT closed in {yoy_p} "
             f"(raw {raw_headline:+.1f}% — not like-for-like). "
             f"At this pace the month would land at {paced_cur:.1f} MT ({headline:+.1f}% vs {yoy_p}). "
-            f"Like-for-like shops billed in both years: {cont_now:.1f} MTD vs {cont_ly:.1f} MT last year"
+            f"Like-for-like: {cont_now:.1f} MTD vs {cont_ly:.1f} MT last year"
             + (f" (run-rate {like_pct:+.1f}%). " if like_pct is not None else ". ")
-            + f"New shops (not billed in {yoy_p}): {len(new_ids)} / {new_vol:.1f} MT MTD. "
-            f"Shops billed last year but not yet this MTD: {len(lost_ids)} / {lost_vol:.1f} MT last year — "
-            "some of those may still bill before month-end. "
-            "New areas are counted as expansion, not as a recovery from zero."
+            + f"New shops: {len(new_ids)} / {new_vol:.1f} MT MTD. "
+            + split
         )
         action = (
             "Do not brief a YoY miss from raw MTD vs a full last-year month. "
-            "Coach like-for-like drop size; treat unbilled-this-MTD shops as still recoverable."
+            "Recover material shops first; keep a monthly cadence on the tail."
         )
         title = f"YoY volume bridge · {mtd['label']}"
     else:
         narrative = (
             f"{period} is {cur_vol:.1f} MT vs {ly_vol:.1f} MT in {yoy_p} "
             f"({headline:+.1f}% headline). "
-            f"Like-for-like (shops billed in both years): {cont_now:.1f} vs {cont_ly:.1f} MT"
+            f"Like-for-like: {cont_now:.1f} vs {cont_ly:.1f} MT"
             + (f" ({like_pct:+.1f}%). " if like_pct is not None else ". ")
-            + f"New shops (not billed in {yoy_p}): {len(new_ids)} / {new_vol:.1f} MT. "
-            f"Lost shops: {len(lost_ids)} / {lost_vol:.1f} MT. "
-            "New areas are counted as expansion, not as a recovery from zero."
+            + f"New shops: {len(new_ids)} / {new_vol:.1f} MT. "
+            + split
         )
-        action = "Coach lost-shop recovery separately from like-for-like drop size. Do not target YoY on shops that were not on file last year."
+        action = "Recover core and middle shops. Do not print a lost-shop list of every micro outlet."
         title = f"YoY volume bridge vs {yoy_p}"
     rows = [
         _insight(
@@ -986,9 +1001,16 @@ def _volume_bridge_insights(
                 "like_for_like_pct": like_pct,
                 "continuing_shops": len(continuing),
                 "new_shops": len(new_ids),
-                "lost_shops": len(lost_ids),
+                "lost_shops": c["lost_all"],
+                "lost_core_n": c["lost_core"],
+                "lost_middle_n": c["lost_middle"],
+                "lost_tail_n": c["lost_tail"],
+                "lost_occasional_n": c["lost_occasional"],
                 "new_mt": new_vol,
                 "lost_mt": lost_vol,
+                "lost_core_mt": v["lost_core"],
+                "lost_middle_mt": v["lost_middle"],
+                "lost_tail_mt": v["lost_tail"],
                 "current_mt": cur_vol,
                 "run_rate_mt": paced_cur,
                 "ly_mt": ly_vol,
@@ -996,36 +1018,85 @@ def _volume_bridge_insights(
             },
         )
     ]
-    # Sections that are genuinely new this year (no like-for-like base).
-    if new_ids:
-        sec = (
-            cur.loc[cur["store_id"].isin(new_ids)]
-            .groupby("section", as_index=False)
-            .agg(new_mt=("volume_mt", "sum"), shops=("store_id", "nunique"))
-            .sort_values("new_mt", ascending=False)
-            .head(5)
+    material_n = c["lost_core"] + c["lost_middle"]
+    material_mt = v["lost_core"] + v["lost_middle"]
+    if material_n and material_mt >= 0.05:
+        visit = must_visit_recoveries(gap, limit=8)
+        names = ", ".join(
+            f"{r.store_name} ({float(r.volume_mt):.2f} MT)"
+            for r in visit.itertuples()
+            if getattr(r, "store_name", None)
         )
-        for _, r in sec.iterrows():
-            if r["new_mt"] < 0.2:
-                continue
-            rows.append(
-                _insight(
-                    type="new_area",
-                    severity="positive",
-                    entity_type="section",
-                    entity_id=str(r["section"]),
-                    title=f"{r['section']} is adding shops that were not on file last year",
-                    narrative=(
-                        f"{int(r['shops'])} shops in {r['section']} billed {r['new_mt']:.2f} MT in {period} "
-                        f"with no bill in {yoy_p}. Treat as distribution expansion, not like-for-like growth."
-                    ),
-                    action="Keep the opening cadence; do not load extra stock just to make the first months look big.",
-                    metric_value=float(r["new_mt"]),
-                    metrics={"shops": int(r["shops"]), "new_mt": float(r["new_mt"])},
-                )
+        rows.append(
+            _insight(
+                type="recover_material",
+                severity="high" if material_mt >= 1 else "medium",
+                entity_type="national",
+                entity_id="ALL",
+                title=f"{material_n} material shops are {quiet_word} ({material_mt:.1f} MT last year)",
+                narrative=(
+                    f"These shops sat in the top 95% of last year's volume. "
+                    f"That is the recovery list. Examples: {names or 'see must-visit'}."
+                ),
+                action="Must-visit this week for those DSRs. Do not mix in the micro-shop tail.",
+                metric_value=material_mt,
+                metrics={"shops": material_n, "volume_mt": material_mt},
             )
+        )
+    if c["lost_tail"] or c["lost_occasional"]:
+        rows.append(
+            _insight(
+                type="long_tail_coverage",
+                severity="medium",
+                entity_type="national",
+                entity_id="ALL",
+                title=f"{c['lost_tail']} micro shops ({v['lost_tail']:.1f} MT) need a coverage cadence, not recovery calls",
+                narrative=(
+                    f"The bottom of last year's volume — {c['lost_tail']} shops, {v['lost_tail']:.1f} MT together — "
+                    f"is {quiet_word}. Individually they are noise; together they are {v['lost_tail']:.1f} MT. "
+                    f"{c['lost_occasional']} further shops ({v['lost_occasional']:.1f} MT) already billed irregularly, "
+                    "so a quiet month is their pattern, not a lapse."
+                ),
+                action="Set a monthly billed/universe KPI on the tail per DSR. Do not add them to the NSM must-visit pack.",
+                metric_value=v["lost_tail"],
+                metrics={
+                    "tail_shops": c["lost_tail"],
+                    "tail_mt": v["lost_tail"],
+                    "occasional_shops": c["lost_occasional"],
+                    "occasional_mt": v["lost_occasional"],
+                },
+            )
+        )
+    # Material new shops only — skip a spray of tiny first bills.
+    if new_ids:
+        material_new = cur.loc[
+            cur["store_id"].astype(str).isin(new_ids) & (cur["volume_mt"] >= 0.2)
+        ]
+        if not material_new.empty:
+            sec = (
+                material_new.groupby("section", as_index=False)
+                .agg(new_mt=("volume_mt", "sum"), shops=("store_id", "nunique"))
+                .sort_values("new_mt", ascending=False)
+                .head(5)
+            )
+            for _, r in sec.iterrows():
+                rows.append(
+                    _insight(
+                        type="new_area",
+                        severity="positive",
+                        entity_type="section",
+                        entity_id=str(r["section"]),
+                        title=f"{r['section']} is adding shops that were not on file last year",
+                        narrative=(
+                            f"{int(r['shops'])} shops in {r['section']} billed {r['new_mt']:.2f} MT in {period} "
+                            f"with no bill in {yoy_p}. Treat as distribution expansion, not like-for-like growth."
+                        ),
+                        action="Keep the opening cadence; do not load extra stock just to make the first months look big.",
+                        metric_value=float(r["new_mt"]),
+                        metrics={"shops": int(r["shops"]), "new_mt": float(r["new_mt"])},
+                    )
+                )
     return rows
-
 
 def _whitespace_insights(stores: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> list[dict]:
     if stores is None or stores.empty:
@@ -1049,7 +1120,8 @@ def _whitespace_insights(stores: pd.DataFrame, shop_month: pd.DataFrame, period:
                 narrative=(
                     f"{len(never)} outlets sit on the master list with zero history. "
                     f"Largest pocket: {top_city} ({pocket_n}) shops. "
-                    f"{len(missed)} shops (including lapsed) were not billed in {period}."
+                    f"{len(missed)} shops (including lapsed) were not billed in {period}. "
+                    "This is a universe-coverage KPI, not a list of thousands of recovery calls."
                 ),
                 action="Give each DSR a top-20 never-billed list in their own section — do not spray the whole universe.",
                 metric_value=float(len(never)),

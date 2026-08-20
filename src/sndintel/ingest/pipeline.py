@@ -7,13 +7,14 @@ from typing import Optional
 
 import pandas as pd
 
-from sndintel.config import DB_PATH, PROCESSED_DIR, ensure_dirs
+from sndintel.config import DATA_DIR, DB_PATH, PROCESSED_DIR, ensure_dirs
 from sndintel.features import add_calendar_panel, build_features, latest_period, rebuild_shop_month
 from sndintel.ingest.shops import parse_shop_master
 from sndintel.ingest.ssrs import parse_sales_file
 from sndintel.insights import compile_insights
 from sndintel.models import cluster_shops, detect_anomalies, forecast_shop_month
 from sndintel.mtd import open_mtd_period, parse_execution_date, run_rate_factor
+from sndintel.strategy import compile_plays
 from sndintel.storage import (
     connect,
     init_db,
@@ -255,6 +256,20 @@ def run_pipeline(
             insights.to_sql("insights", conn, if_exists="append", index=False)
         replace_table(conn, "kpi_snapshots", kpis)
 
+        plays = compile_plays(
+            run_id,
+            shop_month,
+            stores_df,
+            feats,
+            insights,
+            kpis,
+            anomalies,
+            ledger=ledger,
+        )
+        conn.execute("DELETE FROM strategy_plays")
+        if not plays.empty:
+            plays.to_sql("strategy_plays", conn, if_exists="append", index=False)
+
         PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
         stamp = started.replace(":", "").replace("-", "")
         dest = PROCESSED_DIR / f"{stamp}_{sales_path.name}"
@@ -300,6 +315,8 @@ def run_pipeline(
         "warnings": sales_report.warnings,
         "replaced_periods": touched_periods,
         "open_mtd_period": open_period,
+        "n_plays": int(len(plays)) if plays is not None else 0,
+        "data_dir": str(DATA_DIR),
     }
 
 
@@ -323,3 +340,9 @@ def load_ledger(db_path: Optional[str | Path] = None) -> pd.DataFrame:
     init_db(db_path)
     with connect(db_path) as conn:
         return read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
+
+
+def load_plays(db_path: Optional[str | Path] = None) -> pd.DataFrame:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        return read_sql(conn, "SELECT * FROM strategy_plays ORDER BY slot")
