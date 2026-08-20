@@ -21,7 +21,6 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.worksheet import Worksheet
 
-from sndintel.config import MIN_MATERIAL_MT
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
 from sndintel.io_utils import shift_period
@@ -51,6 +50,7 @@ GLOSSARY = [
     ("Fair share of country / city", "This unit’s last-year mix × what the parent billed now. The volume it would have if it only moved with its parent."),
     ("Extra vs country / city", "Billed minus fair share. Negative = worse than the parent after national (or city) weather. This is the local problem."),
     ("Recoverable", "The extra hole expressed as a positive number — volume that could come back if this unit merely matched its parent. max(0, −extra)."),
+    ("Shop lists (visit-worthy)", "A door is listed only if it is a real account (size ≥ 0.5 MT AMS/last year, or the 80th percentile of shops if that is higher) AND the hole is worth a call (recoverable ≥ 0.25 MT and at least 8% of that shop’s size). Smaller doors are rolled into one remainder line — coverage, not must-visit."),
     ("Situation: Lagging", "Worse than the parent’s current book. A city can be down with the country and *not* lagging."),
     ("Situation: With the country", "Moved in line with the parent. Weather, not a local fire."),
     ("Situation: Ahead", "Better than the parent’s current book."),
@@ -158,6 +158,7 @@ class StrategyPack:
     lagging_shops: pd.DataFrame = field(default_factory=pd.DataFrame)
     lagging_city_names: list[str] = field(default_factory=list)
     lagging_distributor_names: list[str] = field(default_factory=list)
+    shop_note: str = ""
 
 
 def build_strategy_pack(
@@ -214,15 +215,16 @@ def build_strategy_pack(
 
     shops = score_shops(shop_month, cities, period, pace)
     shops = _attach_ams(shops, shop_month, period, ["store_id"], ledger, pace)
+    floors = visit_shop_floors(shop_month, period)
 
     city_dist_shops = pd.DataFrame()
+    city_dist_meta = {"n_hidden": 0, "hidden_mt": 0.0}
     if not shops.empty and lagging_dist_names:
         city_dist_shops = shops[
             shops["distributor"].astype(str).isin(lagging_dist_names)
             & shops["city"].astype(str).isin(lagging_city_names)
         ].copy()
-        city_dist_shops = city_dist_shops[city_dist_shops["recoverable_mt"] > 0]
-        city_dist_shops = _sort_focus(city_dist_shops)
+        city_dist_shops, city_dist_meta = keep_visit_shops(city_dist_shops, floors, max_rows=50)
 
     all_lag_dist = dists[dists["situation"] == "lagging"].copy() if not dists.empty else dists
     all_lag_dist = _sort_focus(all_lag_dist)
@@ -230,13 +232,23 @@ def build_strategy_pack(
     all_lag_dsr = _sort_focus(all_lag_dsr)
 
     lag_shops = pd.DataFrame()
+    lag_meta = {"n_hidden": 0, "hidden_mt": 0.0}
     if not shops.empty:
-        lag_shops = shops[shops["recoverable_mt"] >= max(MIN_MATERIAL_MT, 0.05)].copy()
-        lag_shops = _sort_focus(lag_shops)
+        lag_shops, lag_meta = keep_visit_shops(shops, floors, max_rows=75)
 
     kpis["n_lagging_distributors"] = int(len(all_lag_dist)) if all_lag_dist is not None else 0
     kpis["n_lagging_dsrs"] = int(len(all_lag_dsr)) if all_lag_dsr is not None else 0
-    kpis["n_lagging_shops"] = int(len(lag_shops)) if lag_shops is not None else 0
+    kpis["n_lagging_shops"] = int(lag_meta.get("n_kept") or 0)
+    kpis["shop_size_floor_mt"] = floors["size_floor"]
+    kpis["shop_hole_floor_mt"] = floors["hole_floor"]
+    kpis["n_shops_hidden"] = int(lag_meta.get("n_hidden") or 0)
+    kpis["hidden_shop_recoverable_mt"] = float(lag_meta.get("hidden_mt") or 0)
+    shop_note = (
+        f"Visit-worthy shops only: size ≥ {floors['size_floor']:.2f} MT (AMS or last year) and "
+        f"recoverable ≥ {floors['hole_floor']:.2f} MT (and ≥ 8% of that shop’s size). "
+        f"{int(lag_meta.get('n_hidden') or 0)} smaller doors totalling "
+        f"{float(lag_meta.get('hidden_mt') or 0):.1f} MT recoverable are not listed."
+    )
 
     return StrategyPack(
         period=period,
@@ -248,12 +260,13 @@ def build_strategy_pack(
         kpis=kpis,
         cities=_present(cities, CITY_VIEW),
         city_distributors=_present(city_dists, DIST_IN_CITY_VIEW),
-        city_distributor_shops=_present(city_dist_shops, SHOP_VIEW),
+        city_distributor_shops=_present_shops(city_dist_shops, city_dist_meta),
         lagging_distributors=_present(all_lag_dist, DIST_ALL_VIEW),
         lagging_dsrs=_present(all_lag_dsr.head(250), DSR_VIEW),
-        lagging_shops=_present(lag_shops.head(400), SHOP_VIEW),
+        lagging_shops=_present_shops(lag_shops, lag_meta),
         lagging_city_names=lagging_city_names,
         lagging_distributor_names=lagging_dist_names,
+        shop_note=shop_note,
     )
 
 
@@ -282,8 +295,107 @@ def score_shops(shop_month: pd.DataFrame, cities: pd.DataFrame, period: str, pac
     ]
     gaps["recoverable_mt"] = gaps["isolated_mt"].clip(upper=0).abs()
     gaps["store_name"] = gaps["store_name"].replace("", pd.NA).fillna(gaps["store_id"])
-    material = (gaps["ly_mt"] >= MIN_MATERIAL_MT) | (gaps["recoverable_mt"] >= 0.15) | (gaps["volume_mt"] >= MIN_MATERIAL_MT)
-    return gaps.loc[material].copy()
+    return gaps.loc[gaps["recoverable_mt"] > 0].copy()
+
+
+def visit_shop_floors(shop_month: pd.DataFrame, period: str) -> dict[str, float]:
+    """Size a must-visit door from the warehouse, not a kiryana tail.
+
+    Median billed shop on this book is often ~0.02 MT. A ride-with only pays if the
+    door is a real account (~0.5 MT, or the 80th percentile of shops if the book is
+    larger) and the hole is at least 0.25 MT *and* 8% of that shop’s own size.
+    """
+    size_floor = 0.50
+    hole_floor = 0.25
+    if shop_month is None or shop_month.empty or not period:
+        return {"size_floor": size_floor, "hole_floor": hole_floor, "rel": 0.08}
+    yoy = shift_period(period, -12)
+    parts = []
+    for per in (period, yoy):
+        part = shop_month[shop_month["period"].astype(str) == str(per)]
+        if not part.empty:
+            parts.append(part.groupby("store_id")["volume_mt"].sum())
+    if not parts:
+        return {"size_floor": size_floor, "hole_floor": hole_floor, "rel": 0.08}
+    size = pd.concat(parts, axis=1).max(axis=1)
+    size = size[size > 0]
+    if len(size) >= 40:
+        p80 = float(size.quantile(0.80))
+        size_floor = float(min(max(0.50, p80), 2.00))
+    return {"size_floor": size_floor, "hole_floor": hole_floor, "rel": 0.08}
+
+
+def _account_size(df: pd.DataFrame) -> pd.Series:
+    return pd.concat(
+        [
+            pd.to_numeric(df["ams_3m"], errors="coerce") if "ams_3m" in df.columns else pd.Series(0.0, index=df.index),
+            pd.to_numeric(df["ly_mt"], errors="coerce") if "ly_mt" in df.columns else pd.Series(0.0, index=df.index),
+            pd.to_numeric(df["volume_mt"], errors="coerce") if "volume_mt" in df.columns else pd.Series(0.0, index=df.index),
+        ],
+        axis=1,
+    ).max(axis=1).fillna(0.0)
+
+
+def keep_visit_shops(
+    shops: pd.DataFrame,
+    floors: dict[str, float],
+    max_rows: int = 75,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Keep real accounts with a hole worth a visit; roll the rest into a remainder."""
+    empty_meta = {"n_kept": 0, "n_hidden": 0, "hidden_mt": 0.0, "n_pool": 0}
+    if shops is None or shops.empty:
+        return shops if shops is not None else pd.DataFrame(), empty_meta
+    out = shops.copy()
+    rec = pd.to_numeric(out.get("recoverable_mt"), errors="coerce").fillna(0.0)
+    pool = out.loc[rec > 0].copy()
+    rec = rec.loc[pool.index]
+    size = _account_size(pool)
+    size_floor = float(floors.get("size_floor") or 0.50)
+    hole_floor = float(floors.get("hole_floor") or 0.25)
+    rel = float(floors.get("rel") or 0.08)
+    need = pd.concat([pd.Series(hole_floor, index=pool.index), size * rel], axis=1).max(axis=1)
+    keep = (size >= size_floor) & (rec >= need)
+    kept = pool.loc[keep].copy()
+    hidden = pool.loc[~keep]
+    # Among visit-worthy doors, keep those that make 90% of that recoverable so
+    # a long list of similar medium shops does not bury the briefing.
+    kept = _sort_focus(kept)
+    if not kept.empty and len(kept) > 8:
+        total = float(kept["recoverable_mt"].sum()) or 1.0
+        cum = kept["recoverable_mt"].cumsum() / total
+        keep_p = cum.shift(1, fill_value=0) < 0.90
+        extra = kept.loc[~keep_p]
+        if not extra.empty:
+            hidden = pd.concat([hidden, extra], ignore_index=True)
+        kept = kept.loc[keep_p]
+    if len(kept) > max_rows:
+        extra = kept.iloc[max_rows:]
+        hidden = pd.concat([hidden, extra], ignore_index=True)
+        kept = kept.iloc[:max_rows]
+    meta = {
+        "n_kept": int(len(kept)),
+        "n_hidden": int(len(hidden)),
+        "hidden_mt": float(pd.to_numeric(hidden.get("recoverable_mt"), errors="coerce").fillna(0).sum()) if not hidden.empty else 0.0,
+        "n_pool": int(len(pool)),
+        "size_floor": size_floor,
+        "hole_floor": hole_floor,
+    }
+    return kept, meta
+
+
+def _present_shops(df: pd.DataFrame, meta: dict[str, float]) -> pd.DataFrame:
+    table = _present(df, SHOP_VIEW)
+    n_hidden = int(meta.get("n_hidden") or 0)
+    hidden_mt = float(meta.get("hidden_mt") or 0)
+    if n_hidden <= 0:
+        return table
+    rest = {label: None for _, label in SHOP_VIEW}
+    rest["Shop"] = (
+        f"Not listed — {n_hidden} smaller / shallower doors "
+        f"({hidden_mt:.1f} MT recoverable). Coverage KPI, not must-visit."
+    )
+    rest["Recoverable (MT)"] = hidden_mt
+    return pd.concat([table, pd.DataFrame([rest])], ignore_index=True)
 
 
 def ams_last_n(
@@ -346,7 +458,8 @@ def write_excel(pack: StrategyPack, path: Path | str | BytesIO) -> None:
     _sheet_table(
         wb, "03 Those dists-shops",
         "Lagging shops under those distributors",
-        "Doors behind their city, limited to the distributors named on the previous sheet. Recoverable = volume that comes back if the door merely matches the city.",
+        (pack.shop_note or "Visit-worthy doors only.")
+        + " Recoverable is volume that comes back if the door matches the city.",
         pack.city_distributor_shops,
     )
     _sheet_table(
@@ -364,7 +477,7 @@ def write_excel(pack: StrategyPack, path: Path | str | BytesIO) -> None:
     _sheet_table(
         wb, "06 All lagging shops",
         "Every lagging shop worth a visit",
-        "Material doors behind their city. Tiny 0.02 MT shops are excluded so Eva Foods is not buried.",
+        pack.shop_note or "Visit-worthy accounts only. Smaller doors are the remainder line.",
         pack.lagging_shops,
     )
     # First default sheet was cover
@@ -384,7 +497,7 @@ def render_html(pack: StrategyPack) -> str:
         ),
         _html_section(
             "3. Those distributors — lagging shops",
-            "Doors behind their city, only under the distributors above. Recoverable = volume to get back.",
+            "Doors behind their city, only under the distributors above. Visit-worthy accounts only; remainder line is the tail.",
             pack.city_distributor_shops,
         ),
         _html_section(
@@ -399,7 +512,7 @@ def render_html(pack: StrategyPack) -> str:
         ),
         _html_section(
             "6. Every lagging shop worth a visit",
-            "Material doors behind their city.",
+            "Visit-worthy doors behind their city. Smaller shops are rolled into the last row.",
             pack.lagging_shops,
         ),
         _html_glossary(),
@@ -624,10 +737,10 @@ def _sheet_cover(wb: Workbook, pack: StrategyPack) -> Worksheet:
     steps = [
         "01 Country by city — every city versus national weather. Start here. Red Extra vs country is a local fire; grey is weather.",
         "02 Lagging cities-dists — only the cities that showed up as lagging, broken by distributor. First calls.",
-        "03 Those dists-shops — lagging shops under those distributors. Recoverable is the volume you get back if the door matches the city.",
+        "03 Those dists-shops — lagging shops under those distributors that are worth a visit. Remainder line is the kiryana tail.",
         "04 All lagging distributors — every distributor behind its own city, including cities that are not national exceptions.",
         "05 All lagging DSRs — every salesperson behind their city.",
-        "06 All lagging shops — material doors behind their city. Tiny shops are excluded.",
+        "06 All lagging shops — visit-worthy doors only (size ≥ ~0.5 MT and a hole ≥ 0.25 MT). Smaller doors are one remainder line.",
     ]
     for i, line in enumerate(steps):
         ws.cell(18 + i, 1, line)
@@ -785,10 +898,10 @@ def _html_cover(pack: StrategyPack, k: dict[str, Any]) -> str:
     steps = [
         "Country by city — every city versus national weather.",
         "Lagging cities → distributors — first calls.",
-        "Those distributors → lagging shops — recoverable volume at the door.",
+        "Those distributors → lagging shops — visit-worthy doors only; remainder line is the tail.",
         "Every lagging distributor, including cities that are not national exceptions.",
         "Every lagging DSR.",
-        "Every lagging shop worth a visit (tiny doors excluded).",
+        "Every lagging shop worth a visit (kiryana tail rolled into the last row).",
     ]
     ol = "".join(f"<li>{html.escape(s)}</li>" for s in steps)
     return f"""<section class="cover">

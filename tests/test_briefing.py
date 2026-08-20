@@ -115,3 +115,31 @@ def test_excel_and_html_are_readable_packs():
     assert "AMS last 3 months" in html or "Recoverable" in html
     assert "Glossary" in html
     assert "Fair share" in html or "Extra vs" in html
+
+
+def test_tiny_shops_are_not_on_visit_lists():
+    """Kiryana tail is rolled off; a real account with a real hole stays."""
+    rows = []
+    rows.append(_row("BIG", "2026-08", 4.0, "Karachi", "Eva Foods", "Amir", name="Kifaya Mart"))
+    rows.append(_row("BIG", "2025-08", 12.0, "Karachi", "Eva Foods", "Amir", name="Kifaya Mart"))
+    rows.append(_row("HOLD", "2026-08", 12.0, "Karachi", "South Dist", "Amir", name="Hold Super"))
+    rows.append(_row("HOLD", "2025-08", 12.0, "Karachi", "South Dist", "Amir", name="Hold Super"))
+    for i in range(40):
+        rows.append(_row(f"T{i}", "2026-08", 0.0, "Karachi", "Eva Foods", "Amir", name=f"Kiryana {i}"))
+        rows.append(_row(f"T{i}", "2025-08", 0.04, "Karachi", "Eva Foods", "Amir", name=f"Kiryana {i}"))
+    rows.append(_row("L1", "2026-08", 80.0, "Lahore", "Holding Dist", "Ace", name="Lahore Super"))
+    rows.append(_row("L1", "2025-08", 80.0, "Lahore", "Holding Dist", "Ace", name="Lahore Super"))
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
+    report = build_strategy_pack(pack_h.units, sm, period="2026-08")
+    assert report.kpis["shop_size_floor_mt"] >= 0.5
+    assert report.kpis["shop_hole_floor_mt"] >= 0.25
+    names = report.lagging_shops["Shop"].astype(str)
+    assert names.str.contains("Kifaya Mart").any()
+    assert not names.str.contains("Kiryana").any()
+    assert names.str.contains("Not listed").any()
+    assert report.kpis["n_shops_hidden"] >= 20
+    drill = report.city_distributor_shops["Shop"].astype(str)
+    assert not drill.str.contains("Kiryana").any()
+    assert drill.str.contains("Kifaya Mart").any() or drill.str.contains("Not listed").any()
+

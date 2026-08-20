@@ -440,8 +440,8 @@ def _page_strategy(data, latest, period, mtd, ledger):
 
     st.markdown("##### 3. Those distributors — lagging shops")
     st.caption(
-        "Doors behind their city, limited to the distributors above. "
-        "**Recoverable** is the volume you get back if the door merely matches the city."
+        (pack.shop_note or "Visit-worthy doors only.")
+        + " **Recoverable** is the volume you get back if the door merely matches the city."
     )
     if pack.city_distributor_shops.empty:
         st.info("No material lagging shops under those distributors.")
@@ -460,8 +460,8 @@ def _page_strategy(data, latest, period, mtd, ledger):
     _strategy_table(pack.lagging_dsrs.head(60))
 
     st.markdown("##### 6. Every lagging shop worth a visit")
-    st.caption("Material doors behind their city. Tiny 0.02 MT shops are excluded so Eva Foods is not buried.")
-    _strategy_table(pack.lagging_shops.head(80), height=420)
+    st.caption(pack.shop_note or "Visit-worthy doors behind their city. Tiny kiryana is a coverage KPI, not this list.")
+    _strategy_table(pack.lagging_shops, height=420)
 
     with st.expander("How to read the columns", expanded=False):
         for term, meaning in GLOSSARY:
