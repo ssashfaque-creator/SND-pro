@@ -21,6 +21,14 @@ import numpy as np
 import pandas as pd
 
 
+def _finite(value: Any, default: float = 1.0) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) else default
+
+
 SEASON_COLUMNS = [
     "grain",
     "grain_id",
@@ -81,10 +89,10 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
         for m in range(1, 13):
             local = raw.get(m)
             natv = nat_idx.get(m, 1.0)
-            if local is None:
-                mixed[m] = natv
+            if local is None or not np.isfinite(_finite(local, default=float("nan")) if local is not None else float("nan")):
+                mixed[m] = _finite(natv)
             else:
-                mixed[m] = cred * local + (1 - cred) * natv
+                mixed[m] = _finite(cred * float(local) + (1 - cred) * _finite(natv))
         same = g[g["month"] == month]
         typical = float(same["volume_mt"].mean()) if not same.empty else float("nan")
         n_s = int(len(same))
@@ -97,20 +105,23 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
                 "typical_mt": typical if pd.notna(typical) else None,
                 "trend_mt": trend if pd.notna(trend) else None,
                 "n_same_month": n_s,
-                "seasonal_index": mixed.get(month, 1.0),
+                "seasonal_index": _finite(mixed.get(month, 1.0)),
             }
         )
         for m, val in mixed.items():
             typ_m = g.loc[g["month"] == m, "volume_mt"]
+            typical_m = float(typ_m.mean()) if len(typ_m) else None
+            if typical_m is not None and not np.isfinite(typical_m):
+                typical_m = None
             city_idx_rows.append(
                 {
                     "grain": "city",
-                    "grain_id": city,
-                    "month": m,
-                    "seasonal_index": val,
-                    "typical_mt": float(typ_m.mean()) if len(typ_m) else None,
+                    "grain_id": str(city),
+                    "month": int(m),
+                    "seasonal_index": _finite(val),
+                    "typical_mt": typical_m,
                     "n_obs": int(len(typ_m)),
-                    "credibility": cred,
+                    "credibility": _finite(cred, 0.0),
                 }
             )
     table_nat = []
@@ -121,7 +132,7 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
                 "grain": "national",
                 "grain_id": "ALL",
                 "month": m,
-                "seasonal_index": nat_idx.get(m, 1.0),
+                "seasonal_index": _finite(nat_idx.get(m, 1.0)),
                 "typical_mt": float(typ.mean()) if len(typ) else None,
                 "n_obs": int(len(typ)),
                 "credibility": 1.0,
@@ -173,9 +184,9 @@ def _iterative_month_index(frame: pd.DataFrame, rounds: int = 2) -> dict[int, fl
         if new.empty or float(new.mean() or 0) == 0:
             break
         new = new / float(new.mean())
-        idx = {int(m): float(v) for m, v in new.items()}
+        idx = {int(m): _finite(v) for m, v in new.items()}
     for m in range(1, 13):
-        idx.setdefault(m, 1.0)
+        idx[m] = _finite(idx.get(m, 1.0))
     return idx
 
 

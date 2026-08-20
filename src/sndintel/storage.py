@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+import numpy as np
 import pandas as pd
 
 from sndintel.config import DB_PATH, ensure_dirs
@@ -405,6 +407,17 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("situation", "TEXT"),
         ):
             _ensure_column(conn, "focus_targets", col, ddl)
+        for col, ddl in (
+            ("period", "TEXT"),
+            ("grain", "TEXT"),
+            ("grain_id", "TEXT"),
+            ("month", "INTEGER"),
+            ("seasonal_index", "REAL"),
+            ("typical_mt", "REAL"),
+            ("n_obs", "INTEGER"),
+            ("credibility", "REAL"),
+        ):
+            _ensure_column(conn, "seasonality_index", col, ddl)
     return db_path
 
 
@@ -414,11 +427,72 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
+def _table_columns(conn: sqlite3.Connection, name: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({name})")]
+
+
+def _sql_cell(value: Any) -> Any:
+    """SQLite-safe Python scalars. NaN becomes NULL (inf is dropped too)."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bool, np.bool_)):
+        return int(bool(value))
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        f = float(value)
+        if not math.isfinite(f):
+            return None
+        return f
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item") and not isinstance(value, (bytes, str, dict, list)):
+        try:
+            return _sql_cell(value.item())
+        except Exception:
+            pass
+    if isinstance(value, (datetime,)):
+        return value.isoformat()
+    return str(value)
+
+
 def replace_table(conn: sqlite3.Connection, name: str, df: pd.DataFrame) -> None:
+    """Replace a table without pandas.to_sql (which hides sqlite errors as DatabaseError)."""
     conn.execute(f"DELETE FROM {name}")
     if df is None or df.empty:
         return
-    df.to_sql(name, conn, if_exists="append", index=False)
+    existing = _table_columns(conn, name)
+    if not existing:
+        raise RuntimeError(f"Warehouse table {name} does not exist. Restart the app so init_db can create it.")
+    cols = [c for c in df.columns if c in existing]
+    if not cols:
+        raise RuntimeError(f"No overlapping columns when writing {name}: {list(df.columns)}")
+    work = df.loc[:, cols].copy()
+    if name == "seasonality_index" and "seasonal_index" in work.columns:
+        work["seasonal_index"] = pd.to_numeric(work["seasonal_index"], errors="coerce").fillna(1.0)
+        if "grain_id" in work.columns:
+            work["grain_id"] = work["grain_id"].fillna("(unmapped)").astype(str)
+        if "grain" in work.columns:
+            work["grain"] = work["grain"].fillna("national").astype(str)
+        if "period" in work.columns:
+            work["period"] = work["period"].fillna("").astype(str)
+        if "month" in work.columns:
+            work["month"] = pd.to_numeric(work["month"], errors="coerce").fillna(0).astype(int)
+    placeholders = ", ".join("?" * len(cols))
+    col_sql = ", ".join(cols)
+    sql = f"INSERT INTO {name} ({col_sql}) VALUES ({placeholders})"
+    rows = [tuple(_sql_cell(v) for v in rec) for rec in work.itertuples(index=False, name=None)]
+    try:
+        conn.executemany(sql, rows)
+    except Exception as exc:
+        raise RuntimeError(f"Could not write {name} ({len(rows)} rows): {exc}") from exc
 
 
 def upsert_dataframe(

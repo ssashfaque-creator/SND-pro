@@ -111,3 +111,89 @@ def test_mid_month_plus_close_learns_intra_month_frac():
     assert src20 == "learned_mtd_cuts"
     # Linear interp 10→31: day 20 is between 0.30 and 1.0, not clamped to 1.0.
     assert 0.35 < frac20 < 0.85
+
+
+def test_replace_table_accepts_nan_seasonal_index(tmp_path):
+    """NaN used to become SQL NULL and fail NOT NULL as pandas DatabaseError."""
+    from sndintel.storage import connect, init_db, read_sql, replace_table
+
+    db = tmp_path / "warehouse.db"
+    init_db(db)
+    messy = pd.DataFrame(
+        [
+            {
+                "period": "2026-08",
+                "grain": "city",
+                "grain_id": "Karachi",
+                "month": 8,
+                "seasonal_index": float("nan"),
+                "typical_mt": float("nan"),
+                "n_obs": 0,
+                "credibility": 0.2,
+            }
+        ]
+    )
+    with connect(db) as conn:
+        replace_table(conn, "seasonality_index", messy)
+        out = read_sql(conn, "SELECT * FROM seasonality_index")
+    assert len(out) == 1
+    assert abs(float(out.iloc[0]["seasonal_index"]) - 1.0) < 1e-9
+
+
+def test_rescore_persists_seasonality_with_sparse_cities(tmp_path):
+    """A tiny city with one billed month must not crash warehouse writes."""
+    from sndintel.ingest.pipeline import rescore_warehouse
+    from sndintel.storage import connect, init_db, read_sql, replace_table, utcnow
+
+    db = tmp_path / "warehouse.db"
+    init_db(db)
+    rows = []
+    start_y, start_m = 2025, 2
+    for i in range(18):
+        m = (start_m - 1 + i) % 12 + 1
+        y = start_y + (start_m - 1 + i) // 12
+        vol = 140.0 if m == 8 else (70.0 if m == 1 else 100.0)
+        rows.append(_shop_month("K1", f"{y:04d}-{m:02d}", vol, "Karachi"))
+    rows.append(_shop_month("F1", "2026-01", 0.01, "Faisalabad"))
+    rows.append(_shop_month("K1", "2026-08", 90.0, "Karachi"))
+    rows.append(_shop_month("F1", "2026-08", 0.02, "Faisalabad"))
+    sm = pd.DataFrame(rows)
+    stores = sm.drop_duplicates("store_id")[
+        ["store_id", "store_name", "distributor", "dsr_name", "zone", "city", "section"]
+    ]
+    stores = stores.copy()
+    stores["category_1"] = stores["category_2"] = stores["category_3"] = stores["category_4"] = None
+    stores["in_universe"] = 1
+    stores["extra_json"] = None
+    stores["updated_at"] = utcnow()
+    facts = pd.DataFrame(
+        {
+            "store_id": sm["store_id"],
+            "sku": "Eva 5L",
+            "period": sm["period"],
+            "year": sm["year"],
+            "month": sm["month"],
+            "volume_mt": sm["volume_mt"],
+            "distributor": sm["distributor"],
+            "dsr_name": sm["dsr_name"],
+            "section": sm["section"],
+            "store_name": sm["store_name"],
+            "source_file": "test.xlsx",
+            "ingested_at": utcnow(),
+        }
+    )
+    with connect(db) as conn:
+        replace_table(conn, "stores", stores)
+        replace_table(conn, "sales_facts", facts)
+        conn.execute(
+            """INSERT INTO period_ledger (period, status, as_of_day, days_in_month)
+               VALUES ('2026-08', 'mtd_open', 20, 31)"""
+        )
+    scored = rescore_warehouse(db)
+    assert scored["n_cities"] >= 1
+    with connect(db) as conn:
+        season = read_sql(conn, "SELECT * FROM seasonality_index")
+        units = read_sql(conn, "SELECT * FROM unit_scorecards WHERE grain = 'city'")
+    assert not season.empty
+    assert season["seasonal_index"].notna().all()
+    assert not units.empty
