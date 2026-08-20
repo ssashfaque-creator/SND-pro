@@ -232,6 +232,23 @@ CREATE TABLE IF NOT EXISTS unit_scorecards (
     verdict TEXT,
     do_this_week TEXT,
     contrib_national_gap REAL,
+    share_expected_mt REAL,
+    competitive_mt REAL,
+    isolated_mt REAL,
+    z_score REAL,
+    focus_score REAL,
+    coverage_effect_mt REAL,
+    velocity_effect_mt REAL,
+    interaction_effect_mt REAL,
+    mix_effect_mt REAL,
+    wd REAL,
+    nd REAL,
+    parent_index REAL,
+    intra_month_frac REAL,
+    seasonal_mom_index REAL,
+    mom_expected_mt REAL,
+    mom_gap_mt REAL,
+    situation TEXT,
     metrics_json TEXT,
     PRIMARY KEY (period, grain, grain_id, parent_id)
 );
@@ -255,11 +272,35 @@ CREATE TABLE IF NOT EXISTS focus_targets (
     gap_mt REAL,
     diagnosis TEXT,
     action TEXT,
-    why TEXT
+    why TEXT,
+    competitive_mt REAL,
+    isolated_mt REAL,
+    z_score REAL,
+    focus_score REAL,
+    situation TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_targets_rank ON focus_targets(rank);
 CREATE INDEX IF NOT EXISTS idx_targets_city ON focus_targets(city);
+
+CREATE TABLE IF NOT EXISTS situation_brief (
+    period TEXT PRIMARY KEY,
+    headline TEXT,
+    weather TEXT,
+    problem TEXT,
+    action_summary TEXT,
+    metrics_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mtd_observations (
+    period TEXT NOT NULL,
+    as_of_day INTEGER NOT NULL,
+    days_in_month INTEGER,
+    volume_mt REAL,
+    source_file TEXT,
+    ingested_at TEXT,
+    PRIMARY KEY (period, as_of_day)
+);
 
 CREATE TABLE IF NOT EXISTS kpi_snapshots (
     period TEXT NOT NULL,
@@ -320,6 +361,34 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("run_rate_yoy_pct", "REAL"),
         ):
             _ensure_column(conn, "kpi_snapshots", col, ddl)
+        for col, ddl in (
+            ("share_expected_mt", "REAL"),
+            ("competitive_mt", "REAL"),
+            ("isolated_mt", "REAL"),
+            ("z_score", "REAL"),
+            ("focus_score", "REAL"),
+            ("coverage_effect_mt", "REAL"),
+            ("velocity_effect_mt", "REAL"),
+            ("interaction_effect_mt", "REAL"),
+            ("mix_effect_mt", "REAL"),
+            ("wd", "REAL"),
+            ("nd", "REAL"),
+            ("parent_index", "REAL"),
+            ("intra_month_frac", "REAL"),
+            ("seasonal_mom_index", "REAL"),
+            ("mom_expected_mt", "REAL"),
+            ("mom_gap_mt", "REAL"),
+            ("situation", "TEXT"),
+        ):
+            _ensure_column(conn, "unit_scorecards", col, ddl)
+        for col, ddl in (
+            ("competitive_mt", "REAL"),
+            ("isolated_mt", "REAL"),
+            ("z_score", "REAL"),
+            ("focus_score", "REAL"),
+            ("situation", "TEXT"),
+        ):
+            _ensure_column(conn, "focus_targets", col, ddl)
     return db_path
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from calendar import monthrange
 from pathlib import Path
 from typing import Optional
 
@@ -166,6 +167,10 @@ def run_pipeline(
                 as_of = days = None
                 if status == "mtd_open":
                     _factor, as_of, days = run_rate_factor(execution, per)
+                else:
+                    year, month = int(str(per)[:4]), int(str(per)[5:7])
+                    days = monthrange(year, month)[1]
+                    as_of = days
                 conn.execute(
                     """INSERT INTO period_ledger
                        (period, status, source_file, execution_date, ingested_at, n_fact_rows, volume_mt, as_of_day, days_in_month)
@@ -192,6 +197,26 @@ def run_pipeline(
                         days,
                     ),
                 )
+                if as_of and days:
+                    conn.execute(
+                        """INSERT INTO mtd_observations
+                           (period, as_of_day, days_in_month, volume_mt, source_file, ingested_at)
+                           VALUES (?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(period, as_of_day) DO UPDATE SET
+                             volume_mt=excluded.volume_mt,
+                             days_in_month=excluded.days_in_month,
+                             source_file=excluded.source_file,
+                             ingested_at=excluded.ingested_at
+                        """,
+                        (
+                            per,
+                            int(as_of),
+                            int(days),
+                            float(part["volume_mt"].sum()),
+                            sales_path.name,
+                            utcnow(),
+                        ),
+                    )
 
         scored = _rebuild_intelligence(conn, run_id)
         period = scored["latest_period"]
@@ -321,9 +346,30 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
         insights.to_sql("insights", conn, if_exists="append", index=False)
     replace_table(conn, "kpi_snapshots", kpis)
 
-    pack = build_hierarchy_pack(shop_month, stores_df, feats, ledger)
+    pack = build_hierarchy_pack(
+        shop_month,
+        stores_df,
+        feats,
+        ledger,
+        facts=facts_df,
+        mtd_obs=read_sql(conn, "SELECT * FROM mtd_observations"),
+    )
     replace_table(conn, "unit_scorecards", pack.units)
     replace_table(conn, "focus_targets", pack.targets)
+    sit = pd.DataFrame(
+        [
+            {
+                "period": pack.period,
+                "headline": pack.national.get("headline"),
+                "weather": pack.national.get("weather"),
+                "problem": pack.national.get("problem"),
+                "action_summary": pack.national.get("action_summary"),
+                "metrics_json": pd.Series(pack.national).to_json(),
+            }
+        ]
+    ) if pack.national else pd.DataFrame()
+    if not sit.empty:
+        replace_table(conn, "situation_brief", sit)
     plays = plays_from_pack(run_id, pack)
     conn.execute("DELETE FROM strategy_plays")
     if not plays.empty:

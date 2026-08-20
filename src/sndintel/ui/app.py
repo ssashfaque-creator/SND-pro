@@ -26,6 +26,12 @@ DIAGNOSIS_COLOR = {
     "holding": "#15803d",
 }
 
+SITUATION_COLOR = {
+    "lagging": "#b91c1c",
+    "with_market": "#64748b",
+    "outperforming": "#15803d",
+}
+
 
 def _save_upload(file, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +83,10 @@ def load_all():
             data["targets"] = read_sql(conn, "SELECT * FROM focus_targets ORDER BY rank")
         except Exception:
             data["targets"] = pd.DataFrame()
+        try:
+            data["situation"] = read_sql(conn, "SELECT * FROM situation_brief")
+        except Exception:
+            data["situation"] = pd.DataFrame()
     return data
 
 
@@ -90,10 +100,13 @@ def _inject_css():
     st.markdown(
         """
         <style>
-        .block-container {padding-top: 1.1rem; max-width: 1400px;}
+        .block-container {padding-top: 1.0rem; max-width: 1440px;}
         div[data-testid="stMetricValue"] {font-size: 1.35rem;}
-        .play-card {border: 1px solid #e2e8f0; border-radius: 12px; padding: 1rem 1.1rem; margin-bottom: 0.85rem; background: #fff;}
-        .play-kicker {font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 600; margin-bottom: 0.25rem;}
+        .sit-card {border-radius: 14px; padding: 1.15rem 1.35rem; margin-bottom: 0.9rem; color: #0f172a;}
+        .sit-kicker {font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase; font-weight: 700; margin-bottom: 0.35rem;}
+        .sit-headline {font-size: 1.55rem; line-height: 1.25; font-weight: 700; margin: 0 0 0.55rem 0;}
+        .sit-body {font-size: 1.02rem; line-height: 1.45; margin: 0 0 0.4rem 0;}
+        .sit-action {font-size: 1.02rem; line-height: 1.45; margin: 0; font-weight: 600;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -219,86 +232,177 @@ def _kpi_row(latest, mtd):
 
 
 def _page_strategy(data, latest, period, mtd, ledger):
-    st.title("What to do this week")
+    st.title("Briefing")
     st.caption(
-        f"**{mtd['label'] or period}** · city → distributor → DSR → shop. "
-        "The engine reads the warehouse and names the units that move the number. "
-        "It does not paste a canned plan."
+        f"**{mtd['label'] or period}** · exceptions after national weather and seasonality — "
+        "not a raw last-year comparison. Cities that moved with the country are not a local fire."
     )
     if mtd["open"]:
         st.info(banner_text(ledger, period))
-    _kpi_row(latest, mtd)
 
     units = data.get("units", pd.DataFrame())
     targets = data.get("targets", pd.DataFrame())
     if units is None or units.empty:
         st.warning(
-            "No city scorecards yet. If sales are already in the warehouse, rebuild below. "
+            "No scorecards yet. If sales are already in the warehouse, rebuild below. "
             "Otherwise upload the shop list and sales extract."
         )
         _rescore_button()
         return
 
-    cities = units[units["grain"] == "city"].copy().sort_values("gap_mt")
+    cities = units[units["grain"] == "city"].copy()
+    if "isolated_mt" in cities.columns:
+        cities = cities.sort_values("isolated_mt")
+    else:
+        cities = cities.sort_values("gap_mt")
     national = units[units["grain"] == "national"]
     nat = national.iloc[0] if not national.empty else None
-    if nat is not None:
-        st.markdown(
-            f"**National billed {nat['volume_mt']:.1f} MT** vs **{nat['expected_mt']:.1f} expected** "
-            f"(last year {nat['ly_mt']:.1f} MT) · hole **{nat['gap_mt']:+.1f} MT** · "
-            f"{str(nat['diagnosis']).replace('_', ' ')} · {nat['verdict']}"
-        )
-        st.caption(nat["do_this_week"])
+    sit_df = data.get("situation", pd.DataFrame())
+    sit = sit_df.iloc[0] if sit_df is not None and not sit_df.empty else None
 
-    left, right = st.columns((1.45, 1))
+    headline = (sit["headline"] if sit is not None else None) or (nat.get("do_this_week") if nat is not None else None)
+    weather = sit["weather"] if sit is not None else ""
+    problem = sit["problem"] if sit is not None else ""
+    action = sit["action_summary"] if sit is not None else ""
+    extra = float(nat["isolated_mt"]) if nat is not None and "isolated_mt" in nat.index else 0.0
+    if sit is not None:
+        try:
+            import json as _json
+
+            meta = _json.loads(sit["metrics_json"]) if sit.get("metrics_json") else {}
+            extra = float(meta.get("extra_hole_mt") or extra)
+        except Exception:
+            pass
+
+    weather_dir = "declining"
+    if nat is not None and float(nat.get("gap_mt") or 0) > 1:
+        weather_dir = "growing"
+    elif nat is not None and abs(float(nat.get("gap_mt") or 0)) <= 1:
+        weather_dir = "flat"
+    bar = {"declining": "#b91c1c", "growing": "#15803d", "flat": "#334155"}[weather_dir]
+    st.markdown(
+        f'<div class="sit-card" style="background:#f8fafc;border-left:8px solid {bar}">'
+        f'<div class="sit-kicker">Situation</div>'
+        f'<p class="sit-headline">{headline or "Scorecards ready"}</p>'
+        f'<p class="sit-body">{weather}</p>'
+        f'<p class="sit-body"><b>The problem.</b> {problem}</p>'
+        f'<p class="sit-action">Do this week. {action}</p>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    if nat is not None:
+        c1.metric("Billed", metric_or_dash(nat["volume_mt"], "{:.1f}", " MT"))
+        c2.metric("Seasonal expected", metric_or_dash(nat["expected_mt"], "{:.1f}", " MT"))
+        c3.metric("vs last year", metric_or_dash(nat["gap_mt"], "{:+.1f}", " MT"))
+        extra_val = extra if extra else (
+            float(cities.loc[cities["situation"] == "lagging", "isolated_mt"].sum())
+            if "situation" in cities.columns
+            else 0.0
+        )
+        c4.metric("Extra hole after weather", metric_or_dash(extra_val, "{:+.1f}", " MT"))
+        n_lag = int((cities["situation"] == "lagging").sum()) if "situation" in cities.columns else 0
+        c5.metric("Exception cities", str(n_lag))
+    else:
+        _kpi_row(latest, mtd)
+
+    left, right = st.columns((1.4, 1))
     with left:
-        st.subheader("City waterfall (gap vs expected)")
+        st.subheader("Exceptions vs fair share")
+        st.caption(
+            "Fair share = this unit’s last-year mix × what the parent billed now. "
+            "Negative = worse than the parent (the local problem). Bars sum to ~0."
+        )
         if cities.empty:
             st.write("No city rows.")
         else:
             chart = cities.head(16).copy()
             chart["city"] = chart["grain_id"]
+            ycol = "isolated_mt" if "isolated_mt" in chart.columns else "gap_mt"
+            color = "situation" if "situation" in chart.columns else "diagnosis"
+            cmap = SITUATION_COLOR if color == "situation" else DIAGNOSIS_COLOR
             fig = px.bar(
                 chart,
                 x="city",
-                y="gap_mt",
-                color="diagnosis",
-                color_discrete_map=DIAGNOSIS_COLOR,
-                labels={"gap_mt": "Gap vs expected (MT)", "city": ""},
+                y=ycol,
+                color=color,
+                color_discrete_map=cmap,
+                labels={ycol: "vs fair share (MT)", "city": ""},
             )
-            fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-30)
+            fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-30)
+            fig.add_hline(y=0, line_color="#94a3b8", line_width=1)
             st.plotly_chart(fig, use_container_width=True)
-            show = cities[
-                [
+            cols = [
+                c
+                for c in [
                     "grain_id",
                     "zone",
                     "volume_mt",
-                    "expected_mt",
-                    "ly_mt",
-                    "gap_mt",
-                    "lfl_gap",
-                    "lost_n",
-                    "lost_mt",
-                    "billed",
-                    "universe",
-                    "strike_rate",
+                    "share_expected_mt",
+                    "isolated_mt",
+                    "z_score",
+                    "situation",
+                    "coverage_effect_mt",
+                    "velocity_effect_mt",
+                    "mix_effect_mt",
+                    "wd",
                     "diagnosis",
                     "verdict",
                 ]
-            ].rename(columns={"grain_id": "city"})
-            st.dataframe(show, use_container_width=True, hide_index=True)
+                if c in cities.columns
+            ]
+            st.dataframe(
+                cities[cols].rename(
+                    columns={
+                        "grain_id": "city",
+                        "share_expected_mt": "fair_share",
+                        "isolated_mt": "vs_parent",
+                        "coverage_effect_mt": "coverage",
+                        "velocity_effect_mt": "velocity",
+                        "mix_effect_mt": "mix",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
     with right:
-        st.subheader("National trend")
+        st.subheader("Why the extra hole (drivers)")
+        st.caption("Coverage = fewer/more billed doors. Velocity = drop size on the same numeric base. Mix = SKU shift vs national.")
+        lag = cities[cities["situation"] == "lagging"] if "situation" in cities.columns else cities.head(4)
+        if lag.empty:
+            lag = cities.head(4)
+        if not lag.empty and {"coverage_effect_mt", "velocity_effect_mt"}.issubset(lag.columns):
+            long = lag.melt(
+                id_vars=["grain_id"],
+                value_vars=[c for c in ["coverage_effect_mt", "velocity_effect_mt", "mix_effect_mt"] if c in lag.columns],
+                var_name="driver",
+                value_name="mt",
+            )
+            long["driver"] = long["driver"].str.replace("_effect_mt", "")
+            fig = px.bar(
+                long,
+                x="grain_id",
+                y="mt",
+                color="driver",
+                barmode="relative",
+                labels={"grain_id": "", "mt": "MT"},
+            )
+            fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-25)
+            st.plotly_chart(fig, use_container_width=True)
         trend = data["shop_month"].groupby("period", as_index=False)["volume_mt"].sum().sort_values("period")
         fig = px.line(trend, x="period", y="volume_mt", markers=True, labels={"volume_mt": "MT", "period": ""})
-        fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10))
+        fig.update_layout(height=220, margin=dict(l=10, r=10, t=30, b=10), title="National volume")
         st.plotly_chart(fig, use_container_width=True)
         if targets is not None and not targets.empty:
-            shops = targets[targets["grain"] == "shop"][
-                ["rank", "city", "entity_name", "distributor", "dsr_name", "volume_mt", "ly_mt", "gap_mt", "action"]
-            ].rename(columns={"entity_name": "shop"})
-            st.subheader("Must-visit (named shops)")
-            st.dataframe(shops.head(40), use_container_width=True, hide_index=True)
+            shops = targets[targets["grain"] == "shop"].copy()
+            show_cols = [
+                c
+                for c in ["rank", "city", "entity_name", "distributor", "dsr_name", "volume_mt", "ly_mt", "isolated_mt", "action"]
+                if c in shops.columns
+            ]
+            st.subheader("Must-visit (behind their city)")
+            st.dataframe(shops[show_cols].head(25).rename(columns={"entity_name": "shop", "isolated_mt": "vs_city"}), use_container_width=True, hide_index=True)
             st.download_button(
                 "Download named targets CSV",
                 targets.to_csv(index=False).encode("utf-8"),
@@ -306,81 +410,92 @@ def _page_strategy(data, latest, period, mtd, ledger):
                 mime="text/csv",
             )
 
-    st.subheader("Open a city — named people and doors")
-    for i, city in enumerate(cities.itertuples(index=False)):
-        hole = float(city.gap_mt)
-        if i >= 12 and hole > -1.0:
-            continue
-        color = DIAGNOSIS_COLOR.get(str(city.diagnosis), "#334155")
+    st.subheader("Open an exception — named people and doors")
+    show_cities = cities
+    if "situation" in cities.columns and (cities["situation"] == "lagging").any():
+        show_cities = pd.concat(
+            [
+                cities[cities["situation"] == "lagging"],
+                cities[cities["situation"] == "outperforming"].head(2),
+            ]
+        ).drop_duplicates("grain_id")
+    for i, city in enumerate(show_cities.itertuples(index=False)):
+        sit_l = str(getattr(city, "situation", "") or "")
+        iso = float(getattr(city, "isolated_mt", city.gap_mt) or 0)
+        color = SITUATION_COLOR.get(sit_l, "#334155")
         label = (
-            f"{city.grain_id}: billed {city.volume_mt:.1f} MT · should be {city.expected_mt:.1f} · "
-            f"{hole:+.1f} MT · {str(city.diagnosis).replace('_', ' ')} · {city.verdict}"
+            f"{city.grain_id}: {sit_l.replace('_', ' ') or city.verdict} · "
+            f"{iso:+.1f} MT vs fair share · {str(city.diagnosis).replace('_', ' ')}"
         )
-        with st.expander(label, expanded=i == 0):
+        with st.expander(label, expanded=i == 0 and sit_l == "lagging"):
             st.markdown(
-                f"<span style='color:{color};font-weight:600;text-transform:uppercase;letter-spacing:0.06em'>"
-                f"{str(city.diagnosis).replace('_', ' ')}</span>",
+                f"<span style='color:{color};font-weight:700;text-transform:uppercase;letter-spacing:0.06em'>"
+                f"{sit_l.replace('_', ' ') or 'city'} · {str(city.diagnosis).replace('_', ' ')}</span>",
                 unsafe_allow_html=True,
             )
             st.write(city.do_this_week)
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**Distributors**")
-                dist = units[(units["grain"] == "distributor") & (units["parent_id"] == city.grain_id)].sort_values("gap_mt")
+                st.markdown("**Distributors (vs this city)**")
+                dist = units[(units["grain"] == "distributor") & (units["parent_id"] == city.grain_id)].copy()
+                if "isolated_mt" in dist.columns:
+                    dist = dist.sort_values("isolated_mt")
+                else:
+                    dist = dist.sort_values("gap_mt")
                 if dist.empty:
                     st.caption("No distributor slice.")
                 else:
+                    dcols = [c for c in ["grain_id", "volume_mt", "share_expected_mt", "isolated_mt", "situation", "diagnosis"] if c in dist.columns]
                     st.dataframe(
-                        dist[["grain_id", "volume_mt", "ly_mt", "gap_mt", "diagnosis", "verdict"]].rename(
-                            columns={"grain_id": "distributor"}
-                        ).head(12),
+                        dist[dcols].rename(columns={"grain_id": "distributor", "share_expected_mt": "fair_share", "isolated_mt": "vs_city"}).head(12),
                         use_container_width=True,
                         hide_index=True,
                     )
-                st.markdown("**Sections / areas**")
-                sec = units[(units["grain"] == "section") & (units["parent_id"] == city.grain_id)].sort_values("gap_mt")
+                st.markdown("**Sections**")
+                sec = units[(units["grain"] == "section") & (units["parent_id"] == city.grain_id)].copy()
+                if "isolated_mt" in sec.columns:
+                    sec = sec.sort_values("isolated_mt")
                 if sec.empty:
                     st.caption("No section slice.")
                 else:
+                    scols = [c for c in ["grain_id", "volume_mt", "isolated_mt", "situation"] if c in sec.columns]
                     st.dataframe(
-                        sec[["grain_id", "volume_mt", "ly_mt", "gap_mt", "lost_n", "diagnosis"]].rename(
-                            columns={"grain_id": "section"}
-                        ).head(10),
+                        sec[scols].rename(columns={"grain_id": "section", "isolated_mt": "vs_city"}).head(10),
                         use_container_width=True,
                         hide_index=True,
                     )
             with c2:
-                st.markdown("**DSRs**")
-                dsr = units[(units["grain"] == "dsr") & (units["parent_id"] == city.grain_id)].sort_values("gap_mt")
+                st.markdown("**DSRs (vs this city)**")
+                dsr = units[(units["grain"] == "dsr") & (units["parent_id"] == city.grain_id)].copy()
+                if "isolated_mt" in dsr.columns:
+                    dsr = dsr.sort_values("isolated_mt")
                 if dsr.empty:
                     st.caption("No DSR slice.")
                 else:
+                    rcols = [c for c in ["grain_id", "volume_mt", "share_expected_mt", "isolated_mt", "situation"] if c in dsr.columns]
                     st.dataframe(
-                        dsr[["grain_id", "volume_mt", "ly_mt", "gap_mt", "diagnosis", "verdict"]].rename(
-                            columns={"grain_id": "dsr"}
-                        ).head(12),
+                        dsr[rcols].rename(columns={"grain_id": "dsr", "share_expected_mt": "fair_share", "isolated_mt": "vs_city"}).head(12),
                         use_container_width=True,
                         hide_index=True,
                     )
-                st.markdown("**Must-visit shops**")
+                st.markdown("**Must-visit shops (vs this city)**")
                 if targets is None or targets.empty:
                     st.caption("No named shops.")
                 else:
                     hit = targets[(targets["city"] == city.grain_id) & (targets["grain"] == "shop")]
                     if hit.empty:
-                        st.caption("No material shop gap in this city.")
+                        st.caption("No shop exception in this city.")
                     else:
+                        hcols = [c for c in ["entity_name", "distributor", "dsr_name", "volume_mt", "ly_mt", "isolated_mt", "action"] if c in hit.columns]
                         st.dataframe(
-                            hit[["entity_name", "distributor", "dsr_name", "section", "volume_mt", "ly_mt", "gap_mt", "action"]].rename(
-                                columns={"entity_name": "shop"}
-                            ),
+                            hit[hcols].rename(columns={"entity_name": "shop", "isolated_mt": "vs_city"}),
                             use_container_width=True,
                             hide_index=True,
                         )
 
     _rescore_button()
 
-    with st.expander("Evidence — ranked flags behind the scorecards"):
+    with st.expander("Evidence — ranked flags behind the briefing"):
         ins = data["insights"]
         if ins.empty:
             st.write("No insights stored.")
@@ -416,14 +531,21 @@ def _page_focus(data, period):
     kpis = data["kpis"]
     grains = st.selectbox("Slice", ["city", "distributor", "dsr", "section", "zone"])
     if units is not None and not units.empty and grains in set(units["grain"].dropna()):
-        slice_df = units[(units["grain"] == grains) & (units["period"] == period)].copy().sort_values("gap_mt")
+        slice_df = units[(units["grain"] == grains) & (units["period"] == period)].copy()
+        if "isolated_mt" in slice_df.columns:
+            slice_df = slice_df.sort_values("isolated_mt")
+        else:
+            slice_df = slice_df.sort_values("gap_mt")
+        ycol = "isolated_mt" if "isolated_mt" in slice_df.columns else "gap_mt"
+        color = "situation" if "situation" in slice_df.columns else "diagnosis"
+        cmap = SITUATION_COLOR if color == "situation" else DIAGNOSIS_COLOR
         fig = px.bar(
             slice_df.head(20),
             x="grain_id",
-            y="gap_mt",
-            color="diagnosis",
-            color_discrete_map=DIAGNOSIS_COLOR,
-            labels={"grain_id": grains, "gap_mt": "Gap vs expected (MT)"},
+            y=ycol,
+            color=color,
+            color_discrete_map=cmap,
+            labels={"grain_id": grains, ycol: "vs fair share (MT)"},
         )
         fig.update_layout(height=360, xaxis_tickangle=-30)
         st.plotly_chart(fig, use_container_width=True)

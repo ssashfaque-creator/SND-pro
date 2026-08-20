@@ -88,24 +88,37 @@ def brief(limit: int = typer.Option(20, help="How many ranked insights to show")
             f"YoY {yoy_txt}"
         )
     with connect() as conn:
-        cities = read_sql(conn, "SELECT * FROM unit_scorecards WHERE grain = 'city' ORDER BY gap_mt")
+        try:
+            sit = read_sql(conn, "SELECT * FROM situation_brief ORDER BY period DESC LIMIT 1")
+        except Exception:
+            sit = pd.DataFrame()
+        cities = read_sql(conn, "SELECT * FROM unit_scorecards WHERE grain = 'city' ORDER BY isolated_mt")
         shops = read_sql(conn, "SELECT * FROM focus_targets WHERE grain = 'shop' ORDER BY rank LIMIT 12")
+    if not sit.empty:
+        row_s = sit.iloc[0]
+        console.print(f"\n[bold]{row_s['headline']}[/]")
+        console.print(row_s["weather"])
+        console.print(f"[red]{row_s['problem']}[/]")
+        console.print(f"[green]{row_s['action_summary']}[/]\n")
     if not cities.empty:
-        waterfall = Table(title="City waterfall vs expected")
+        waterfall = Table(title="City exceptions vs fair share of national")
         waterfall.add_column("City", width=16)
         waterfall.add_column("Billed", justify="right")
-        waterfall.add_column("Expected", justify="right")
-        waterfall.add_column("Gap", justify="right")
-        waterfall.add_column("Diagnosis", width=12)
-        waterfall.add_column("Verdict", width=12)
+        waterfall.add_column("Fair share", justify="right")
+        waterfall.add_column("vs parent", justify="right")
+        waterfall.add_column("Situation", width=14)
+        waterfall.add_column("Driver", width=12)
         for rec in cities.head(12).itertuples(index=False):
+            fair = getattr(rec, "share_expected_mt", rec.expected_mt)
+            iso = getattr(rec, "isolated_mt", rec.gap_mt)
+            sit_l = getattr(rec, "situation", rec.verdict)
             waterfall.add_row(
                 str(rec.grain_id)[:16],
                 f"{rec.volume_mt:.1f}",
-                f"{rec.expected_mt:.1f}",
-                f"{rec.gap_mt:+.1f}",
+                f"{fair:.1f}",
+                f"{iso:+.1f}",
+                str(sit_l),
                 str(rec.diagnosis),
-                str(rec.verdict),
             )
         console.print(waterfall)
     if not shops.empty:

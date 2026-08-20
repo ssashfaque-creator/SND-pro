@@ -23,6 +23,19 @@ import pandas as pd
 from sndintel.config import MIN_MATERIAL_MT
 from sndintel.features import latest_period
 from sndintel.io_utils import shift_period
+from sndintel.isolate import (
+    apply_coverage_velocity,
+    apply_shift_share,
+    attach_mix,
+    attach_seasonal_mom,
+    empirical_bayes,
+    intra_month_fraction,
+    k_from_ly,
+    rewrite_action,
+    seasonal_mom_expected,
+    situation_brief,
+    sku_industry_mix,
+)
 from sndintel.mtd import period_state
 from sndintel.storage import dumps
 
@@ -57,6 +70,23 @@ UNIT_COLUMNS = [
     "verdict",
     "do_this_week",
     "contrib_national_gap",
+    "share_expected_mt",
+    "competitive_mt",
+    "isolated_mt",
+    "z_score",
+    "focus_score",
+    "coverage_effect_mt",
+    "velocity_effect_mt",
+    "interaction_effect_mt",
+    "mix_effect_mt",
+    "wd",
+    "nd",
+    "parent_index",
+    "intra_month_frac",
+    "seasonal_mom_index",
+    "mom_expected_mt",
+    "mom_gap_mt",
+    "situation",
     "metrics_json",
 ]
 
@@ -77,6 +107,11 @@ TARGET_COLUMNS = [
     "diagnosis",
     "action",
     "why",
+    "competitive_mt",
+    "isolated_mt",
+    "z_score",
+    "focus_score",
+    "situation",
 ]
 
 
@@ -95,16 +130,24 @@ def build_hierarchy_pack(
     stores: pd.DataFrame | None,
     features: pd.DataFrame | None = None,  # noqa: ARG001 — kept for pipeline signature
     ledger: pd.DataFrame | None = None,
+    facts: pd.DataFrame | None = None,
+    mtd_obs: pd.DataFrame | None = None,
 ) -> HierarchyPack:
     period = latest_period(shop_month)
     if not period or shop_month is None or shop_month.empty:
         return HierarchyPack(period=period or "", yoy_period="", mtd={}, national={})
     mtd = period_state(ledger, period)
     yoy_p = shift_period(period, -12)
-    pace = 1.0
-    if mtd.get("open") and mtd.get("as_of_day") and mtd.get("days_in_month"):
-        pace = float(mtd["as_of_day"]) / float(mtd["days_in_month"])
-    factor = float(mtd.get("factor") or 1.0) if mtd.get("open") else 1.0
+    intra_frac, intra_src = intra_month_fraction(
+        mtd.get("as_of_day"),
+        mtd.get("days_in_month"),
+        mtd_obs,
+        open_mtd=bool(mtd.get("open")),
+    )
+    pace = float(intra_frac)
+    factor = (1.0 / pace) if pace > 1e-9 else 1.0
+    if not mtd.get("open"):
+        factor = 1.0
 
     sm = shop_month.copy()
     sm["store_id"] = sm["store_id"].astype(str)
@@ -130,35 +173,73 @@ def build_hierarchy_pack(
     city_units["parent_grain"] = "national"
     city_units["parent_id"] = "ALL"
     city_units["city"] = city_units["grain_id"]
-    nat_gap = float(city_units["gap_mt"].sum())
-    city_units["contrib_national_gap"] = city_units["gap_mt"]
+    nat_now = float(city_units["volume_mt"].sum())
+    nat_ly = float(city_units["ly_mt"].sum())
+    city_k = k_from_ly(city_units["ly_mt"], default=1.0)
+    city_units = apply_coverage_velocity(city_units)
+    city_units = apply_shift_share(city_units, nat_now, nat_ly, city_k)
+    facts_city = _facts_with_geo(facts, stores, sm, period, yoy_p)
+    if facts_city is not None:
+        fnow, fly = facts_city
+        mix = sku_industry_mix(fnow, fly, ["city"])
+        city_units = attach_mix(city_units, mix.rename(columns={"city": "grain_id"}), ["grain_id"])
+    mom = seasonal_mom_expected(sm, period, ["city"])
+    city_units = attach_seasonal_mom(
+        city_units, mom.rename(columns={"city": "grain_id"}) if not mom.empty else mom, ["grain_id"]
+    )
+    city_units["intra_month_frac"] = pace
+    city_units["contrib_national_gap"] = city_units["isolated_mt"]
     city_units = _annotate_units(city_units, mtd, grain_label="city")
+    city_units = _rewrite_actions(city_units, mtd, "city")
 
     dist_units = _grain_bridge(cur, ly, ["city", "distributor"], None, pace, factor)
     dist_units["grain"] = "distributor"
     dist_units["parent_grain"] = "city"
     dist_units["parent_id"] = dist_units["city"].astype(str)
     dist_units["grain_id"] = dist_units["distributor"].astype(str)
-    dist_units["contrib_national_gap"] = dist_units["gap_mt"]
+    dist_units = _enrich_children(dist_units, city_units, default_k=0.5)
+    dist_units["intra_month_frac"] = pace
+    dist_units["contrib_national_gap"] = dist_units["isolated_mt"]
     dist_units = _annotate_units(dist_units, mtd, grain_label="distributor")
+    dist_units = _rewrite_actions(dist_units, mtd, "distributor")
 
     dsr_units = _grain_bridge(cur, ly, ["city", "dsr_name"], None, pace, factor)
     dsr_units["grain"] = "dsr"
     dsr_units["parent_grain"] = "city"
     dsr_units["parent_id"] = dsr_units["city"].astype(str)
     dsr_units["grain_id"] = dsr_units["dsr_name"].astype(str)
-    dsr_units["contrib_national_gap"] = dsr_units["gap_mt"]
+    dsr_units = _enrich_children(dsr_units, city_units, default_k=0.2)
+    dsr_units["intra_month_frac"] = pace
+    dsr_units["contrib_national_gap"] = dsr_units["isolated_mt"]
     dsr_units = _annotate_units(dsr_units, mtd, grain_label="dsr")
+    dsr_units = _rewrite_actions(dsr_units, mtd, "dsr")
 
     section_units = _grain_bridge(cur, ly, ["city", "section"], None, pace, factor)
     section_units["grain"] = "section"
     section_units["parent_grain"] = "city"
     section_units["parent_id"] = section_units["city"].astype(str)
     section_units["grain_id"] = section_units["section"].astype(str)
-    section_units["contrib_national_gap"] = section_units["gap_mt"]
+    section_units = _enrich_children(section_units, city_units, default_k=0.3)
+    section_units["intra_month_frac"] = pace
+    section_units["contrib_national_gap"] = section_units["isolated_mt"]
     section_units = _annotate_units(section_units, mtd, grain_label="section")
+    section_units = _rewrite_actions(section_units, mtd, "section")
 
+    nat_gap = float(city_units["gap_mt"].sum())
     nat_row = _national_unit(city_units, period, mtd, pace, factor)
+    if not nat_row.empty:
+        nat_row["parent_index"] = 1.0
+        nat_row["share_expected_mt"] = nat_row["expected_mt"]
+        nat_row["competitive_mt"] = 0.0
+        nat_row["isolated_mt"] = 0.0
+        nat_row["z_score"] = 0.0
+        nat_row["focus_score"] = 0.0
+        nat_row["situation"] = "with_market"
+        nat_row["intra_month_frac"] = pace
+        nat_row = apply_coverage_velocity(nat_row)
+        nat_row = _annotate_units(nat_row, mtd, grain_label="national")
+        nat_row = _rewrite_actions(nat_row, mtd, "national")
+
     units = pd.concat(
         [nat_row, city_units, dist_units, dsr_units, section_units],
         ignore_index=True,
@@ -171,17 +252,21 @@ def build_hierarchy_pack(
         cur, ly, city_units, dist_units, dsr_units, section_units, stores, period, mtd, pace
     )
     national = {
-        "volume_mt": float(cur["volume_mt"].sum()),
-        "ly_mt": float(ly["volume_mt"].sum()) if not ly.empty else 0.0,
-        "expected_mt": float(ly["volume_mt"].sum()) * pace if not ly.empty else 0.0,
-        "run_rate_mt": float(cur["volume_mt"].sum()) * factor,
+        "volume_mt": nat_now,
+        "ly_mt": nat_ly,
+        "expected_mt": nat_ly * pace,
+        "run_rate_mt": nat_now * factor,
         "gap_mt": nat_gap,
         "n_cities": int(city_units["grain_id"].nunique()) if not city_units.empty else 0,
         "open_mtd": bool(mtd.get("open")),
         "label": mtd.get("label") or period,
+        "period": period,
         "diagnosis": str(nat_row.iloc[0]["diagnosis"]) if not nat_row.empty else "mixed",
         "verdict": str(nat_row.iloc[0]["verdict"]) if not nat_row.empty else "watch",
+        "intra_month_frac": pace,
+        "intra_month_source": intra_src,
     }
+    national.update(situation_brief(national, city_units))
     return HierarchyPack(period=period, yoy_period=yoy_p, mtd=mtd, national=national, units=units, targets=targets)
 
 
@@ -191,6 +276,65 @@ def _mode_or_first(s: pd.Series):
         return "(unmapped)"
     mode = m.mode()
     return str(mode.iloc[0]) if len(mode) else str(m.iloc[0])
+
+
+def _rewrite_actions(df: pd.DataFrame, mtd: dict[str, Any], grain_label: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["do_this_week"] = [rewrite_action(r, mtd, grain_label) for _, r in out.iterrows()]
+    return out
+
+
+def _enrich_children(df: pd.DataFrame, parents: pd.DataFrame, default_k: float) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    parent_now = {}
+    parent_ly = {}
+    if parents is not None and not parents.empty:
+        for _, r in parents.iterrows():
+            parent_now[str(r["grain_id"])] = float(r["volume_mt"] or 0)
+            parent_ly[str(r["grain_id"])] = float(r["ly_mt"] or 0)
+    parts = []
+    for pid, g in df.groupby("parent_id", dropna=False):
+        pid_s = str(pid)
+        now = parent_now.get(pid_s, float(g["volume_mt"].sum()))
+        ly = parent_ly.get(pid_s, float(g["ly_mt"].sum()))
+        k = k_from_ly(g["ly_mt"], default=default_k)
+        g = apply_coverage_velocity(g)
+        g = apply_shift_share(g, now, ly, k)
+        parts.append(g)
+    return pd.concat(parts, ignore_index=True) if parts else df
+
+
+def _facts_with_geo(
+    facts: pd.DataFrame | None,
+    stores: pd.DataFrame | None,
+    sm: pd.DataFrame,
+    period: str,
+    yoy_p: str,
+) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    if facts is None or facts.empty:
+        return None
+    f = facts.copy()
+    if "city" not in f.columns or f["city"].isna().all():
+        if stores is not None and not stores.empty and "city" in stores.columns:
+            geo = stores[["store_id", "city"]].drop_duplicates("store_id")
+            geo["store_id"] = geo["store_id"].astype(str)
+            f["store_id"] = f["store_id"].astype(str)
+            f = f.merge(geo, on="store_id", how="left", suffixes=("", "_g"))
+            if "city_g" in f.columns:
+                f["city"] = f["city"].fillna(f["city_g"]) if "city" in f.columns else f["city_g"]
+        if "city" not in f.columns or f["city"].isna().all():
+            cmap = sm.groupby("store_id")["city"].last()
+            f["store_id"] = f["store_id"].astype(str)
+            f["city"] = f["store_id"].map(cmap)
+    f["city"] = f["city"].fillna("(unmapped)").replace("", "(unmapped)")
+    now = f[f["period"] == period]
+    ly = f[f["period"] == yoy_p]
+    if now.empty or ly.empty:
+        return None
+    return now, ly
 
 
 def _universe_by_city(stores: pd.DataFrame | None) -> pd.Series:
@@ -499,20 +643,44 @@ def _focus_targets(
     rows: list[dict[str, Any]] = []
     if cities.empty:
         return pd.DataFrame(columns=TARGET_COLUMNS)
-    ranked_cities = cities.sort_values("gap_mt")
-    focus_cities = ranked_cities.head(10)
-    extra = ranked_cities[ranked_cities["gap_mt"] <= -1.0]
-    focus_cities = pd.concat([focus_cities, extra]).drop_duplicates("grain_id")
+    sort_col = "isolated_mt" if "isolated_mt" in cities.columns else "gap_mt"
+    ranked_cities = cities.sort_values(sort_col)
+    if "situation" in ranked_cities.columns:
+        lagging = ranked_cities[ranked_cities["situation"] == "lagging"]
+        focus_cities = lagging if not lagging.empty else ranked_cities.head(8)
+    else:
+        focus_cities = ranked_cities.head(10)
+        extra = ranked_cities[ranked_cities["gap_mt"] <= -1.0]
+        focus_cities = pd.concat([focus_cities, extra]).drop_duplicates("grain_id")
 
     shop_gap = _shop_gaps(cur, ly, pace)
+    if not shop_gap.empty and not cities.empty:
+        idx_map = {
+            str(r.grain_id): (float(r.volume_mt or 0) / float(r.ly_mt) if float(r.ly_mt or 0) else 1.0)
+            for r in cities.itertuples(index=False)
+        }
+        shop_gap["parent_index"] = shop_gap["city"].map(idx_map).fillna(1.0)
+        shop_gap["competitive_mt"] = shop_gap["volume_mt"] - shop_gap["ly_mt"] * shop_gap["parent_index"]
+        k_shop = k_from_ly(shop_gap["ly_mt"], 0.05)
+        shop_gap["isolated_mt"] = [
+            empirical_bayes(c, ly, k_shop)
+            for c, ly in zip(shop_gap["competitive_mt"], shop_gap["ly_mt"])
+        ]
+    else:
+        shop_gap["competitive_mt"] = shop_gap.get("gap_mt", 0)
+        shop_gap["isolated_mt"] = shop_gap.get("gap_mt", 0)
 
     for _, city in focus_cities.iterrows():
         city_name = str(city["grain_id"])
         diagnosis = str(city["diagnosis"])
         zone = city.get("zone")
-        cd = dists[dists["parent_id"] == city_name].sort_values("gap_mt") if not dists.empty else dists
+        cd = dists[dists["parent_id"] == city_name].copy() if not dists.empty else dists
+        if not cd.empty:
+            cd = cd.sort_values("isolated_mt" if "isolated_mt" in cd.columns else "gap_mt")
         for rec in cd.itertuples(index=False):
-            if float(rec.gap_mt) > -0.15:
+            iso = float(getattr(rec, "isolated_mt", rec.gap_mt) or 0)
+            sit = str(getattr(rec, "situation", "") or "")
+            if iso > 0.15:
                 continue
             if len([r for r in rows if r["city"] == city_name and r["grain"] == "distributor"]) >= 5:
                 break
@@ -532,12 +700,21 @@ def _focus_targets(
                     rec.gap_mt,
                     rec.diagnosis,
                     rec.do_this_week,
-                    f"{rec.grain_id} is {float(rec.gap_mt):+.1f} MT vs expected in {city_name}.",
+                    f"{rec.grain_id} is {iso:+.1f} MT vs fair share of {city_name} (billed {float(rec.volume_mt):.1f} vs {float(getattr(rec, 'share_expected_mt', rec.ly_mt) or 0):.1f} expected from parent).",
+                    iso,
+                    iso,
+                    float(getattr(rec, "z_score", 0) or 0),
+                    float(getattr(rec, "focus_score", 0) or 0),
+                    sit or None,
                 )
             )
-        cs = dsrs[dsrs["parent_id"] == city_name].sort_values("gap_mt") if not dsrs.empty else dsrs
+        cs = dsrs[dsrs["parent_id"] == city_name].copy() if not dsrs.empty else dsrs
+        if not cs.empty:
+            cs = cs.sort_values("isolated_mt" if "isolated_mt" in cs.columns else "gap_mt")
         for rec in cs.itertuples(index=False):
-            if float(rec.gap_mt) > -0.15:
+            iso = float(getattr(rec, "isolated_mt", rec.gap_mt) or 0)
+            sit = str(getattr(rec, "situation", "") or "")
+            if iso > 0.15:
                 continue
             if len([r for r in rows if r["city"] == city_name and r["grain"] == "dsr"]) >= 4:
                 break
@@ -557,12 +734,21 @@ def _focus_targets(
                     rec.gap_mt,
                     rec.diagnosis,
                     f"Ride-with {rec.grain_id} this week. {rec.do_this_week}",
-                    f"{rec.grain_id} is {float(rec.gap_mt):+.1f} MT vs expected in {city_name}.",
+                    f"{rec.grain_id} is {iso:+.1f} MT vs fair share of {city_name}.",
+                    iso,
+                    iso,
+                    float(getattr(rec, "z_score", 0) or 0),
+                    float(getattr(rec, "focus_score", 0) or 0),
+                    sit or None,
                 )
             )
-        sec = sections[sections["parent_id"] == city_name].sort_values("gap_mt") if not sections.empty else sections
+        sec = sections[sections["parent_id"] == city_name].copy() if not sections.empty else sections
+        if not sec.empty:
+            sec = sec.sort_values("isolated_mt" if "isolated_mt" in sec.columns else "gap_mt")
         for rec in sec.itertuples(index=False):
-            if float(rec.gap_mt) > -0.15:
+            iso = float(getattr(rec, "isolated_mt", rec.gap_mt) or 0)
+            sit = str(getattr(rec, "situation", "") or "")
+            if iso > 0.15:
                 continue
             if len([r for r in rows if r["city"] == city_name and r["grain"] == "section"]) >= 4:
                 break
@@ -582,16 +768,22 @@ def _focus_targets(
                     rec.gap_mt,
                     rec.diagnosis,
                     f"Beat {rec.grain_id}: {rec.do_this_week}",
-                    f"Section {rec.grain_id} is {float(rec.gap_mt):+.1f} MT vs expected in {city_name}.",
+                    f"Section {rec.grain_id} is {iso:+.1f} MT vs fair share of {city_name}.",
+                    iso,
+                    iso,
+                    float(getattr(rec, "z_score", 0) or 0),
+                    float(getattr(rec, "focus_score", 0) or 0),
+                    sit or None,
                 )
             )
         pick = _pick_city_shops(city_name, diagnosis, shop_gap, stores, cur)
         for rec in pick.itertuples(index=False):
             vol = float(rec.volume_mt)
+            iso = float(getattr(rec, "isolated_mt", rec.gap_mt) or 0)
             action = (
-                "Must-visit: drop is off this shop's own last-year bill. Confirm stock, credit, competitor fill-in."
+                "Must-visit: this door is behind its city's fair share. Confirm stock, credit, competitor fill-in."
                 if vol > 0
-                else "Must-visit: billed last year, quiet this period."
+                else "Must-visit: billed last year, quiet this period — and behind the city's index."
             )
             if diagnosis == "whitespace" and vol <= 0:
                 action = "Universe door, not billed this period. Put it on a coverage beat — do not wait for inbound."
@@ -614,14 +806,20 @@ def _focus_targets(
                     diagnosis,
                     action,
                     f"{rec.store_name or rec.store_id} {float(rec.volume_mt):.2f} MT vs {float(rec.ly_mt):.2f} last year "
-                    f"({float(rec.gap_mt):+.2f} MT vs expected).",
+                    f"({iso:+.2f} MT vs the city's fair share).",
+                    iso,
+                    iso,
+                    0.0,
+                    -iso,
+                    "lagging" if iso < -0.05 else "with_market",
                 )
             )
 
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=TARGET_COLUMNS)
-    out = out.sort_values("gap_mt").reset_index(drop=True)
+    sort_t = "isolated_mt" if "isolated_mt" in out.columns else "gap_mt"
+    out = out.sort_values(sort_t).reset_index(drop=True)
     out["rank"] = np.arange(1, len(out) + 1)
     return out[TARGET_COLUMNS]
 
@@ -665,11 +863,14 @@ def _pick_city_shops(
         material = city_shops
     if diagnosis == "drop_size":
         cont = material[material["volume_mt"] > 0]
-        return (cont if not cont.empty else material).nsmallest(8, "gap_mt")
-    if diagnosis == "coverage":
+        pool = cont if not cont.empty else material
+    elif diagnosis == "coverage":
         quiet = material[material["volume_mt"] <= 0]
-        return (quiet if not quiet.empty else material).nsmallest(8, "gap_mt")
-    return material.nsmallest(8, "gap_mt")
+        pool = quiet if not quiet.empty else material
+    else:
+        pool = material
+    sort_col = "isolated_mt" if "isolated_mt" in pool.columns else "gap_mt"
+    return pool.nsmallest(8, sort_col)
 
 
 def _shop_gaps(cur: pd.DataFrame, ly: pd.DataFrame, pace: float) -> pd.DataFrame:
@@ -739,6 +940,11 @@ def _target(
     diagnosis: Any,
     action: Any,
     why: Any,
+    competitive_mt: Any = 0,
+    isolated_mt: Any = 0,
+    z_score: Any = 0,
+    focus_score: Any = 0,
+    situation: Any = None,
 ) -> dict[str, Any]:
     def _s(v: Any) -> str | None:
         if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -763,6 +969,11 @@ def _target(
         "diagnosis": _s(diagnosis),
         "action": _s(action) or "",
         "why": _s(why) or "",
+        "competitive_mt": float(competitive_mt or 0),
+        "isolated_mt": float(isolated_mt or 0),
+        "z_score": float(z_score or 0),
+        "focus_score": float(focus_score or 0),
+        "situation": _s(situation),
     }
 
 
@@ -785,7 +996,11 @@ def plays_from_pack(run_id: int, pack: HierarchyPack) -> pd.DataFrame:
     """Turn the hierarchy into a short named briefing — still data-driven, not a template."""
     if pack.units is None or pack.units.empty:
         return pd.DataFrame(columns=_PLAY_COLS)
-    cities = pack.units[pack.units["grain"] == "city"].sort_values("gap_mt")
+    cities = pack.units[pack.units["grain"] == "city"].copy()
+    if "isolated_mt" in cities.columns:
+        cities = cities.sort_values("isolated_mt")
+    else:
+        cities = cities.sort_values("gap_mt")
     plays: list[dict[str, Any]] = []
     nat = pack.national
     mtd = pack.mtd
@@ -793,21 +1008,15 @@ def plays_from_pack(run_id: int, pack: HierarchyPack) -> pd.DataFrame:
         plays.append(
             {
                 "theme": "close_month" if mtd.get("open") else "recover",
-                "title": (
+                "title": nat.get("headline") or (
                     f"National hole {nat['gap_mt']:+.0f} MT vs expected"
                     if nat.get("gap_mt", 0) < -1
                     else f"National {nat['volume_mt']:.0f} MT"
                 ),
-                "why": (
-                    f"{nat.get('label')}: billed {nat['volume_mt']:.1f} MT vs {nat['expected_mt']:.1f} expected "
-                    f"(last year {nat['ly_mt']:.1f} MT). Work cities in waterfall order."
-                ),
-                "do_this_week": (
-                    "Inside each city, do what the diagnosis says — drop size, coverage, or whitespace — "
-                    "not a generic lost-shop dump."
-                ),
+                "why": nat.get("weather") or "",
+                "do_this_week": nat.get("action_summary") or nat.get("problem") or "",
                 "owner": "NSM",
-                "metric_value": abs(float(nat.get("gap_mt") or 0)),
+                "metric_value": abs(float(nat.get("extra_hole_mt") or nat.get("gap_mt") or 0)),
                 "shops": [],
                 "metrics": nat,
             }

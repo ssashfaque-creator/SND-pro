@@ -38,6 +38,11 @@ Why XGBoost not ARIMA/Prophet per shop? Hundreds of shops × short series. A poo
 
 Each module writes rows into `insights` with `type`, `severity`, `entity_*`, `narrative`, `action`, `metrics_json`, `rank_score`.
 
+- **Fair-share isolation (shift-share)** — city / distributor / DSR / shop residual versus parent current book × last-year mix. Residuals sum to ~0. National declining → extra-declining units are the problem. National growing → slower-growth units are the problem. Empirical-Bayes shrinkage stops 0.02 MT shops from ranking above Eva Foods.
+- **Coverage × velocity × mix** — CPG volume identity plus SKU industry-mix versus national SKU trends.
+- **Seasonality** — YoY same month; seasonal MoM from last year's Jul→Aug shape; intra-month from empirical MTD cuts or a documented back-loaded GT prior (not linear 20/31).
+- **Exception briefing** — `situation_brief` headline / weather / problem / do-this-week. Cities that moved with the market are not a hit-list.
+
 - **Micro vs macro** — section/DSR MoM minus national MoM. Gap ≥ 15 pp and local decline → execution failure, not category weather.
 - **SKU cannibalization** — share shift this month vs last, plus Pearson correlation of first differences across the full history (≤ −0.55 ⇒ persistent substitution).
 - **Strike-rate efficiency** — billed / universe by DSR. Low strike + large universe = underdeveloped beat. High strike + falling drop size = saturated coverage, mix/stock problem.
