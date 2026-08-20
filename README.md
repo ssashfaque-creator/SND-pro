@@ -128,6 +128,8 @@ pip install -e .
 snd-intel app
 ```
 
+Open the app → **Strategy** → **Rebuild scorecards from warehouse**. That rebuilds city / distributor / DSR / shop names from months already stored. You do **not** re-upload July or August.
+
 ## How a new file is applied
 
 The Google Drive sample is July + August in one extract. The next file you drop will often be **August only** (or a later cut of the same month as MTD grows).
@@ -141,7 +143,9 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 
 | Question | Where it shows up |
 |---|---|
-| Which areas/shops must we focus on this week? | Briefing + Focus map + Churn Risk / Growth Target segments |
+| How is each city doing vs what it should be billing? | Strategy city waterfall |
+| Which distributor / DSR / shop in that city? | Open the city card; Named targets CSV |
+| Which areas/shops must we focus on this week? | Strategy must-visit + Focus slice by gap |
 | What are we doing well, so we can copy it? | Positive insights, DSR wins, local outperformance |
 | Did salespeople dump stock into a shop? | Trade-loading anomalies (spike vs that shop’s own 6-month median) |
 | Is a section dying while the city is fine? | Divergence insights |

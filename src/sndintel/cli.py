@@ -13,7 +13,7 @@ from rich.table import Table
 
 from sndintel import __version__
 from sndintel.config import SAMPLE_DIR, DATA_DIR, DB_PATH
-from sndintel.ingest.pipeline import load_brief, load_kpis, load_ledger, run_pipeline
+from sndintel.ingest.pipeline import load_brief, load_kpis, load_ledger, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
 from sndintel.sampledata import generate_demo_files
 from sndintel.storage import connect, init_db, read_sql
@@ -38,6 +38,14 @@ def ingest(
     """Clean a sales export, merge the shop list, train models, and write insights."""
     result = run_pipeline(sales, shop_path=shops)
     console.print_json(data=result)
+
+
+@app.command()
+def rescore():
+    """Rebuild city → shop scorecards from the warehouse. Does not re-read a sales file."""
+    result = rescore_warehouse()
+    console.print_json(data=result)
+    brief()
 
 
 @app.command()
@@ -79,6 +87,34 @@ def brief(limit: int = typer.Option(20, help="How many ranked insights to show")
             f"MoM {row['comparable_mom_pct'] if pd.notna(row.get('comparable_mom_pct')) else (row['mom_pct'] if pd.notna(row['mom_pct']) else 'n/a')}  "
             f"YoY {yoy_txt}"
         )
+    with connect() as conn:
+        cities = read_sql(conn, "SELECT * FROM unit_scorecards WHERE grain = 'city' ORDER BY gap_mt")
+        shops = read_sql(conn, "SELECT * FROM focus_targets WHERE grain = 'shop' ORDER BY rank LIMIT 12")
+    if not cities.empty:
+        waterfall = Table(title="City waterfall vs expected")
+        waterfall.add_column("City", width=16)
+        waterfall.add_column("Billed", justify="right")
+        waterfall.add_column("Expected", justify="right")
+        waterfall.add_column("Gap", justify="right")
+        waterfall.add_column("Diagnosis", width=12)
+        waterfall.add_column("Verdict", width=12)
+        for rec in cities.head(12).itertuples(index=False):
+            waterfall.add_row(
+                str(rec.grain_id)[:16],
+                f"{rec.volume_mt:.1f}",
+                f"{rec.expected_mt:.1f}",
+                f"{rec.gap_mt:+.1f}",
+                str(rec.diagnosis),
+                str(rec.verdict),
+            )
+        console.print(waterfall)
+    if not shops.empty:
+        console.print("\n[bold]Named must-visit shops[/]")
+        for rec in shops.itertuples(index=False):
+            console.print(
+                f"• {rec.entity_name} ({rec.city}) {rec.volume_mt:.2f} vs {rec.ly_mt:.2f} LY "
+                f"· {rec.dsr_name or '—'} · {rec.distributor or '—'}"
+            )
     table = Table(title="Ranked insights", show_lines=False)
     table.add_column("Sev", width=8)
     table.add_column("Type", width=16)
@@ -180,10 +216,22 @@ def export_excel(path: Path = typer.Argument(Path("SND_intelligence_brief.xlsx")
             WHERE m.period = (SELECT MAX(period) FROM shop_month)
             """,
         )
+        try:
+            units = read_sql(conn, "SELECT * FROM unit_scorecards ORDER BY grain, gap_mt")
+        except Exception:
+            units = pd.DataFrame()
+        try:
+            targets = read_sql(conn, "SELECT * FROM focus_targets ORDER BY rank")
+        except Exception:
+            targets = pd.DataFrame()
     path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         insights.to_excel(writer, sheet_name="Insights", index=False)
         kpis.to_excel(writer, sheet_name="KPIs", index=False)
+        if not units.empty:
+            units.to_excel(writer, sheet_name="City_to_DSR", index=False)
+        if not targets.empty:
+            targets.to_excel(writer, sheet_name="Named_targets", index=False)
         anomalies.to_excel(writer, sheet_name="Anomalies", index=False)
         segments.to_excel(writer, sheet_name="Segments", index=False)
         shops.to_excel(writer, sheet_name="Shop Scorecard", index=False)

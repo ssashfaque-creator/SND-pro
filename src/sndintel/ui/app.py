@@ -1,4 +1,4 @@
-"""Local briefing app: upload files, then a five-play strategy pack.
+"""Local briefing app: upload files, then city → distributor → DSR → shop scorecards.
 
 Warehouse lives in the user data directory so reinstalling the code does not
 require re-uploading history.
@@ -14,29 +14,16 @@ import plotly.express as px
 import streamlit as st
 
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
-from sndintel.ingest.pipeline import run_pipeline
+from sndintel.ingest.pipeline import rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
 from sndintel.storage import connect, init_db, read_sql
-from sndintel.strategy import plays_to_visit_frame
 
-THEME_LABEL = {
-    "close_month": "1 · Close the month",
-    "protect": "2 · Protect the base",
-    "recover": "3 · Recover material volume",
-    "fix_beat": "4 · Fix the beat",
-    "coverage": "5 · Long-tail coverage",
-    "mix": "Mix",
-    "people": "People",
-}
-
-THEME_HINT = {
-    "close_month": "#1d4ed8",
-    "protect": "#b45309",
-    "recover": "#b91c1c",
-    "fix_beat": "#7c3aed",
-    "coverage": "#334155",
-    "mix": "#0f766e",
-    "people": "#166534",
+DIAGNOSIS_COLOR = {
+    "drop_size": "#b91c1c",
+    "coverage": "#c2410c",
+    "whitespace": "#334155",
+    "mixed": "#7c3aed",
+    "holding": "#15803d",
 }
 
 
@@ -82,6 +69,14 @@ def load_all():
             data["plays"] = read_sql(conn, "SELECT * FROM strategy_plays ORDER BY slot")
         except Exception:
             data["plays"] = pd.DataFrame()
+        try:
+            data["units"] = read_sql(conn, "SELECT * FROM unit_scorecards")
+        except Exception:
+            data["units"] = pd.DataFrame()
+        try:
+            data["targets"] = read_sql(conn, "SELECT * FROM focus_targets ORDER BY rank")
+        except Exception:
+            data["targets"] = pd.DataFrame()
     return data
 
 
@@ -195,7 +190,7 @@ def _page_upload(empty: bool):
         st.error("No shop list on file yet. Upload it once.")
         return
     sales_path = _save_upload(sales, INCOMING_DIR / sales.name)
-    with st.spinner("Parsing the extract, updating MTD, and rebuilding the strategy pack. Large files take a few minutes."):
+    with st.spinner("Parsing the extract and rebuilding city → distributor → DSR → shop scorecards. Large files take a few minutes."):
         try:
             result = run_pipeline(sales_path, shop_path=shop_path)
         except Exception as exc:  # noqa: BLE001 — show parse errors in the UI
@@ -204,7 +199,8 @@ def _page_upload(empty: bool):
     st.cache_data.clear()
     st.success(
         f"Scored {result.get('n_sales_rows')} fact rows · latest {result.get('latest_period')} · "
-        f"{result.get('n_plays', 0)} strategy plays. Replaced months: {', '.join(result.get('replaced_periods') or []) or '—'}"
+        f"{result.get('n_cities', 0)} cities · {result.get('n_targets', 0)} named targets. "
+        f"Replaced months: {', '.join(result.get('replaced_periods') or []) or '—'}"
     )
     if result.get("open_mtd_period"):
         st.info(f"Open MTD: {result['open_mtd_period']}")
@@ -223,50 +219,168 @@ def _kpi_row(latest, mtd):
 
 
 def _page_strategy(data, latest, period, mtd, ledger):
-    st.title("This week’s strategy")
+    st.title("What to do this week")
     st.caption(
-        f"**{mtd['label'] or period}** · full warehouse, not just the last file. "
-        "Five plays. Tiny shops are a coverage KPI, not a lost-account dump."
+        f"**{mtd['label'] or period}** · city → distributor → DSR → shop. "
+        "The engine reads the warehouse and names the units that move the number. "
+        "It does not paste a canned plan."
     )
     if mtd["open"]:
         st.info(banner_text(ledger, period))
     _kpi_row(latest, mtd)
 
-    plays = data.get("plays", pd.DataFrame())
-    if plays is None or plays.empty:
-        st.warning("No strategy pack stored. Re-upload the latest sales file to build plays.")
-    else:
-        left, right = st.columns((1.35, 1))
-        with left:
-            for rec in plays.itertuples(index=False):
-                color = THEME_HINT.get(rec.theme, "#334155")
-                st.markdown(
-                    f'<div class="play-card"><div class="play-kicker" style="color:{color}">'
-                    f"{THEME_LABEL.get(rec.theme, rec.theme)} · {rec.owner}</div>"
-                    f"<h3 style='margin:0 0 0.4rem 0'>{rec.title}</h3></div>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(f"**Why it matters.** {rec.why}")
-                st.markdown(f"**Do this week.** {rec.do_this_week}")
-                st.divider()
-        with right:
-            st.subheader("National trend")
-            trend = data["shop_month"].groupby("period", as_index=False)["volume_mt"].sum().sort_values("period")
-            fig = px.line(trend, x="period", y="volume_mt", markers=True, labels={"volume_mt": "MT", "period": ""})
-            fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-            visit = plays_to_visit_frame(plays)
-            if not visit.empty:
-                st.subheader("Must-visit (material only)")
-                st.dataframe(visit, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "Download must-visit CSV",
-                    visit.to_csv(index=False).encode("utf-8"),
-                    file_name=f"must_visit_{period}.csv",
-                    mime="text/csv",
-                )
+    units = data.get("units", pd.DataFrame())
+    targets = data.get("targets", pd.DataFrame())
+    if units is None or units.empty:
+        st.warning(
+            "No city scorecards yet. If sales are already in the warehouse, rebuild below. "
+            "Otherwise upload the shop list and sales extract."
+        )
+        _rescore_button()
+        return
 
-    with st.expander("Evidence — ranked flags behind the plays"):
+    cities = units[units["grain"] == "city"].copy().sort_values("gap_mt")
+    national = units[units["grain"] == "national"]
+    nat = national.iloc[0] if not national.empty else None
+    if nat is not None:
+        st.markdown(
+            f"**National billed {nat['volume_mt']:.1f} MT** vs **{nat['expected_mt']:.1f} expected** "
+            f"(last year {nat['ly_mt']:.1f} MT) · hole **{nat['gap_mt']:+.1f} MT** · "
+            f"{str(nat['diagnosis']).replace('_', ' ')} · {nat['verdict']}"
+        )
+        st.caption(nat["do_this_week"])
+
+    left, right = st.columns((1.45, 1))
+    with left:
+        st.subheader("City waterfall (gap vs expected)")
+        if cities.empty:
+            st.write("No city rows.")
+        else:
+            chart = cities.head(16).copy()
+            chart["city"] = chart["grain_id"]
+            fig = px.bar(
+                chart,
+                x="city",
+                y="gap_mt",
+                color="diagnosis",
+                color_discrete_map=DIAGNOSIS_COLOR,
+                labels={"gap_mt": "Gap vs expected (MT)", "city": ""},
+            )
+            fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-30)
+            st.plotly_chart(fig, use_container_width=True)
+            show = cities[
+                [
+                    "grain_id",
+                    "zone",
+                    "volume_mt",
+                    "expected_mt",
+                    "ly_mt",
+                    "gap_mt",
+                    "lfl_gap",
+                    "lost_n",
+                    "lost_mt",
+                    "billed",
+                    "universe",
+                    "strike_rate",
+                    "diagnosis",
+                    "verdict",
+                ]
+            ].rename(columns={"grain_id": "city"})
+            st.dataframe(show, use_container_width=True, hide_index=True)
+    with right:
+        st.subheader("National trend")
+        trend = data["shop_month"].groupby("period", as_index=False)["volume_mt"].sum().sort_values("period")
+        fig = px.line(trend, x="period", y="volume_mt", markers=True, labels={"volume_mt": "MT", "period": ""})
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        if targets is not None and not targets.empty:
+            shops = targets[targets["grain"] == "shop"][
+                ["rank", "city", "entity_name", "distributor", "dsr_name", "volume_mt", "ly_mt", "gap_mt", "action"]
+            ].rename(columns={"entity_name": "shop"})
+            st.subheader("Must-visit (named shops)")
+            st.dataframe(shops.head(40), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download named targets CSV",
+                targets.to_csv(index=False).encode("utf-8"),
+                file_name=f"focus_targets_{period}.csv",
+                mime="text/csv",
+            )
+
+    st.subheader("Open a city — named people and doors")
+    for i, city in enumerate(cities.itertuples(index=False)):
+        hole = float(city.gap_mt)
+        if i >= 12 and hole > -1.0:
+            continue
+        color = DIAGNOSIS_COLOR.get(str(city.diagnosis), "#334155")
+        label = (
+            f"{city.grain_id}: billed {city.volume_mt:.1f} MT · should be {city.expected_mt:.1f} · "
+            f"{hole:+.1f} MT · {str(city.diagnosis).replace('_', ' ')} · {city.verdict}"
+        )
+        with st.expander(label, expanded=i == 0):
+            st.markdown(
+                f"<span style='color:{color};font-weight:600;text-transform:uppercase;letter-spacing:0.06em'>"
+                f"{str(city.diagnosis).replace('_', ' ')}</span>",
+                unsafe_allow_html=True,
+            )
+            st.write(city.do_this_week)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Distributors**")
+                dist = units[(units["grain"] == "distributor") & (units["parent_id"] == city.grain_id)].sort_values("gap_mt")
+                if dist.empty:
+                    st.caption("No distributor slice.")
+                else:
+                    st.dataframe(
+                        dist[["grain_id", "volume_mt", "ly_mt", "gap_mt", "diagnosis", "verdict"]].rename(
+                            columns={"grain_id": "distributor"}
+                        ).head(12),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                st.markdown("**Sections / areas**")
+                sec = units[(units["grain"] == "section") & (units["parent_id"] == city.grain_id)].sort_values("gap_mt")
+                if sec.empty:
+                    st.caption("No section slice.")
+                else:
+                    st.dataframe(
+                        sec[["grain_id", "volume_mt", "ly_mt", "gap_mt", "lost_n", "diagnosis"]].rename(
+                            columns={"grain_id": "section"}
+                        ).head(10),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            with c2:
+                st.markdown("**DSRs**")
+                dsr = units[(units["grain"] == "dsr") & (units["parent_id"] == city.grain_id)].sort_values("gap_mt")
+                if dsr.empty:
+                    st.caption("No DSR slice.")
+                else:
+                    st.dataframe(
+                        dsr[["grain_id", "volume_mt", "ly_mt", "gap_mt", "diagnosis", "verdict"]].rename(
+                            columns={"grain_id": "dsr"}
+                        ).head(12),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                st.markdown("**Must-visit shops**")
+                if targets is None or targets.empty:
+                    st.caption("No named shops.")
+                else:
+                    hit = targets[(targets["city"] == city.grain_id) & (targets["grain"] == "shop")]
+                    if hit.empty:
+                        st.caption("No material shop gap in this city.")
+                    else:
+                        st.dataframe(
+                            hit[["entity_name", "distributor", "dsr_name", "section", "volume_mt", "ly_mt", "gap_mt", "action"]].rename(
+                                columns={"entity_name": "shop"}
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+    _rescore_button()
+
+    with st.expander("Evidence — ranked flags behind the scorecards"):
         ins = data["insights"]
         if ins.empty:
             st.write("No insights stored.")
@@ -278,23 +392,92 @@ def _page_strategy(data, latest, period, mtd, ledger):
                 st.caption(rec.action)
 
 
+def _rescore_button():
+    st.divider()
+    st.caption("Code updates do not wipe the warehouse. Rebuild scorecards from facts already on disk — no re-upload.")
+    if st.button("Rebuild scorecards from warehouse"):
+        with st.spinner("Rebuilding city → distributor → DSR → shop scorecards from the warehouse."):
+            try:
+                result = rescore_warehouse()
+            except Exception as exc:  # noqa: BLE001
+                st.exception(exc)
+                return
+        st.cache_data.clear()
+        st.success(
+            f"Rebuilt {result.get('n_cities', 0)} cities · {result.get('n_targets', 0)} named targets · "
+            f"latest {result.get('latest_period')}"
+        )
+        st.rerun()
+
+
 def _page_focus(data, period):
     st.title("Where to put people")
+    units = data.get("units", pd.DataFrame())
     kpis = data["kpis"]
-    grains = st.selectbox("Slice", ["city", "section", "dsr", "distributor", "zone"])
-    slice_df = kpis[(kpis["grain"] == grains) & (kpis["period"] == period)].copy().sort_values("volume_mt", ascending=False)
-    fig = px.bar(
-        slice_df.head(20),
-        x="grain_id",
-        y="volume_mt",
-        color="comparable_mom_pct" if "comparable_mom_pct" in slice_df.columns else "mom_pct",
-        color_continuous_scale="RdYlGn",
-        labels={"grain_id": grains, "volume_mt": "MT"},
-    )
-    fig.update_layout(height=360, xaxis_tickangle=-30)
-    st.plotly_chart(fig, use_container_width=True)
-    cols = [c for c in ["grain_id", "volume_mt", "billed_outlets", "universe_outlets", "strike_rate", "drop_size", "mom_pct", "comparable_mom_pct", "yoy_pct", "run_rate_yoy_pct"] if c in slice_df.columns]
-    st.dataframe(slice_df[cols].rename(columns={"grain_id": grains}), use_container_width=True, hide_index=True)
+    grains = st.selectbox("Slice", ["city", "distributor", "dsr", "section", "zone"])
+    if units is not None and not units.empty and grains in set(units["grain"].dropna()):
+        slice_df = units[(units["grain"] == grains) & (units["period"] == period)].copy().sort_values("gap_mt")
+        fig = px.bar(
+            slice_df.head(20),
+            x="grain_id",
+            y="gap_mt",
+            color="diagnosis",
+            color_discrete_map=DIAGNOSIS_COLOR,
+            labels={"grain_id": grains, "gap_mt": "Gap vs expected (MT)"},
+        )
+        fig.update_layout(height=360, xaxis_tickangle=-30)
+        st.plotly_chart(fig, use_container_width=True)
+        cols = [
+            c
+            for c in [
+                "grain_id",
+                "city",
+                "volume_mt",
+                "expected_mt",
+                "ly_mt",
+                "gap_mt",
+                "lfl_gap",
+                "lost_n",
+                "lost_mt",
+                "billed",
+                "universe",
+                "strike_rate",
+                "diagnosis",
+                "verdict",
+                "do_this_week",
+            ]
+            if c in slice_df.columns
+        ]
+        st.dataframe(slice_df[cols].rename(columns={"grain_id": grains}), use_container_width=True, hide_index=True)
+    else:
+        slice_df = kpis[(kpis["grain"] == grains) & (kpis["period"] == period)].copy().sort_values("volume_mt", ascending=False)
+        fig = px.bar(
+            slice_df.head(20),
+            x="grain_id",
+            y="volume_mt",
+            color="comparable_mom_pct" if "comparable_mom_pct" in slice_df.columns else "mom_pct",
+            color_continuous_scale="RdYlGn",
+            labels={"grain_id": grains, "volume_mt": "MT"},
+        )
+        fig.update_layout(height=360, xaxis_tickangle=-30)
+        st.plotly_chart(fig, use_container_width=True)
+        cols = [
+            c
+            for c in [
+                "grain_id",
+                "volume_mt",
+                "billed_outlets",
+                "universe_outlets",
+                "strike_rate",
+                "drop_size",
+                "mom_pct",
+                "comparable_mom_pct",
+                "yoy_pct",
+                "run_rate_yoy_pct",
+            ]
+            if c in slice_df.columns
+        ]
+        st.dataframe(slice_df[cols].rename(columns={"grain_id": grains}), use_container_width=True, hide_index=True)
     segs = data["segments"]
     if not segs.empty:
         st.subheader("Outlet segments")
@@ -306,12 +489,38 @@ def _page_focus(data, period):
 
 def _page_people(data, period):
     st.title("People scorecards")
+    units = data.get("units", pd.DataFrame())
     kpis = data["kpis"]
-    for grain, label in [("dsr", "Salespeople"), ("distributor", "Distributors")]:
+    for grain, label, key in [("dsr", "Salespeople", "dsr"), ("distributor", "Distributors", "distributor")]:
         st.markdown(f"#### {label}")
-        df = kpis[(kpis["grain"] == grain) & (kpis["period"] == period)].sort_values("volume_mt", ascending=False)
-        cols = [c for c in ["grain_id", "volume_mt", "mom_pct", "comparable_mom_pct", "yoy_pct", "run_rate_yoy_pct", "strike_rate", "drop_size", "sku_depth", "billed_outlets", "universe_outlets"] if c in df.columns]
-        st.dataframe(df[cols].rename(columns={"grain_id": label[:-1]}), use_container_width=True, hide_index=True)
+        if units is not None and not units.empty and grain in set(units["grain"].dropna()):
+            df = units[(units["grain"] == grain) & (units["period"] == period)].sort_values("gap_mt")
+            cols = [
+                c
+                for c in ["grain_id", "city", "volume_mt", "expected_mt", "ly_mt", "gap_mt", "diagnosis", "verdict", "do_this_week"]
+                if c in df.columns
+            ]
+            st.dataframe(df[cols].rename(columns={"grain_id": key}), use_container_width=True, hide_index=True)
+        else:
+            df = kpis[(kpis["grain"] == grain) & (kpis["period"] == period)].sort_values("volume_mt", ascending=False)
+            cols = [
+                c
+                for c in [
+                    "grain_id",
+                    "volume_mt",
+                    "mom_pct",
+                    "comparable_mom_pct",
+                    "yoy_pct",
+                    "run_rate_yoy_pct",
+                    "strike_rate",
+                    "drop_size",
+                    "sku_depth",
+                    "billed_outlets",
+                    "universe_outlets",
+                ]
+                if c in df.columns
+            ]
+            st.dataframe(df[cols].rename(columns={"grain_id": label[:-1]}), use_container_width=True, hide_index=True)
 
 
 def _page_mix(data, period):
@@ -367,6 +576,7 @@ def _page_warehouse(data):
     if not ledger.empty:
         st.subheader("Months on file")
         st.dataframe(ledger, use_container_width=True, hide_index=True)
+    st.caption("Updating the app does not wipe this warehouse. Use Strategy → Rebuild scorecards if the briefing looks stale.")
     runs = data["runs"]
     if not runs.empty:
         st.subheader("Recent runs")

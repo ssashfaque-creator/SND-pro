@@ -11,10 +11,10 @@ from sndintel.config import DATA_DIR, DB_PATH, PROCESSED_DIR, ensure_dirs
 from sndintel.features import add_calendar_panel, build_features, latest_period, rebuild_shop_month
 from sndintel.ingest.shops import parse_shop_master
 from sndintel.ingest.ssrs import parse_sales_file
+from sndintel.hierarchy import HierarchyPack, build_hierarchy_pack, plays_from_pack
 from sndintel.insights import compile_insights
 from sndintel.models import cluster_shops, detect_anomalies, forecast_shop_month
 from sndintel.mtd import open_mtd_period, parse_execution_date, run_rate_factor
-from sndintel.strategy import compile_plays
 from sndintel.storage import (
     connect,
     init_db,
@@ -193,82 +193,14 @@ def run_pipeline(
                     ),
                 )
 
-        stores_df = read_sql(conn, "SELECT * FROM stores")
-        facts_df = read_sql(conn, "SELECT * FROM sales_facts")
-        shop_month = rebuild_shop_month(facts_df, stores_df)
-        shop_month = add_calendar_panel(shop_month, stores_df)
-        shop_cols = [
-            "store_id",
-            "period",
-            "year",
-            "month",
-            "volume_mt",
-            "sku_count",
-            "billed",
-            "distributor",
-            "dsr_name",
-            "section",
-            "store_name",
-            "zone",
-            "city",
-        ]
-        if not shop_month.empty:
-            replace_table(conn, "shop_month", shop_month[shop_cols])
-        else:
-            replace_table(conn, "shop_month", pd.DataFrame(columns=shop_cols))
-
-        feats = build_features(shop_month, facts_df)
-        replace_table(conn, "features_shop_month", feats)
-
-        period = latest_period(shop_month)
-        forecasts = forecast_shop_month(feats, shop_month)
-        replace_table(conn, "forecasts", forecasts)
-
-        ledger = read_sql(conn, "SELECT * FROM period_ledger")
-        latest_open = None
-        if not ledger.empty and "status" in ledger.columns:
-            open_rows = ledger[ledger["status"] == "mtd_open"]
-            if not open_rows.empty:
-                latest_open = str(open_rows["period"].max())
-        anomalies = (
-            detect_anomalies(feats, shop_month, period, mtd_open=bool(period and period == latest_open))
-            if period
-            else pd.DataFrame()
-        )
-        replace_table(conn, "anomalies", anomalies)
-
-        segments = cluster_shops(feats, shop_month, period) if period else pd.DataFrame()
-        replace_table(conn, "shop_segments", segments)
-
-        insights, kpis = compile_insights(
-            run_id,
-            facts_df,
-            stores_df,
-            shop_month,
-            feats,
-            forecasts,
-            anomalies,
-            segments,
-            ledger=ledger,
-        )
-        conn.execute("DELETE FROM insights")
-        if not insights.empty:
-            insights.to_sql("insights", conn, if_exists="append", index=False)
-        replace_table(conn, "kpi_snapshots", kpis)
-
-        plays = compile_plays(
-            run_id,
-            shop_month,
-            stores_df,
-            feats,
-            insights,
-            kpis,
-            anomalies,
-            ledger=ledger,
-        )
-        conn.execute("DELETE FROM strategy_plays")
-        if not plays.empty:
-            plays.to_sql("strategy_plays", conn, if_exists="append", index=False)
+        scored = _rebuild_intelligence(conn, run_id)
+        period = scored["latest_period"]
+        facts_df = scored["_facts"]
+        stores_df = scored["_stores"]
+        insights = scored["_insights"]
+        anomalies = scored["_anomalies"]
+        plays = scored["_plays"]
+        pack = scored["_pack"]
 
         PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
         stamp = started.replace(":", "").replace("-", "")
@@ -316,6 +248,155 @@ def run_pipeline(
         "replaced_periods": touched_periods,
         "open_mtd_period": open_period,
         "n_plays": int(len(plays)) if plays is not None else 0,
+        "n_cities": int(pack.national.get("n_cities") or 0) if pack is not None else 0,
+        "n_targets": int(len(pack.targets)) if pack is not None and pack.targets is not None else 0,
+        "data_dir": str(DATA_DIR),
+    }
+
+
+SHOP_MONTH_COLS = [
+    "store_id",
+    "period",
+    "year",
+    "month",
+    "volume_mt",
+    "sku_count",
+    "billed",
+    "distributor",
+    "dsr_name",
+    "section",
+    "store_name",
+    "zone",
+    "city",
+]
+
+
+def _rebuild_intelligence(conn, run_id: int) -> dict:
+    """Rebuild features, insights, and the city→shop hierarchy from warehouse facts."""
+    stores_df = read_sql(conn, "SELECT * FROM stores")
+    facts_df = read_sql(conn, "SELECT * FROM sales_facts")
+    shop_month = rebuild_shop_month(facts_df, stores_df)
+    shop_month = add_calendar_panel(shop_month, stores_df)
+    if not shop_month.empty:
+        replace_table(conn, "shop_month", shop_month[SHOP_MONTH_COLS])
+    else:
+        replace_table(conn, "shop_month", pd.DataFrame(columns=SHOP_MONTH_COLS))
+
+    feats = build_features(shop_month, facts_df)
+    replace_table(conn, "features_shop_month", feats)
+
+    period = latest_period(shop_month)
+    forecasts = forecast_shop_month(feats, shop_month)
+    replace_table(conn, "forecasts", forecasts)
+
+    ledger = read_sql(conn, "SELECT * FROM period_ledger")
+    latest_open = None
+    if not ledger.empty and "status" in ledger.columns:
+        open_rows = ledger[ledger["status"] == "mtd_open"]
+        if not open_rows.empty:
+            latest_open = str(open_rows["period"].max())
+    anomalies = (
+        detect_anomalies(feats, shop_month, period, mtd_open=bool(period and period == latest_open))
+        if period
+        else pd.DataFrame()
+    )
+    replace_table(conn, "anomalies", anomalies)
+
+    segments = cluster_shops(feats, shop_month, period) if period else pd.DataFrame()
+    replace_table(conn, "shop_segments", segments)
+
+    insights, kpis = compile_insights(
+        run_id,
+        facts_df,
+        stores_df,
+        shop_month,
+        feats,
+        forecasts,
+        anomalies,
+        segments,
+        ledger=ledger,
+    )
+    conn.execute("DELETE FROM insights")
+    if not insights.empty:
+        insights.to_sql("insights", conn, if_exists="append", index=False)
+    replace_table(conn, "kpi_snapshots", kpis)
+
+    pack = build_hierarchy_pack(shop_month, stores_df, feats, ledger)
+    replace_table(conn, "unit_scorecards", pack.units)
+    replace_table(conn, "focus_targets", pack.targets)
+    plays = plays_from_pack(run_id, pack)
+    conn.execute("DELETE FROM strategy_plays")
+    if not plays.empty:
+        plays.to_sql("strategy_plays", conn, if_exists="append", index=False)
+
+    return {
+        "latest_period": period,
+        "n_sales_rows": int(len(facts_df)),
+        "n_stores": int(len(stores_df)),
+        "n_insights": int(len(insights)) if insights is not None else 0,
+        "n_anomalies": int(len(anomalies)) if anomalies is not None else 0,
+        "n_plays": int(len(plays)) if plays is not None else 0,
+        "n_cities": int(pack.national.get("n_cities") or 0) if pack.national else 0,
+        "n_targets": int(len(pack.targets)) if pack.targets is not None else 0,
+        "_facts": facts_df,
+        "_stores": stores_df,
+        "_insights": insights,
+        "_anomalies": anomalies,
+        "_plays": plays,
+        "_pack": pack,
+    }
+
+
+def rescore_warehouse(db_path: Optional[str | Path] = None) -> dict:
+    """Rebuild scorecards from facts already in the warehouse. No file upload."""
+    ensure_dirs()
+    db_path = Path(db_path or DB_PATH)
+    init_db(db_path)
+    started = utcnow()
+    pack = HierarchyPack(period="", yoy_period="", mtd={}, national={})
+    with connect(db_path) as conn:
+        facts = read_sql(conn, "SELECT 1 AS x FROM sales_facts LIMIT 1")
+        if facts.empty:
+            raise ValueError("Warehouse has no sales facts yet. Upload a Shop SKU Wise extract first.")
+        cur = conn.execute(
+            """INSERT INTO pipeline_runs (started_at, status, sales_file, shop_file)
+               VALUES (?, 'running', ?, ?)""",
+            (started, "rescore", None),
+        )
+        run_id = int(cur.lastrowid)
+        scored = _rebuild_intelligence(conn, run_id)
+        pack = scored["_pack"]
+        notes = {"rescore": True, "n_cities": scored["n_cities"], "n_targets": scored["n_targets"]}
+        conn.execute(
+            """UPDATE pipeline_runs
+               SET finished_at=?, status=?, n_sales_rows=?, n_stores=?, latest_period=?, notes=?
+               WHERE run_id=?""",
+            (
+                utcnow(),
+                "success",
+                scored["n_sales_rows"],
+                scored["n_stores"],
+                scored["latest_period"],
+                pd.Series(notes).to_json(),
+                run_id,
+            ),
+        )
+    return {
+        "run_id": run_id,
+        "db_path": str(db_path),
+        "latest_period": scored["latest_period"],
+        "n_sales_rows": scored["n_sales_rows"],
+        "n_stores": scored["n_stores"],
+        "n_insights": scored["n_insights"],
+        "n_anomalies": scored["n_anomalies"],
+        "parser": "rescore",
+        "processed_copy": None,
+        "warnings": [],
+        "replaced_periods": [],
+        "open_mtd_period": None,
+        "n_plays": scored["n_plays"],
+        "n_cities": scored["n_cities"],
+        "n_targets": int(len(pack.targets)) if pack.targets is not None else 0,
         "data_dir": str(DATA_DIR),
     }
 

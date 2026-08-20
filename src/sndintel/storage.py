@@ -202,6 +202,65 @@ CREATE TABLE IF NOT EXISTS strategy_plays (
 
 CREATE INDEX IF NOT EXISTS idx_plays_slot ON strategy_plays(slot);
 
+CREATE TABLE IF NOT EXISTS unit_scorecards (
+    period TEXT NOT NULL,
+    grain TEXT NOT NULL,
+    grain_id TEXT NOT NULL,
+    parent_grain TEXT,
+    parent_id TEXT,
+    zone TEXT,
+    city TEXT,
+    volume_mt REAL,
+    ly_mt REAL,
+    expected_mt REAL,
+    run_rate_mt REAL,
+    gap_mt REAL,
+    gap_vs_ly_mt REAL,
+    gap_pct REAL,
+    lfl_now REAL,
+    lfl_ly REAL,
+    lfl_gap REAL,
+    lost_n INTEGER,
+    lost_mt REAL,
+    new_n INTEGER,
+    new_mt REAL,
+    billed INTEGER,
+    billed_ly INTEGER,
+    universe INTEGER,
+    strike_rate REAL,
+    diagnosis TEXT,
+    verdict TEXT,
+    do_this_week TEXT,
+    contrib_national_gap REAL,
+    metrics_json TEXT,
+    PRIMARY KEY (period, grain, grain_id, parent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_units_grain ON unit_scorecards(grain, gap_mt);
+CREATE INDEX IF NOT EXISTS idx_units_city ON unit_scorecards(city);
+
+CREATE TABLE IF NOT EXISTS focus_targets (
+    period TEXT,
+    rank INTEGER,
+    grain TEXT,
+    entity_id TEXT,
+    entity_name TEXT,
+    city TEXT,
+    zone TEXT,
+    distributor TEXT,
+    dsr_name TEXT,
+    section TEXT,
+    volume_mt REAL,
+    ly_mt REAL,
+    gap_mt REAL,
+    diagnosis TEXT,
+    action TEXT,
+    why TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_targets_rank ON focus_targets(rank);
+CREATE INDEX IF NOT EXISTS idx_targets_city ON focus_targets(city);
+
 CREATE TABLE IF NOT EXISTS kpi_snapshots (
     period TEXT NOT NULL,
     grain TEXT NOT NULL,

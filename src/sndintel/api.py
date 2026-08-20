@@ -103,6 +103,41 @@ def shop(store_id: str):
     return {"store": profile[0] if profile else None, "history": history, "features": features, "insights": ins}
 
 
+@app.get("/waterfall")
+def waterfall():
+    """City scorecards sorted by gap vs expected — the national hole, additively."""
+    return _rows("SELECT * FROM unit_scorecards WHERE grain = 'city' ORDER BY gap_mt")
+
+
+@app.get("/targets")
+def targets(city: Optional[str] = None, grain: Optional[str] = None, limit: int = 100):
+    clauses = ["1=1"]
+    params: list = []
+    if city:
+        clauses.append("city = ?")
+        params.append(city)
+    if grain:
+        clauses.append("grain = ?")
+        params.append(grain)
+    params.append(limit)
+    sql = f"SELECT * FROM focus_targets WHERE {' AND '.join(clauses)} ORDER BY rank LIMIT ?"
+    return _rows(sql, tuple(params))
+
+
+@app.get("/scorecards")
+def scorecards(grain: Optional[str] = None, city: Optional[str] = None):
+    clauses = ["1=1"]
+    params: list = []
+    if grain:
+        clauses.append("grain = ?")
+        params.append(grain)
+    if city:
+        clauses.append("city = ?")
+        params.append(city)
+    sql = f"SELECT * FROM unit_scorecards WHERE {' AND '.join(clauses)} ORDER BY gap_mt"
+    return _rows(sql, tuple(params))
+
+
 @app.get("/focus")
 def focus():
     return {

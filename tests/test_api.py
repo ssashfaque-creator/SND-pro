@@ -23,6 +23,9 @@ def test_api_brief(demo, tmp_path, monkeypatch):
     assert brief.status_code == 200
     assert isinstance(brief.json(), list)
     assert client.get("/focus").status_code == 200
+    water = client.get("/waterfall")
+    assert water.status_code == 200
+    assert isinstance(water.json(), list)
 
 
 def test_cli_query_help():
