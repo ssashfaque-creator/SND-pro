@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from typing import Union
 
@@ -43,7 +44,7 @@ def read_raw_table(path: PathLike, sheet: Union[str, int, None] = 0) -> pd.DataF
     if suffix in {".xlsx", ".xlsm", ".xls"}:
         df = pd.read_excel(path, header=None, dtype=object, sheet_name=sheet)
     elif suffix in {".csv", ".txt"}:
-        df = pd.read_csv(path, header=None, dtype=object, encoding="utf-8-sig")
+        df = _read_ragged_csv(path)
     else:
         raise ValueError(f"Unsupported file type: {path.suffix}")
     if isinstance(df, dict):
@@ -51,6 +52,22 @@ def read_raw_table(path: PathLike, sheet: Union[str, int, None] = 0) -> pd.DataF
     df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
     df = df.reset_index(drop=True)
     df.columns = list(range(df.shape[1]))
+    return df
+
+
+def _read_ragged_csv(path: Path) -> pd.DataFrame:
+    """SSRS CSVs are jagged: parameter rows have ~18 fields, the tablix has 40+.
+
+    pandas' C engine rejects that. Pad every row to the max width.
+    """
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.reader(handle))
+    if not rows:
+        return pd.DataFrame()
+    width = max(len(row) for row in rows)
+    padded = [row + [None] * (width - len(row)) for row in rows]
+    df = pd.DataFrame(padded, dtype=object)
+    df.replace("", None, inplace=True)
     return df
 
 
@@ -117,7 +134,7 @@ def looks_like_store_id(value) -> bool:
         return False
     letters = sum(ch.isalpha() for ch in text)
     digits = sum(ch.isdigit() for ch in text)
-    return digits >= 6 and letters <= 4 and 6 <= len(text) <= 20
+    return digits >= 6 and letters <= 4 and 6 <= len(text) <= 24
 
 
 def looks_like_total(value) -> bool:
@@ -127,3 +144,15 @@ def looks_like_total(value) -> bool:
 
 def period_key(year: int, month: int) -> str:
     return f"{int(year):04d}-{int(month):02d}"
+
+
+def shift_period(period: str, months: int) -> str:
+    year = int(period[:4])
+    month = int(period[5:7]) + months
+    while month > 12:
+        month -= 12
+        year += 1
+    while month < 1:
+        month += 12
+        year -= 1
+    return period_key(year, month)

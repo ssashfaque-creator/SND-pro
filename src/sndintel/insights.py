@@ -11,6 +11,7 @@ import pandas as pd
 
 from sndintel.config import DIVERGENCE_GAP_PP, MIN_VOLUME_FLAG_MT
 from sndintel.features import latest_period, previous_period
+from sndintel.io_utils import shift_period
 from sndintel.storage import dumps
 
 
@@ -42,6 +43,7 @@ def compile_insights(
     rows += _pareto_insights(shop_month, period)
     rows += _forecast_gap_insights(forecasts, shop_month, period)
     rows += _positive_insights(kpis, segments, shop_month, period)
+    rows += _volume_bridge_insights(shop_month, period)
     rows += _whitespace_insights(stores, shop_month, period)
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -705,6 +707,91 @@ def _positive_insights(kpis: pd.DataFrame, segments: pd.DataFrame, shop_month: p
                 metrics={"mom_pct": r["mom_pct"], "volume_mt": r["volume_mt"]},
             )
         )
+    return rows
+
+
+def _volume_bridge_insights(shop_month: pd.DataFrame, period: str) -> list[dict]:
+    """Split YoY movement into continuing shops vs new areas vs lost shops.
+
+    A store that first appears this year is expansion, not 'growth from zero'.
+    """
+    yoy_p = shift_period(period, -12)
+    cur = shop_month[shop_month["period"] == period]
+    ly = shop_month[shop_month["period"] == yoy_p]
+    if cur.empty or ly.empty:
+        return []
+    cur_ids = set(cur.loc[cur["billed"] == 1, "store_id"])
+    ly_ids = set(ly.loc[ly["billed"] == 1, "store_id"])
+    continuing = cur_ids & ly_ids
+    new_ids = cur_ids - ly_ids
+    lost_ids = ly_ids - cur_ids
+    cur_vol = float(cur["volume_mt"].sum())
+    ly_vol = float(ly["volume_mt"].sum())
+    cont_now = float(cur.loc[cur["store_id"].isin(continuing), "volume_mt"].sum())
+    cont_ly = float(ly.loc[ly["store_id"].isin(continuing), "volume_mt"].sum())
+    new_vol = float(cur.loc[cur["store_id"].isin(new_ids), "volume_mt"].sum())
+    lost_vol = float(ly.loc[ly["store_id"].isin(lost_ids), "volume_mt"].sum())
+    like_pct = (cont_now - cont_ly) / cont_ly * 100 if cont_ly else None
+    headline = (cur_vol - ly_vol) / ly_vol * 100 if ly_vol else None
+    rows = [
+        _insight(
+            type="volume_bridge",
+            severity="high" if (headline or 0) < -10 else "medium",
+            entity_type="national",
+            entity_id="ALL",
+            title=f"YoY volume bridge vs {yoy_p}",
+            narrative=(
+                f"{period} is {cur_vol:.1f} MT vs {ly_vol:.1f} MT in {yoy_p} "
+                f"({headline:+.1f}% headline). "
+                f"Like-for-like (shops billed in both years): {cont_now:.1f} vs {cont_ly:.1f} MT"
+                + (f" ({like_pct:+.1f}%). " if like_pct is not None else ". ")
+                + f"New shops (not billed in {yoy_p}): {len(new_ids)} / {new_vol:.1f} MT. "
+                f"Lost shops: {len(lost_ids)} / {lost_vol:.1f} MT. "
+                "New areas are counted as expansion, not as a recovery from zero."
+            ),
+            action="Coach lost-shop recovery separately from like-for-like drop size. Do not target YoY on shops that were not on file last year.",
+            metric_value=abs(float(headline or 0)),
+            metrics={
+                "headline_yoy_pct": headline,
+                "like_for_like_pct": like_pct,
+                "continuing_shops": len(continuing),
+                "new_shops": len(new_ids),
+                "lost_shops": len(lost_ids),
+                "new_mt": new_vol,
+                "lost_mt": lost_vol,
+                "current_mt": cur_vol,
+                "ly_mt": ly_vol,
+            },
+        )
+    ]
+    # Sections that are genuinely new this year (no like-for-like base).
+    if new_ids:
+        sec = (
+            cur.loc[cur["store_id"].isin(new_ids)]
+            .groupby("section", as_index=False)
+            .agg(new_mt=("volume_mt", "sum"), shops=("store_id", "nunique"))
+            .sort_values("new_mt", ascending=False)
+            .head(5)
+        )
+        for _, r in sec.iterrows():
+            if r["new_mt"] < 0.2:
+                continue
+            rows.append(
+                _insight(
+                    type="new_area",
+                    severity="positive",
+                    entity_type="section",
+                    entity_id=str(r["section"]),
+                    title=f"{r['section']} is adding shops that were not on file last year",
+                    narrative=(
+                        f"{int(r['shops'])} shops in {r['section']} billed {r['new_mt']:.2f} MT in {period} "
+                        f"with no bill in {yoy_p}. Treat as distribution expansion, not like-for-like growth."
+                    ),
+                    action="Keep the opening cadence; do not load extra stock just to make the first months look big.",
+                    metric_value=float(r["new_mt"]),
+                    metrics={"shops": int(r["shops"]), "new_mt": float(r["new_mt"])},
+                )
+            )
     return rows
 
 

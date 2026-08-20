@@ -14,7 +14,8 @@ Shop master ───┘
 - Totals (any header containing `Total`) and repeated A–F labels are dropped.
 - Facts are upserted on `(store_id, sku, period)` so a new monthly extract overwrites that month and leaves history intact.
 - Indexes: `store_id`, `section`, `city`, `period`.
-- On ingest we materialise composite metrics: 3/6-month rolling mean and median, own z-score, MoM/YoY, recency, 12-month billed rate, top-SKU share, vs-section / vs-city.
+- Shop-month panel starts at each outlet's **first billed month**. Leading zeros are not invented for areas that were not on the file yet. Later gaps *after* that first bill are real zeros (skipped / lapsed).
+- On ingest we materialise composite metrics: calendar-aware lags (MoM and YoY, not "12 rows back"), 3/6-month rolling mean and median, own z-score, recency, 12-month billed rate, top-SKU share, vs-section / vs-city, `yoy_comparable` flag.
 
 SQLite is the right first backbone: one file, WAL mode, portable to a sales laptop, queryable by a ReAct agent without a server. Move to Postgres later if several users write concurrently.
 

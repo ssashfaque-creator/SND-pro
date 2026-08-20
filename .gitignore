@@ -19,7 +19,7 @@ data/incoming/*
 !data/incoming/.gitkeep
 data/models/*
 !data/models/.gitkeep
-data/warehouse.db
+data/raw/
 .streamlit/secrets.toml
 dist/
 build/

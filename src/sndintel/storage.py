@@ -105,11 +105,14 @@ CREATE TABLE IF NOT EXISTS features_shop_month (
     vs_section_pct REAL,
     vs_city_pct REAL,
     cv_6m REAL,
-    recency_months INTEGER,
-    billed_rate_12 REAL,
-    top_sku_share REAL,
-    PRIMARY KEY (store_id, period)
-);
+        recency_months INTEGER,
+        billed_rate_12 REAL,
+        top_sku_share REAL,
+        first_period TEXT,
+        months_on_file INTEGER,
+        yoy_comparable INTEGER,
+        PRIMARY KEY (store_id, period)
+    );
 
 CREATE TABLE IF NOT EXISTS forecasts (
     entity_type TEXT NOT NULL,
@@ -211,7 +214,16 @@ def init_db(path: Optional[Path] = None) -> Path:
     db_path = Path(path or DB_PATH)
     with connect(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_column(conn, "features_shop_month", "first_period", "TEXT")
+        _ensure_column(conn, "features_shop_month", "months_on_file", "INTEGER")
+        _ensure_column(conn, "features_shop_month", "yoy_comparable", "INTEGER")
     return db_path
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def replace_table(conn: sqlite3.Connection, name: str, df: pd.DataFrame) -> None:

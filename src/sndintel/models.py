@@ -78,7 +78,9 @@ def forecast_shop_month(features: pd.DataFrame, shop_month: pd.DataFrame) -> pd.
             df[col] = 0
         df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(0)
     df["actual"] = df["volume_mt"].fillna(0)
-    df["baseline"] = df["roll_median_6"].fillna(df["roll_mean_3"]).fillna(df["lag_1"]).fillna(0)
+    # Prefer last-year same month when the shop actually existed then.
+    df["baseline"] = df["lag_12"].where(df["lag_12"].notna(), df["roll_median_6"])
+    df["baseline"] = df["baseline"].fillna(df["roll_mean_3"]).fillna(df["lag_1"]).fillna(0)
 
     model_name = "seasonal_naive"
     preds = df["baseline"].to_numpy()
@@ -164,15 +166,23 @@ def detect_anomalies(features: pd.DataFrame, shop_month: pd.DataFrame, period: s
     for i, row in latest.reset_index(drop=True).iterrows():
         expected = row.get("roll_median_6")
         expected = float(expected) if pd.notna(expected) else 0.0
+        ly = row.get("lag_12")
+        if pd.notna(ly):
+            expected = float(ly)
         volume = float(row.get("volume_mt") or 0)
+        months_on = int(row.get("months_on_file") or 0)
+        comparable = int(row.get("yoy_comparable") or 0)
         z = row.get("zscore_own")
         z = float(z) if pd.notna(z) else 0.0
         kinds = []
+        # New / newly listed shops are not dumps or lapses.
+        if months_on <= 1:
+            continue
         if expected > 0 and volume >= expected * 2.5 and volume >= 0.05:
             kinds.append("trade_loading")
         if expected > 0.05 and volume <= expected * 0.4:
             kinds.append("drop_off")
-        if volume == 0 and (row.get("billed_rate_12") or 0) >= 0.5:
+        if volume == 0 and (row.get("billed_rate_12") or 0) >= 0.5 and comparable:
             kinds.append("lapse")
         cv = row.get("cv_6m")
         if pd.notna(cv) and float(cv) >= 1.2 and volume >= 0.05:
@@ -233,7 +243,7 @@ def cluster_shops(features: pd.DataFrame, shop_month: pd.DataFrame, period: str)
             cv=("volume_mt", lambda s: float(s.std() / s.mean()) if s.mean() else 0.0),
         )
     )
-    rec = features[features["period"] == period][["store_id", "recency_months", "roll_mean_3", "lag_3"]]
+    rec = features[features["period"] == period][["store_id", "recency_months", "roll_mean_3", "lag_3", "months_on_file", "yoy_comparable"]]
     snap = snap.merge(rec, on="store_id", how="left")
     # Trend: last 3 billed months vs prior 3
     ordered = hist.sort_values(["store_id", "period"])
@@ -305,6 +315,9 @@ def _label_segment(row) -> str:
     money = getattr(row, "monetary", 0) or 0
     trend = getattr(row, "trend", 0) or 0
     cv = getattr(row, "cv", 0) or 0
+    months_on = getattr(row, "months_on_file", 99) or 99
+    if months_on <= 2:
+        return "New / Ramp-up"
     if recency >= 4 and freq >= 0.3:
         return "Churn Risk"
     if recency >= 4 and freq < 0.3:

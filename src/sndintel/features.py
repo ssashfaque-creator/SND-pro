@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from sndintel.io_utils import period_key
+from sndintel.io_utils import period_key, shift_period
 
 
 def rebuild_shop_month(sales: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFrame:
@@ -47,17 +47,22 @@ def rebuild_shop_month(sales: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFram
 
 
 def add_calendar_panel(shop_month: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFrame:
-    """Fill missing shop-months with zeros so recency and strike-rate are honest."""
+    """Zero-fill months *after a shop's first bill*, never before.
+
+    Areas come onto the file at different times. Filling zeros from the global
+    start would make a 2026-only shop look like it churned throughout 2024.
+    Never-billed universe shops stay off this panel (they are whitespace, not history).
+    """
     if shop_month.empty:
         return shop_month
     attr_cols = ["distributor", "dsr_name", "section", "store_name", "zone", "city"]
-    periods = sorted(shop_month["period"].unique())
-    store_ids = set(shop_month["store_id"])
-    if stores is not None and not stores.empty:
-        store_ids |= set(stores["store_id"])
-    grid = pd.MultiIndex.from_product(
-        [sorted(store_ids), periods], names=["store_id", "period"]
-    ).to_frame(index=False)
+    billed = shop_month.loc[shop_month["volume_mt"] > 0, ["store_id", "period"]]
+    if billed.empty:
+        return shop_month
+    first = billed.groupby("store_id")["period"].min().rename("first_period")
+    periods = pd.Series(sorted(shop_month["period"].unique()), name="period")
+    grid = first.reset_index().merge(periods, how="cross")
+    grid = grid[grid["period"] >= grid["first_period"]].drop(columns=["first_period"])
     value_cols = ["store_id", "period", "volume_mt", "sku_count"]
     merged = grid.merge(shop_month[value_cols], on=["store_id", "period"], how="left")
     merged["volume_mt"] = merged["volume_mt"].fillna(0.0)
@@ -94,11 +99,19 @@ def build_features(shop_month: pd.DataFrame, sales: pd.DataFrame) -> pd.DataFram
     if shop_month.empty:
         return pd.DataFrame()
     df = shop_month.sort_values(["store_id", "period"]).copy()
+    vol = df.set_index(["store_id", "period"])["volume_mt"]
+
+    def _lag(months: int) -> np.ndarray:
+        idx = pd.MultiIndex.from_arrays(
+            [df["store_id"], df["period"].map(lambda p: shift_period(p, -months))]
+        )
+        return vol.reindex(idx).to_numpy()
+
+    df["lag_1"] = _lag(1)
+    df["lag_2"] = _lag(2)
+    df["lag_3"] = _lag(3)
+    df["lag_12"] = _lag(12)
     g = df.groupby("store_id", group_keys=False)
-    df["lag_1"] = g["volume_mt"].shift(1)
-    df["lag_2"] = g["volume_mt"].shift(2)
-    df["lag_3"] = g["volume_mt"].shift(3)
-    df["lag_12"] = g["volume_mt"].shift(12)
     df["roll_mean_3"] = g["volume_mt"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
     df["roll_mean_6"] = g["volume_mt"].transform(lambda s: s.shift(1).rolling(6, min_periods=2).mean())
     df["roll_median_6"] = g["volume_mt"].transform(lambda s: s.shift(1).rolling(6, min_periods=2).median())
@@ -133,6 +146,9 @@ def build_features(shop_month: pd.DataFrame, sales: pd.DataFrame) -> pd.DataFram
     top_share = _top_sku_share(sales)
     df = df.merge(top_share, on=["store_id", "period"], how="left")
     df["top_sku_share"] = df["top_sku_share"].fillna(0)
+    df["first_period"] = df.groupby("store_id")["period"].transform("min")
+    df["months_on_file"] = df.groupby("store_id").cumcount() + 1
+    df["yoy_comparable"] = df["lag_12"].notna().astype(int)
     keep = [
         "store_id",
         "period",
@@ -154,6 +170,9 @@ def build_features(shop_month: pd.DataFrame, sales: pd.DataFrame) -> pd.DataFram
         "recency_months",
         "billed_rate_12",
         "top_sku_share",
+        "first_period",
+        "months_on_file",
+        "yoy_comparable",
     ]
     return df[keep]
 

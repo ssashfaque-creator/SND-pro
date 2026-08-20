@@ -62,8 +62,11 @@ FIELD_ID_MAP = {
     "txt_csku_lo": "sku",
     "txt_csku": "sku",
     "txt_calendar": "calendar",
+    "txt_calendar_year": "year",
+    "txt_calendar_month": "month",
     "uval_mtd_se": "volume_mt",
     "uval_mtd": "volume_mt",
+    "uval_mtd_secondary": "volume_mt",
 }
 
 HUMAN_HEADER_MAP = {
@@ -138,15 +141,23 @@ def parse_sales_file(path: str | Path) -> tuple[pd.DataFrame, ParseReport]:
         data_start_row=None,
         params=_extract_params(raw),
     )
-    skip_cols = _total_columns(raw)
+    skip_cols = _hierarchy_total_columns(raw)
     field_row, field_map = _detect_field_id_row(raw, skip_cols)
     human_row, human_map = _detect_human_header_row(raw, skip_cols)
+    if field_row is not None:
+        field_map = _attach_year_group_volumes(raw, field_row, field_map)
 
     if field_map:
         report.strategy = "ssrs_field_ids"
         report.header_row = field_row
         report.column_map = field_map
-        data_start = (human_row + 1) if human_row is not None and human_row > field_row else field_row + 1
+        data_start = field_row + 1
+        if human_row is not None and human_row > field_row:
+            store_cols = [c for c, role in field_map.items() if role == "store_id"]
+            looks_like_data = False
+            if store_cols and human_row < len(raw):
+                looks_like_data = looks_like_store_id(raw.iloc[human_row][store_cols[0]])
+            data_start = human_row if looks_like_data else human_row + 1
         mapped = _project_columns(raw, field_map, data_start)
     elif human_map:
         report.strategy = "human_headers"
@@ -186,18 +197,43 @@ def _extract_params(raw: pd.DataFrame) -> dict:
     return params
 
 
-def _total_columns(raw: pd.DataFrame) -> set[int]:
+def _hierarchy_total_columns(raw: pd.DataFrame) -> set[int]:
+    """Skip shop/section/DSR/grand totals — not the year-group MTD measures.
+
+    SSRS names year-group measures ``val_TotalC_*``; those contain the word
+    'total' but they ARE the MTD for 2025/2026/etc. when ``uval_MTD`` is empty.
+    """
     skip: set[int] = set()
-    scan = raw.head(12)
+    scan = raw.head(8)
     for col in raw.columns:
         values = [cell_str(v) for v in scan[col].tolist()]
-        if any(looks_like_total(v) for v in values):
-            # Keep a column if it is the actual volume field containing the word
-            # only as a rare cell; totals in SSRS usually have "Total" in the header.
-            headerish = " ".join(values[:8]).lower()
-            if "total" in headerish:
+        headerish = " ".join(values[:6])
+        key = norm_key(headerish).replace(" ", "_")
+        if key.startswith("uval_") or "val_totalc" in key:
+            continue
+        if key.startswith("txt_total"):
+            skip.add(int(col))
+            continue
+        if any(looks_like_total(v) for v in values[:6]):
+            joined = " ".join(values[:6]).lower()
+            if "grand total" in joined or joined.strip().endswith("total") or " total" in joined:
                 skip.add(int(col))
     return skip
+
+
+def _attach_year_group_volumes(raw: pd.DataFrame, field_row: int, mapping: dict[int, str]) -> dict[int, str]:
+    """Map val_TotalC_* columns that sit before the first outlet-level total."""
+    row = raw.iloc[field_row]
+    yg = 0
+    out = dict(mapping)
+    for col, val in row.items():
+        key = norm_key(val).replace(" ", "_")
+        if key.startswith("txt_total"):
+            break
+        if key.startswith("val_totalc"):
+            out[int(col)] = f"volume_yg_{yg}"
+            yg += 1
+    return out
 
 
 def _detect_field_id_row(raw: pd.DataFrame, skip_cols: set[int]) -> tuple[Optional[int], dict[int, str]]:
@@ -323,6 +359,37 @@ def _positional_project(
     return pd.DataFrame(), {}, 0
 
 
+def _resolve_mtd(df: pd.DataFrame, yg_cols: list[str]) -> pd.Series:
+    """uval_MTD is the month fact. val_TotalC_* are year column-groups.
+
+    On a 2026 row those extra columns still hold 2025's same-month number, so
+    'first filled measure' would leak last year into this year. Map each
+    year-group column to a calendar year (match against rows where MTD is
+    present; otherwise newest year → first group) and only backfill that year.
+    """
+    mtd = df["volume_mt"].map(parse_volume) if "volume_mt" in df.columns else pd.Series([None] * len(df), index=df.index)
+    if not yg_cols:
+        return mtd
+    years = df["year"]
+    yg = {c: df[c].map(parse_volume) for c in yg_cols}
+    uniq = sorted((int(y) for y in years.dropna().unique()), reverse=True)
+    # Default: newest calendar year is the leftmost year-group (SSRS matrix).
+    year_to_col = {y: yg_cols[i] for i, y in enumerate(uniq) if i < len(yg_cols)}
+    y0 = uniq[0]
+    mask = (years == y0) & mtd.notna()
+    if int(mask.sum()) >= 10:
+        scores = {c: int(((yg[c][mask] - mtd[mask]).abs() < 1e-6).sum()) for c in yg_cols}
+        best = max(scores, key=scores.get)
+        if best != year_to_col.get(y0):
+            ordered = [best] + [c for c in yg_cols if c != best]
+            year_to_col = {y: ordered[i] for i, y in enumerate(uniq) if i < len(ordered)}
+    resolved = mtd.copy()
+    for y, col in year_to_col.items():
+        pick = (years == y) & resolved.isna()
+        resolved = resolved.where(~pick, yg[col])
+    return resolved
+
+
 def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
     df = mapped.copy()
     if "calendar" in df.columns:
@@ -350,10 +417,13 @@ def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
 
     df["year"] = df.get("year", pd.Series([None] * len(df))).map(parse_year)
     df["month"] = df.get("month", pd.Series([None] * len(df))).map(parse_month)
+    yg_cols = [c for c in df.columns if str(c).startswith("volume_yg_")]
     if "volume_mt" not in df.columns:
-        report.warnings.append("No volume column detected")
+        report.warnings.append("No uval_MTD column detected; using year-group measures")
         df["volume_mt"] = None
-    df["volume_mt"] = df["volume_mt"].map(parse_volume)
+    df["volume_mt"] = _resolve_mtd(df, yg_cols)
+    if yg_cols:
+        report.warnings.append(f"Resolved MTD from {len(yg_cols)} SSRS year-group measure column(s)")
 
     # Drop repeating header labels and SSRS total rows.
     def _is_junk(row) -> bool:
@@ -366,11 +436,9 @@ def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
             return True
         if dist in LABEL_VALUES or sku in LABEL_VALUES:
             return True
-        if not looks_like_store_id(sid) and not re.match(r"^[A-Za-z0-9_\-]{4,20}$", sid):
+        if not looks_like_store_id(sid) and not re.match(r"^[A-Za-z0-9_\-]{4,24}$", sid):
             return True
         if row.get("year") is None or row.get("month") is None:
-            return True
-        if row.get("volume_mt") is None:
             return True
         if not row.get("sku"):
             return True
@@ -381,8 +449,9 @@ def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
     df["year"] = df["year"].astype(int)
     df["month"] = df["month"].astype(int)
     df["period"] = [period_key(y, m) for y, m in zip(df["year"], df["month"])]
-    df["volume_mt"] = df["volume_mt"].astype(float)
+    df["volume_mt"] = df["volume_mt"].fillna(0.0).astype(float)
     df["store_id"] = df["store_id"].astype(str).str.strip()
+    df = df[df["volume_mt"] > 0]
     grouped = (
         df.groupby(["store_id", "sku", "period"], as_index=False)
         .agg(

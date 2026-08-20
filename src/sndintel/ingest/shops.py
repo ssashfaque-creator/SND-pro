@@ -43,13 +43,17 @@ HEADER_ALIASES = {
     "pop code": "store_id",
     "outlet code": "store_id",
     "outlet id": "store_id",
+    "txt cpop code": "store_id",
     "store name": "store_name",
     "pop name": "store_name",
     "outlet name": "store_name",
+    "txt cpop name": "store_name",
     "distributor": "distributor",
+    "txt cdistributor name": "distributor",
     "dsr name": "dsr_name",
     "dsr": "dsr_name",
     "salesperson": "dsr_name",
+    "txt cdsr name": "dsr_name",
     "zone": "zone",
     "division": "zone",
     "region": "zone",
@@ -58,14 +62,21 @@ HEADER_ALIASES = {
     "section": "section",
     "area": "section",
     "beat": "section",
+    "txt csection long description": "section",
     "channel": "category_1",
     "channel type": "category_1",
     "outlet type": "category_1",
     "category": "category_1",
+    "txt csub element long description": "category_1",
     "class": "category_2",
     "channel class": "category_2",
+    "sub channel": "category_2",
+    "txt csub channel short description": "category_2",
+    "account type": "category_3",
+    "txt caccount type long description": "category_3",
+    "pop type": "category_4",
+    "txt cpop type short description": "category_4",
     "locality": "category_3",
-    "sub channel": "category_3",
     "tier": "category_4",
 }
 
@@ -176,7 +187,14 @@ def _normalize_shops(df: pd.DataFrame, report: ShopParseReport) -> pd.DataFrame:
     out = out[out["store_id"].str.lower() != "store id"]
     out = out[out["store_id"].map(lambda v: looks_like_store_id(v) or (isinstance(v, str) and len(v) >= 4))]
     out["store_id"] = out["store_id"].astype(str).str.strip()
-    out = out.drop_duplicates(subset=["store_id"], keep="last")
+    # Same POP can appear under several distributors (including *_CLOSED).
+    # Keep an open assignment when one exists.
+    closed = out["distributor"].fillna("").str.contains("CLOSED", case=False)
+    out = out.assign(_closed=closed.astype(int)).sort_values(["store_id", "_closed"])
+    dropped = int(out["store_id"].duplicated().sum())
+    out = out.drop_duplicates(subset=["store_id"], keep="first").drop(columns=["_closed"])
+    if dropped:
+        report.warnings.append(f"Collapsed {dropped} duplicate master rows (same store, multiple DSR/distributor lines)")
     missing_geo = out["city"].isna().sum() + out["zone"].isna().sum()
     if missing_geo:
         report.warnings.append(f"{missing_geo} shops missing zone/city after parse")
