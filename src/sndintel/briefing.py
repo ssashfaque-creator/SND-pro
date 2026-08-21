@@ -47,7 +47,8 @@ GLOSSARY = [
     ("vs AMS", "This period minus AMS × fraction of the month elapsed. Negative = behind the recent run-rate."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month)."),
     ("Expected this month", "Warehouse-learned typical same calendar month (every August on file, not last year alone), paced if MTD is open."),
-    ("Fair share of country / city", "This unit’s last-year mix × what the parent billed now. The volume it would have if it only moved with its parent."),
+    ("Fair share of country / city", "This unit’s last-year mix × what the parent billed now. The volume it would have if it only moved with its parent. Different from Expected — Expected is seasonality; fair share is ‘moved with the parent’."),
+    ("Drop size (MT)", "Average billed volume per billed shop this period (billed MT ÷ billed shops). Not the same as From drop size, which is that driver’s share of Recoverable."),
     ("Recoverable", "The extra hole versus the parent, as a positive number — volume that comes back if this unit merely matched its parent."),
     ("From drop size (MT)", "Share of recoverable explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than fair share. The three From columns add to Recoverable when the unit is behind."),
     ("From unvisited shops (MT)", "Share of recoverable from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of fair share."),
@@ -68,13 +69,13 @@ SHOP_RECOVERABLE_FLOOR = 0.25
 
 CITY_VIEW = [
     ("grain_id", "City"),
-    ("zone", "Zone"),
     ("volume_mt", "Billed this period (MT)"),
     ("ams_3m", "AMS last 3 months (MT)"),
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("expected_mt", "Expected this month (MT)"),
     ("share_expected_mt", "Fair share of country (MT)"),
+    ("drop_size_mt", "Drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
@@ -96,6 +97,7 @@ DIST_IN_CITY_VIEW = [
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("share_expected_mt", "Fair share of this city (MT)"),
+    ("drop_size_mt", "Drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
@@ -112,12 +114,12 @@ DIST_IN_CITY_VIEW = [
 DIST_ALL_VIEW = [
     ("grain_id", "Distributor"),
     ("city", "City"),
-    ("zone", "Zone"),
     ("volume_mt", "Billed this period (MT)"),
     ("ams_3m", "AMS last 3 months (MT)"),
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("share_expected_mt", "Fair share of its city (MT)"),
+    ("drop_size_mt", "Drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
@@ -139,6 +141,7 @@ DSR_VIEW = [
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("share_expected_mt", "Fair share of its city (MT)"),
+    ("drop_size_mt", "Drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
@@ -932,6 +935,12 @@ def _grain(units: pd.DataFrame, grain: str) -> pd.DataFrame:
     out["strike_pct"] = strike * 100
     visit = pd.to_numeric(out.get("visit_rate"), errors="coerce")
     out["visit_pct"] = visit * 100
+    vol = pd.to_numeric(out.get("volume_mt"), errors="coerce")
+    if "billed" in out.columns:
+        billed = pd.to_numeric(out["billed"], errors="coerce")
+        out["drop_size_mt"] = vol / billed.mask(billed <= 0)
+    else:
+        out["drop_size_mt"] = pd.NA
     return out
 
 
@@ -1029,6 +1038,11 @@ def _round_display(df: pd.DataFrame) -> pd.DataFrame:
         if col == "Remarks":
             continue
         name = str(col)
+        if name == "Drop size (MT)":
+            out[col] = [
+                (round(float(v), 2) if v is not None and pd.notna(v) else pd.NA) for v in out[col]
+            ]
+            continue
         if "(MT)" in name or name.endswith("%") or name in count_cols:
             out[col] = [_round_num(v) for v in out[col]]
     if rec_col in out.columns and len(from_cols) == 3:
@@ -1380,6 +1394,10 @@ def _excel_value(value: Any) -> Any:
 
 def _format_metric_cell(cell, header: str) -> None:
     h = str(header)
+    if h == "Drop size (MT)":
+        cell.number_format = "0.00"
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
+        return
     if "(MT)" in h:
         cell.number_format = (
             "+0;-0;0"
@@ -1505,6 +1523,8 @@ def _html_td(val: Any, col: str) -> str:
 def _html_cell(val: Any, col: str) -> str:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return "—"
+    if isinstance(val, (int, float)) and str(col) == "Drop size (MT)":
+        return f"{val:.2f}"
     if isinstance(val, (int, float)) and "(MT)" in str(col):
         if str(col).startswith("Extra") or str(col).startswith("vs ") or str(col).startswith("From "):
             return f"{val:+.0f}"

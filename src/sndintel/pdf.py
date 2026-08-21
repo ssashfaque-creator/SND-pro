@@ -49,6 +49,7 @@ HEADER_ALIAS = {
     "Fair share of country (MT)": "Fair share<br/>(MT)",
     "Fair share of this city (MT)": "Fair share<br/>(MT)",
     "Fair share of its city (MT)": "Fair share<br/>(MT)",
+    "Drop size (MT)": "Drop size<br/>(MT)",
     "Recoverable (MT)": "Recoverable<br/>(MT)",
     "From drop size (MT)": "From drop<br/>(MT)",
     "From unvisited shops (MT)": "From<br/>unvisited",
@@ -62,7 +63,6 @@ HEADER_ALIAS = {
 
 TEXT_COLS = {
     "City",
-    "Zone",
     "Distributor",
     "DSR",
     "Shop",
@@ -401,7 +401,7 @@ def _col_widths(cols: list[str], usable: float) -> list[float]:
             weights.append(2.2)
         elif c in {"Distributor", "DSR"}:
             weights.append(1.6)
-        elif c in {"City", "Zone", "Beat", "Call", "Situation"}:
+        elif c in {"City", "Beat", "Call", "Situation"}:
             weights.append(1.15)
         elif "(MT)" in c:
             weights.append(0.85)
@@ -425,6 +425,8 @@ def _cell(val: Any, col: str, styles: dict[str, ParagraphStyle]) -> Paragraph:
 def _pdf_cell_text(val: Any, col: str) -> str:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return "—"
+    if isinstance(val, (int, float)) and col == "Drop size (MT)":
+        return f"{float(val):.2f}"
     if isinstance(val, (int, float)) and "(MT)" in col:
         n = int(round(float(val)))
         if col in SIGNED_MT or col.startswith("vs ") or col.startswith("From "):

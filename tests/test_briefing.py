@@ -107,6 +107,10 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "City" in cities.columns
     assert "AMS last 3 months (MT)" in cities.columns
     assert "Recoverable (MT)" in cities.columns
+    assert "Drop size (MT)" in cities.columns
+    assert "Zone" not in cities.columns
+    fair_i = list(cities.columns).index("Fair share of country (MT)")
+    assert list(cities.columns)[fair_i + 1] == "Drop size (MT)"
     assert "From drop size (MT)" in cities.columns
     assert "From unvisited shops (MT)" in cities.columns
     assert "From unbilled shops (MT)" in cities.columns
@@ -135,7 +139,8 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "Billed shops" in report.lagging_distributors.columns
     assert "Strike %" in report.lagging_distributors.columns
     assert "Universe" in report.lagging_distributors.columns
-    assert "From drop size (MT)" in report.lagging_dsrs.columns
+    assert "Drop size (MT)" in report.lagging_distributors.columns
+    assert "Zone" not in report.lagging_distributors.columns
     assert "Remarks" in report.lagging_dsrs.columns
     assert "Strike %" in report.lagging_dsrs.columns
     assert "Ghost DSR" not in set(report.lagging_dsrs["DSR"].astype(str))

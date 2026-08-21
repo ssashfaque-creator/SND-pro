@@ -574,6 +574,8 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
         name = str(col)
         if name == "Remarks":
             cfg[col] = st.column_config.TextColumn(name, width="large")
+        elif name == "Drop size (MT)":
+            cfg[col] = st.column_config.NumberColumn(name, format="%.2f")
         elif "(MT)" in name:
             cfg[col] = st.column_config.NumberColumn(name, format="%.0f")
         elif name.endswith("%") or name == "Strike %":
