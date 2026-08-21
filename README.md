@@ -6,9 +6,11 @@ The system reads the messy **Shop SKU Wise Execution Report** your SSRS stack ex
 
 ## What your files actually contain
 
-### Sales extract (SSRS Excel / CSV)
+### Sales extract (Outlet Date Wise or Shop SKU Wise)
 
-Opening the report in Excel looks broken. That is normal. The tablix is a matrix, not a table:
+**Outlet Date Wise Sale** (daily tons by POP code) is the preferred billed file. Date columns are summed to calendar months. There is no distributor on that sheet — POP codes are mapped from the **Universe shop list** (then the legacy shop list). Upload universe once, then the daily file.
+
+Shop SKU Wise Execution Report still parses if that is what you have. Opening it in Excel looks broken. That is normal. The tablix is a matrix, not a table:
 
 | Region of the sheet | What it is | Keep? |
 |---|---|---|
@@ -128,9 +130,9 @@ pip install -e .
 snd-intel app
 ```
 
-Open the app → **Strategy** → **Rebuild scorecards from warehouse**. Then open **Warehouse** and pick **Agha Traders (Quetta)** + **2026-07**: the shop list and MT total should match that distributor’s July total on Shop SKU Wise (about 14.51 MT), not ~2×. Country 2026-07 should be near the extract Grand Total (~996 MT) and 2026-08 near the MTD Grand Total (~375 MT).
+Open the app → **Upload files** → universe shop list (if not already saved) + **Outlet Date Wise** sales. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open. Then **Warehouse** → pick a distributor + month and compare shop MT to that name on the SND portal.
 
-If billed is still double after this update, **re-upload the sales extract** — an older warehouse row can still hold the inflated number.
+If billed looks wrong, **re-upload the daily sales file** — rebuild cannot invent days that were never ingested.
 
 ## How a new file is applied
 

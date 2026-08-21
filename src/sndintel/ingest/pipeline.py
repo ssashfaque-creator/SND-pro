@@ -11,6 +11,7 @@ import pandas as pd
 
 from sndintel.config import DATA_DIR, DB_PATH, PROCESSED_DIR, ensure_dirs
 from sndintel.features import add_calendar_panel, build_features, latest_period, rebuild_shop_month
+from sndintel.ingest.daily import overlay_store_attrs
 from sndintel.ingest.shops import parse_shop_master
 from sndintel.ingest.ssrs import collapse_sales_facts, parse_sales_file
 from sndintel.ingest.universe import fill_zone_from_legacy, parse_universe
@@ -98,6 +99,13 @@ def run_pipeline(
             _upsert_stores(conn, store_rows)
 
         if not sales.empty:
+            live_book = read_sql(conn, "SELECT * FROM stores")
+            if not shops.empty:
+                extra = shops.copy()
+                if "in_universe" not in extra.columns:
+                    extra["in_universe"] = 0
+                live_book = pd.concat([live_book, extra], ignore_index=True)
+            sales = overlay_store_attrs(sales, live_book)
             discovered = (
                 sales.groupby("store_id", as_index=False)
                 .agg(

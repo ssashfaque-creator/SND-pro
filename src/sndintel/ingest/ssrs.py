@@ -131,6 +131,10 @@ class ParseReport:
 
 def parse_sales_file(path: str | Path) -> tuple[pd.DataFrame, ParseReport]:
     path = Path(path)
+    from sndintel.ingest.daily import looks_like_outlet_date_wise, parse_outlet_date_wise
+
+    if looks_like_outlet_date_wise(path):
+        return parse_outlet_date_wise(path)
     raw = read_raw_table(path)
     report = ParseReport(
         strategy="unknown",

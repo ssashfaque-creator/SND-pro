@@ -243,7 +243,11 @@ def _page_upload(empty: bool):
         if last_shop and shops is None:
             st.caption(f"Saved legacy master: `{last_shop.name}`")
     with c2:
-        sales = st.file_uploader("Sales extract (xlsx / csv)", type=["xlsx", "xls", "xlsm", "csv"], key="sales")
+        sales = st.file_uploader(
+            "Sales extract — Outlet Date Wise or Shop SKU Wise (xlsx / csv)",
+            type=["xlsx", "xls", "xlsm", "csv"],
+            key="sales",
+        )
         visits = st.file_uploader(
             "Shop visit calls (csv / xlsx) — MTD visits, weekly with sales",
             type=["xlsx", "xls", "xlsm", "csv"],
@@ -254,7 +258,8 @@ def _page_upload(empty: bool):
 
     st.markdown(
         "- **Universe** columns: distributor, area/city, section, DSR, POP code, POP name. Merged cells are filled down.\n"
-        "- First time: universe **and** sales. Optional legacy shop list fills **zone**.\n"
+        "- **Sales:** Outlet Date Wise (daily tons by POP) is summed to months and mapped to distributor/DSR from the universe. Shop SKU Wise still works.\n"
+        "- First time: universe **and** sales. Optional legacy shop list fills **zone** and historical POPs.\n"
         "- Every later week: **sales + visit calls**. Closed months stay. Re-upload universe when shops/DSRs move."
     )
 
@@ -989,7 +994,7 @@ def _page_warehouse(data):
         st.subheader("Check billed vs your extract")
         st.caption(
             "Pick a distributor and a **closed** month (July). Sum the shops and compare to that "
-            "distributor’s total on Shop SKU Wise for the same year and month. "
+            "distributor’s total on Outlet Date Wise (or Shop SKU Wise) for the same year and month. "
             "Country totals below should match the extract’s Grand Total for that month — not ~2×."
         )
         nat = period_totals(sm)
