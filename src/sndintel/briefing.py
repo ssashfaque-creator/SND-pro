@@ -46,45 +46,42 @@ DRIVER_LABEL = {
 GLOSSARY = [
     ("Billed this period", "Secondary volume in the month being scored (MTD if the month is still open)."),
     ("AMS last 3 months", "Average monthly secondary volume over the last three *closed* months. A typical recent month, not last year."),
-    ("vs AMS", "This period minus AMS × fraction of the month elapsed. Negative = behind the recent run-rate."),
-    ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month)."),
-    ("Expected this month", "Warehouse-learned typical same calendar month (every August on file, not last year alone), blended with destationalized recent trend × this month’s index, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Thin doors shrink toward the parent’s month index; children’s Expecteds are then scaled so they add to the parent."),
-    ("Drop size (MT)", "Average billed volume per billed shop this period (billed MT ÷ billed shops). Not the same as From drop size, which is that driver’s share of Recoverable."),
-    ("Recoverable", "The hole versus this unit’s own Expected, as a positive number — volume that comes back if the unit merely billed its typical month. Country Recoverable is the country miss versus Expected."),
-    ("From drop size (MT)", "Share of recoverable explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than Expected. The three From columns add to Recoverable when the unit is behind."),
-    ("From unvisited shops (MT)", "Share of recoverable from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of Expected."),
-    ("From unbilled shops (MT)", "Share of recoverable from doors that were visited (or, if no visit file, simply not billed) but did not buy. Positive = hole; negative = ahead of Expected."),
-    ("Remarks", "Four bullets: trend vs AMS and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; this unit’s drop size and the national average (MT per billed shop)."),
+    ("vs AMS", "This period minus AMS × fraction of the month elapsed. Negative = behind the recent run-rate. On day 20 that is billed − AMS × (20 ÷ days in month), not billed − AMS."),
+    ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month). Zero means no August last year — it does not mean Expected should be zero."),
+    ("Expected this month", "Recent run-rate: mean of the last three closed months (same window as AMS), blended with the last-six-month median, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
+    ("Gap", "The hole versus this unit’s own Expected, as a positive number — volume that comes back if the unit billed its recent run-rate. Country Gap is the country miss versus Expected. Zero means billed at or above Expected, not that AMS is irrelevant."),
+    ("From drop size (MT)", "Share of the gap explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than Expected. The three From columns add to Gap when the unit is behind."),
+    ("From unvisited shops (MT)", "Share of the gap from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of Expected."),
+    ("From unbilled shops (MT)", "Share of the gap from doors that were visited (or, if no visit file, simply not billed) but did not buy. Positive = hole; negative = ahead of Expected."),
+    ("Drop size (MT)", "Average billed volume per billed shop this period (billed MT ÷ billed shops). Not the same as From drop size, which is that driver’s share of Gap."),
+    ("Remarks", "Four bullets: trend vs AMS, vs Expected, and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; drop size vs expected drop (Expected ÷ billed shops) vs national average."),
     ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
     ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
     ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
-    ("Shop lists", "Every door with recoverable greater than 0.25 MT. Shallower holes are one remainder line."),
+    ("Shop lists", "Every door with gap greater than 0.25 MT. Shallower holes are one remainder line."),
     ("AMS = 0 distributors / DSRs", "Hidden everywhere in the report. No recent three-month run-rate, so they are not a call."),
-    ("Situation: Lagging", "Behind this unit’s own Expected by a material amount."),
-    ("Situation: On expected", "Billed in line with this unit’s typical same calendar month."),
-    ("Situation: Ahead", "Ahead of this unit’s own Expected."),
 ]
 
 CALCULATION_NOTES = [
     (
         "Expected this month",
-        "Mean of every same calendar month already in the warehouse (every August, not only last year) blended with destationalized recent trend × that month’s seasonal index. The same recipe runs at country, city, distributor, DSR, and shop. City indexes shrink toward national; dist/DSR/shop indexes shrink toward the city. Children’s Expecteds are then scaled so they add to the parent Expected (forecast-based proportions, not last-year mix × parent billed now). If the month is still open, Expected is that full-month typical × the intra-month fraction.",
+        "Mean of the last three closed months (same window as AMS), blended with the last-six-month median. Calendar-month seasonality is not used: an empty August last year does not zero out a city that has been billing 40 MT/month recently. The same recipe runs at country, city, distributor, DSR, and shop. Children’s Expecteds are then scaled so they add to the parent Expected. If the month is still open, Expected is that full-month run-rate × the intra-month fraction (elapsed days, or learned MTD cuts when those exist).",
     ),
     (
-        "Recoverable",
-        "max(0, Expected − billed), after a small empirical-Bayes shrink so a noisy 0.02 MT door cannot outrank a large one. Country Recoverable is the country miss versus Expected. Lagging means behind own Expected; Ahead means ahead of it; On expected means in line.",
+        "Gap",
+        "max(0, Expected − billed), after a small empirical-Bayes shrink so a noisy 0.02 MT door cannot outrank a large one. Country Gap is the country miss versus Expected.",
     ),
     (
         "From drop / unvisited / unbilled",
-        "Shop-level identity: opportunity is that shop’s Expected (fallback AMS × pace, else last-year × pace). Unvisited = not called and not billed. Unbilled = called (or, with no visit file, simply not billed) and did not buy. Drop size = billed volume versus opportunity on billed doors. Those three are weights, then scaled so they add to Recoverable. Positive = part of the hole; negative = billed more than Expected.",
+        "Shop-level identity: opportunity is that shop’s Expected (fallback AMS × pace, else last-year × pace). Unvisited = not called and not billed. Unbilled = called (or, with no visit file, simply not billed) and did not buy. Drop size = billed volume versus opportunity on billed doors. Those three are weights, then scaled so they add to Gap. Positive = part of the hole; negative = billed more than Expected.",
     ),
     (
         "Drop size (MT) versus From drop size",
-        "Drop size is billed MT ÷ billed shops this period (two decimals). From drop size is that driver’s share of Recoverable, not the average drop.",
+        "Drop size is billed MT ÷ billed shops this period (two decimals). From drop size is that driver’s share of Gap, not the average drop.",
     ),
     (
         "vs AMS",
-        "Billed minus (AMS of the last three closed months × fraction of the month elapsed). Negative = behind the recent run-rate.",
+        "Billed minus (AMS of the last three closed months × fraction of the month elapsed). Negative = behind the recent run-rate. This is not billed minus the full-month AMS.",
     ),
     (
         "Visit % and Strike %",
@@ -96,7 +93,7 @@ CALCULATION_NOTES = [
     ),
     (
         "Rounding and lists",
-        "MT, shop counts, and percents print as whole numbers. From-columns are adjusted so they still add to Recoverable after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. Shops with recoverable ≤ 0.25 MT are one remainder line.",
+        "MT, shop counts, and percents print as whole numbers. From-columns are adjusted so they still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. Shops with gap ≤ 0.25 MT are one remainder line.",
     ),
 ]
 
@@ -105,127 +102,66 @@ def how_to_read_steps(pack: StrategyPack, detailed: bool = False) -> list[str]:
     scope = (pack.scope or "national").lower()
     if scope == "city":
         return [
-            "City scorecard versus its own Expected. Recoverable is billed versus that typical month.",
+            "City scorecard versus its own Expected. Gap is billed versus that recent run-rate.",
             "Every distributor in this city with AMS greater than 0.",
             "Every DSR in this city with AMS greater than 0.",
-            "Shops in this city with recoverable greater than 0.25 MT.",
+            "Shops in this city with gap greater than 0.25 MT.",
         ]
     if scope == "distributor":
         return [
             "Distributor scorecard versus its own Expected.",
             "DSRs on this distributor’s doors.",
-            "Shops under this distributor with recoverable greater than 0.25 MT.",
+            "Shops under this distributor with gap greater than 0.25 MT.",
         ]
     if scope == "dsr":
         return [
             "DSR scorecard versus its own Expected.",
-            "Shops on this beat with recoverable greater than 0.25 MT.",
+            "Shops on this beat with gap greater than 0.25 MT.",
         ]
     if detailed:
         return [
-            "City detail — every city, highest recoverable first.",
+            "City detail — every city, highest gap first.",
             "Distributor detail — every distributor with AMS greater than 0.",
             "DSR detail — every DSR with AMS greater than 0.",
-            "National shops — every door with recoverable greater than 0.25 MT.",
+            "National shops — every door with gap greater than 0.25 MT.",
         ]
     return [
-        "Country by city — every city versus its own Expected. Highest recoverable first.",
+        "Country by city — every city versus its own Expected. Highest gap first.",
         "Lagging cities → distributors — first calls. AMS = 0 is hidden.",
-        "Those distributors → shops with recoverable greater than 0.25 MT.",
+        "Those distributors → shops with gap greater than 0.25 MT.",
         "Every lagging distributor (AMS > 0), including cities that are on expected.",
         "Every lagging DSR (AMS > 0).",
-        "Every shop with recoverable greater than 0.25 MT (shallower doors rolled into the last row).",
+        "Every shop with gap greater than 0.25 MT (shallower doors rolled into the last row).",
     ]
 
 SHOP_RECOVERABLE_FLOOR = 0.25
 
-
-CITY_VIEW = [
-    ("grain_id", "City"),
+SCORECARD_METRICS = [
     ("volume_mt", "Billed this period (MT)"),
     ("ams_3m", "AMS last 3 months (MT)"),
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("expected_mt", "Expected this month (MT)"),
-    ("drop_size_mt", "Drop size (MT)"),
-    ("recoverable_mt", "Recoverable (MT)"),
+    ("recoverable_mt", "Gap (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
     ("from_unbilled_mt", "From unbilled shops (MT)"),
-    ("situation_label", "Situation"),
     ("billed", "Billed shops"),
     ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
     ("visit_pct", "Visit %"),
+    ("drop_size_mt", "Drop size (MT)"),
     ("remarks", "Remarks"),
 ]
 
-DIST_IN_CITY_VIEW = [
-    ("city", "City"),
-    ("grain_id", "Distributor"),
-    ("volume_mt", "Billed this period (MT)"),
-    ("ams_3m", "AMS last 3 months (MT)"),
-    ("vs_ams_mt", "vs AMS (MT)"),
-    ("ly_mt", "Same month last year (MT)"),
-    ("expected_mt", "Expected this month (MT)"),
-    ("drop_size_mt", "Drop size (MT)"),
-    ("recoverable_mt", "Recoverable (MT)"),
-    ("from_drop_size_mt", "From drop size (MT)"),
-    ("from_unvisited_mt", "From unvisited shops (MT)"),
-    ("from_unbilled_mt", "From unbilled shops (MT)"),
-    ("situation_label", "Situation"),
-    ("billed", "Billed shops"),
-    ("visited", "Visited shops"),
-    ("universe", "Universe"),
-    ("strike_pct", "Strike %"),
-    ("visit_pct", "Visit %"),
-    ("remarks", "Remarks"),
-]
+CITY_VIEW = [("grain_id", "City"), *SCORECARD_METRICS]
 
-DIST_ALL_VIEW = [
-    ("grain_id", "Distributor"),
-    ("city", "City"),
-    ("volume_mt", "Billed this period (MT)"),
-    ("ams_3m", "AMS last 3 months (MT)"),
-    ("vs_ams_mt", "vs AMS (MT)"),
-    ("ly_mt", "Same month last year (MT)"),
-    ("expected_mt", "Expected this month (MT)"),
-    ("drop_size_mt", "Drop size (MT)"),
-    ("recoverable_mt", "Recoverable (MT)"),
-    ("from_drop_size_mt", "From drop size (MT)"),
-    ("from_unvisited_mt", "From unvisited shops (MT)"),
-    ("from_unbilled_mt", "From unbilled shops (MT)"),
-    ("situation_label", "Situation"),
-    ("billed", "Billed shops"),
-    ("visited", "Visited shops"),
-    ("universe", "Universe"),
-    ("strike_pct", "Strike %"),
-    ("visit_pct", "Visit %"),
-    ("remarks", "Remarks"),
-]
+DIST_IN_CITY_VIEW = [("city", "City"), ("grain_id", "Distributor"), *SCORECARD_METRICS]
 
-DSR_VIEW = [
-    ("grain_id", "DSR"),
-    ("city", "City"),
-    ("volume_mt", "Billed this period (MT)"),
-    ("ams_3m", "AMS last 3 months (MT)"),
-    ("vs_ams_mt", "vs AMS (MT)"),
-    ("ly_mt", "Same month last year (MT)"),
-    ("expected_mt", "Expected this month (MT)"),
-    ("drop_size_mt", "Drop size (MT)"),
-    ("recoverable_mt", "Recoverable (MT)"),
-    ("from_drop_size_mt", "From drop size (MT)"),
-    ("from_unvisited_mt", "From unvisited shops (MT)"),
-    ("from_unbilled_mt", "From unbilled shops (MT)"),
-    ("situation_label", "Situation"),
-    ("billed", "Billed shops"),
-    ("visited", "Visited shops"),
-    ("universe", "Universe"),
-    ("strike_pct", "Strike %"),
-    ("visit_pct", "Visit %"),
-    ("remarks", "Remarks"),
-]
+DIST_ALL_VIEW = [("grain_id", "Distributor"), ("city", "City"), *SCORECARD_METRICS]
+
+DSR_VIEW = [("grain_id", "DSR"), ("city", "City"), *SCORECARD_METRICS]
 
 SHOP_VIEW = [
     ("store_name", "Shop"),
@@ -237,7 +173,7 @@ SHOP_VIEW = [
     ("ams_3m", "AMS last 3 months (MT)"),
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
-    ("recoverable_mt", "Recoverable (MT)"),
+    ("recoverable_mt", "Gap (MT)"),
     ("visits", "Visits MTD"),
     ("call_status", "Call"),
 ]
@@ -446,9 +382,9 @@ def build_strategy_pack(
     kpis["n_shops_hidden"] = int(lag_meta.get("n_hidden") or 0)
     kpis["hidden_shop_recoverable_mt"] = float(lag_meta.get("hidden_mt") or 0)
     shop_note = (
-        f"Every shop with recoverable greater than {hole_floor:.2f} MT. "
+        f"Every shop with gap greater than {hole_floor:.2f} MT. "
         f"{int(lag_meta.get('n_hidden') or 0)} shallower doors totalling "
-        f"{float(lag_meta.get('hidden_mt') or 0):.0f} MT recoverable are one remainder line."
+        f"{float(lag_meta.get('hidden_mt') or 0):.0f} MT gap are one remainder line."
     )
 
     pack = StrategyPack(
@@ -685,7 +621,7 @@ def score_shops(shop_month: pd.DataFrame, cities: pd.DataFrame, period: str, pac
 
 
 def visit_shop_floors(shop_month: pd.DataFrame, period: str) -> dict[str, float]:
-    """Recoverable cut for shop lists. Size floors are not used — any door above 0.25 MT recoverable is listed."""
+    """Recoverable cut for shop lists. Size floors are not used — any door above 0.25 MT gap is listed."""
     del shop_month, period
     return {"size_floor": 0.0, "hole_floor": SHOP_RECOVERABLE_FLOOR, "rel": 0.0}
 
@@ -726,10 +662,10 @@ def _present_shops(df: pd.DataFrame, meta: dict[str, float]) -> pd.DataFrame:
         return table
     rest = {label: None for _, label in SHOP_VIEW}
     rest["Shop"] = (
-        f"Not listed — {n_hidden} doors with recoverable ≤ {SHOP_RECOVERABLE_FLOOR:.2f} MT "
-        f"({hidden_mt:.0f} MT recoverable). Coverage KPI, not a visit list."
+        f"Not listed — {n_hidden} doors with gap ≤ {SHOP_RECOVERABLE_FLOOR:.2f} MT "
+        f"({hidden_mt:.0f} MT gap). Coverage KPI, not a visit list."
     )
-    rest["Recoverable (MT)"] = _round_num(hidden_mt)
+    rest["Gap (MT)"] = _round_num(hidden_mt)
     return pd.concat([table, pd.DataFrame([rest])], ignore_index=True)
 
 
@@ -799,9 +735,9 @@ def write_excel(pack: StrategyPack, path: Path | str | BytesIO) -> None:
     _sheet_cover(wb, pack)
     for i, (sheet, heading, note, df) in enumerate(iter_report_sheets(pack, detailed=False)):
         kwargs: dict[str, Any] = {}
-        if i == 0 and df is not None and not df.empty and "Recoverable (MT)" in df.columns:
+        if i == 0 and df is not None and not df.empty and "Gap (MT)" in df.columns:
             cat = "City" if "City" in df.columns else list(df.columns)[0]
-            kwargs = dict(bar_col="Recoverable (MT)", cat_col=cat, freeze="A2")
+            kwargs = dict(bar_col="Gap (MT)", cat_col=cat, freeze="A2")
         _sheet_table(wb, sheet, heading, note, df, **kwargs)
     if path is not None:
         wb.save(path)
@@ -812,9 +748,9 @@ def write_excel_detailed(pack: StrategyPack, path: Path | str | BytesIO) -> None
     _sheet_cover(wb, pack, detailed=True)
     for sheet, heading, note, df in iter_report_sheets(pack, detailed=True):
         kwargs: dict[str, Any] = {}
-        if sheet.startswith("01") and df is not None and not df.empty and "Recoverable (MT)" in df.columns:
+        if sheet.startswith("01") and df is not None and not df.empty and "Gap (MT)" in df.columns:
             cat = "City" if "City" in df.columns else list(df.columns)[0]
-            kwargs = dict(bar_col="Recoverable (MT)", cat_col=cat, freeze="A2")
+            kwargs = dict(bar_col="Gap (MT)", cat_col=cat, freeze="A2")
         _sheet_table(wb, sheet, heading, note, df, **kwargs)
     if path is not None:
         wb.save(path)
@@ -829,13 +765,13 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "01 City",
                 f"{label} versus its Expected",
-                "Country row is first when included. Recoverable is billed versus this unit’s own Expected. From drop / unvisited / unbilled add to Recoverable.",
+                "Country row is first when included. Gap is billed versus this unit’s own Expected. From drop / unvisited / unbilled add to Gap.",
                 pack.cities,
             ),
             (
                 "02 Distributors",
                 f"Distributors in {label}",
-                "AMS = 0 is hidden. Highest recoverable first.",
+                "AMS = 0 is hidden. Highest gap first.",
                 pack.all_distributors,
             ),
             (
@@ -847,7 +783,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "04 Shops",
                 f"Shops in {label}",
-                pack.shop_note or "Shops with recoverable greater than 0.25 MT.",
+                pack.shop_note or "Shops with gap greater than 0.25 MT.",
                 pack.all_shops,
             ),
         ]
@@ -857,7 +793,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "01 Distributor",
                 f"{label}",
-                "Scorecard versus its own Expected. From drop / unvisited / unbilled add to Recoverable.",
+                "Scorecard versus its own Expected. From drop / unvisited / unbilled add to Gap.",
                 dist_tbl,
             ),
             (
@@ -869,7 +805,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "03 Shops",
                 f"Shops under {label}",
-                pack.shop_note or "Shops with recoverable greater than 0.25 MT.",
+                pack.shop_note or "Shops with gap greater than 0.25 MT.",
                 pack.all_shops,
             ),
         ]
@@ -878,13 +814,13 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "01 DSR",
                 f"{label}",
-                "Scorecard versus its own Expected. From drop / unvisited / unbilled add to Recoverable.",
+                "Scorecard versus its own Expected. From drop / unvisited / unbilled add to Gap.",
                 pack.all_dsrs,
             ),
             (
                 "02 Shops",
                 f"Shops on this beat",
-                pack.shop_note or "Shops with recoverable greater than 0.25 MT.",
+                pack.shop_note or "Shops with gap greater than 0.25 MT.",
                 pack.all_shops,
             ),
         ]
@@ -893,19 +829,19 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "01 City detail",
                 "Every city",
-                "Full city list, highest recoverable first. From drop / unvisited / unbilled add to Recoverable. Strike % = billed shops ÷ universe.",
+                "Full city list, highest gap first. From drop / unvisited / unbilled add to Gap. Strike % = billed shops ÷ universe.",
                 pack.cities,
             ),
             (
                 "02 Distributor detail",
                 "Every distributor with AMS greater than 0",
-                "Not just lagging distributors. AMS = 0 is hidden. Sorted highest recoverable first.",
+                "Not just lagging distributors. AMS = 0 is hidden. Sorted highest gap first.",
                 pack.all_distributors,
             ),
             (
                 "03 DSR detail",
                 "Every DSR with AMS greater than 0",
-                "Not just lagging DSRs. AMS = 0 is hidden. Sorted highest recoverable first.",
+                "Not just lagging DSRs. AMS = 0 is hidden. Sorted highest gap first.",
                 pack.all_dsrs,
             ),
             (
@@ -917,7 +853,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "05 National shops",
                 "National shop list",
-                pack.shop_note or "Every shop with recoverable greater than 0.25 MT.",
+                pack.shop_note or "Every shop with gap greater than 0.25 MT.",
                 pack.all_shops,
             ),
         ]
@@ -925,7 +861,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
         (
             "01 Country by city",
             "Every city versus its own Expected",
-            "Recoverable is billed versus this unit’s own Expected. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than Expected). Country row is first. Distributors and DSRs with AMS = 0 are hidden.",
+            "Gap is billed versus this unit’s own Expected. From drop size / unvisited / unbilled add to Gap (positive = hole; negative = billed more than Expected). Country row is first. Distributors and DSRs with AMS = 0 are hidden.",
             pack.cities,
         ),
         (
@@ -937,8 +873,8 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
         (
             "03 Those dists-shops",
             "Lagging shops under those distributors",
-            (pack.shop_note or "Shops with recoverable greater than 0.25 MT.")
-            + " Recoverable is volume that comes back if the door billed its own Expected.",
+            (pack.shop_note or "Shops with gap greater than 0.25 MT.")
+            + " Gap is volume that comes back if the door billed its own Expected.",
             pack.city_distributor_shops,
         ),
         (
@@ -956,7 +892,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
         (
             "06 All lagging shops",
             "Every lagging shop worth a visit",
-            pack.shop_note or "Shops with recoverable greater than 0.25 MT. Shallower doors are the remainder line.",
+            pack.shop_note or "Shops with gap greater than 0.25 MT. Shallower doors are the remainder line.",
             pack.lagging_shops,
         ),
     ]
@@ -973,7 +909,7 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
         [
         _html_section(
             "1. The country — every city",
-            "Recoverable is billed versus this unit’s own Expected, highest first. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than Expected). Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first. Remarks are the last column.",
+            "Gap is billed versus this unit’s own Expected, highest first. From drop size / unvisited / unbilled add to Gap (positive = hole; negative = billed more than Expected). Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first. Remarks are the last column.",
             pack.cities,
         ),
         _html_section(
@@ -983,7 +919,7 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
         ),
         _html_section(
             "3. Those distributors — lagging shops",
-            "Doors behind their own Expected under the distributors above. Every shop with recoverable greater than 0.25 MT; remainder line is the tail.",
+            "Doors behind their own Expected under the distributors above. Every shop with gap greater than 0.25 MT; remainder line is the tail.",
             pack.city_distributor_shops,
         ),
         _html_section(
@@ -997,8 +933,8 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
             pack.lagging_dsrs,
         ),
         _html_section(
-            "6. Every lagging shop above 0.25 MT recoverable",
-            pack.shop_note or "Shops with recoverable greater than 0.25 MT. Shallower doors are the remainder line.",
+            "6. Every lagging shop above 0.25 MT gap",
+            pack.shop_note or "Shops with gap greater than 0.25 MT. Shallower doors are the remainder line.",
             pack.lagging_shops,
         ),
         ]
@@ -1013,12 +949,12 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
                 ),
                 _html_section(
                     "Distributor detail — every distributor with AMS > 0",
-                    "Not just lagging. Sorted highest recoverable first.",
+                    "Not just lagging. Sorted highest gap first.",
                     pack.all_distributors,
                 ),
                 _html_section(
                     "DSR detail — every DSR with AMS > 0",
-                    "Not just lagging. Sorted highest recoverable first.",
+                    "Not just lagging. Sorted highest gap first.",
                     pack.all_dsrs,
                 ),
                 _html_section(
@@ -1027,8 +963,8 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
                     pack.all_dsrs,
                 ),
                 _html_section(
-                    "National detail — every shop above 0.25 MT recoverable",
-                    pack.shop_note or "Every shop with recoverable greater than 0.25 MT.",
+                    "National detail — every shop above 0.25 MT gap",
+                    pack.shop_note or "Every shop with gap greater than 0.25 MT.",
                     pack.all_shops,
                 ),
             ]
@@ -1181,11 +1117,11 @@ def _round_num(val: Any) -> Any:
 
 
 def _round_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Whole numbers for MT, counts, and percents. From-columns still sum to Recoverable."""
+    """Whole numbers for MT, counts, and percents. From-columns still sum to Gap."""
     if df is None or df.empty:
         return df
     out = df.copy()
-    rec_col = "Recoverable (MT)"
+    rec_col = "Gap (MT)"
     from_cols = [
         c
         for c in ["From drop size (MT)", "From unvisited shops (MT)", "From unbilled shops (MT)"]
@@ -1522,12 +1458,12 @@ def _sheet_table(
             else:
                 cell.font = Font(size=10)
                 _format_metric_cell(cell, df.columns[c_idx - 1] if c_idx - 1 < len(df.columns) else "")
-                sit = _row_situation(df, r_idx - start - 1)
-                if sit == "Lagging":
+                sit = row_tone(df.iloc[r_idx - start - 1])
+                if sit == "lagging":
                     cell.fill = PatternFill("solid", fgColor="FEF2F2")
-                elif sit == "Ahead":
+                elif sit == "ahead":
                     cell.fill = PatternFill("solid", fgColor="F0FDF4")
-                elif sit == "Country":
+                elif sit == "country":
                     cell.fill = PatternFill("solid", fgColor="E2E8F0")
                     cell.font = Font(size=10, bold=True)
     headers = list(df.columns)
@@ -1599,13 +1535,32 @@ def _format_metric_cell(cell, header: str) -> None:
         cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
 
 
-def _row_situation(df: pd.DataFrame, idx: int) -> str:
-    if "Situation" not in df.columns:
-        return ""
-    if idx < 0 or idx >= len(df):
-        return ""
-    val = df.iloc[idx]["Situation"]
-    return str(val) if pd.notna(val) else ""
+def row_tone(row: pd.Series) -> str:
+    """Row wash: country / lagging (gap > 0) / ahead (billed > expected)."""
+    city = str(row.get("City") or "")
+    dist = str(row.get("Distributor") or "")
+    if city == "Country" or dist == "Country":
+        return "country"
+    gap = row.get("Gap (MT)")
+    billed = row.get("Billed this period (MT)")
+    exp = row.get("Expected this month (MT)")
+    try:
+        if gap is not None and pd.notna(gap) and float(gap) > 0:
+            return "lagging"
+    except (TypeError, ValueError):
+        pass
+    try:
+        if (
+            billed is not None
+            and exp is not None
+            and pd.notna(billed)
+            and pd.notna(exp)
+            and float(billed) > float(exp) + 0.5
+        ):
+            return "ahead"
+    except (TypeError, ValueError):
+        pass
+    return ""
 
 
 def _html_cover(pack: StrategyPack, k: dict[str, Any], detailed: bool = False) -> str:
@@ -1678,7 +1633,7 @@ def _html_glossary() -> str:
     )
     return f"""<section>
   <h2>Glossary</h2>
-  <p class="note">Read this first. Every later table uses these words. From drop / unvisited / unbilled add to Recoverable.</p>
+  <p class="note">Read this first. Every later table uses these words. From drop / unvisited / unbilled add to Gap.</p>
   <dl class="glossary">{items}</dl>
   <h2>How the figures are calculated</h2>
   <dl class="glossary">{calc}</dl>
@@ -1691,20 +1646,9 @@ def _df_html(df: pd.DataFrame) -> str:
         return "<p class='note'>No rows at this layer for this period.</p>"
     heads = "".join(f"<th>{html.escape(str(c))}</th>" for c in df.columns)
     body = []
-    sit_col = "Situation" if "Situation" in df.columns else None
     for _, row in df.iterrows():
-        klass = ""
-        if sit_col:
-            sit = str(row[sit_col] or "")
-            if sit == "Lagging":
-                klass = "lagging"
-            elif sit == "Ahead":
-                klass = "ahead"
-            elif sit == "Country":
-                klass = "country"
-        tds = "".join(
-            f"<td>{_html_td(row[c], c)}</td>" for c in df.columns
-        )
+        klass = row_tone(row) or ""
+        tds = "".join(f"<td>{_html_td(row[c], c)}</td>" for c in df.columns)
         body.append(f"<tr class='{klass}'>{tds}</tr>")
     return f"<table><thead><tr>{heads}</tr></thead><tbody>{''.join(body)}</tbody></table>"
 

@@ -42,30 +42,30 @@ Return JSON only:
 Two sections, and only these two:
 
 1. situation — 2 to 4 short paragraphs. Summary of the current situation.
-   Paragraph 1: the country. Billed versus AMS, last year, and Expected. Country Recoverable is that miss versus Expected (not a leftover versus peers). If MTD is open, say the day/fraction. Visit % versus Strike % at country level.
-   Paragraph 2: cities versus their own Expected. Rank lagging cities by Recoverable and, when you can, each city's share of country Recoverable. Lagging-city Recoverable can sum to more than country Recoverable when other cities are Ahead. Name Ahead cities so leadership does not raid them. Cities "On expected" billed their typical month — they are not local fires even if they are down versus last year.
-   Paragraph 3: coverage versus conversion versus drop size. Read country Visit % against Strike %, and the country From drop / From unvisited / From unbilled split (they add to Recoverable). High visit and low strike means unbilled shops, not unvisited. Confirm with the From columns.
+   Paragraph 1: the country. Billed versus AMS, last year, and Expected. Country Gap is that miss versus Expected (not a leftover versus peers). If MTD is open, say the day/fraction. Visit % versus Strike % at country level.
+   Paragraph 2: cities versus their own Expected. Rank lagging cities by Gap and, when you can, each city's share of country Gap. Lagging-city Gap can sum to more than country Gap when other cities are Ahead. Name Ahead cities so leadership does not raid them.
+   Paragraph 3: coverage versus conversion versus drop size. Read country Visit % against Strike %, and the country From drop / From unvisited / From unbilled split (they add to Gap). High visit and low strike means unbilled shops, not unvisited. Confirm with the From columns.
    Optional paragraph 4: concentration. If one city is both a large share of billed volume and most of the country miss versus Expected, say so. Do not tour every city that is slightly down.
 
-2. focus — 4 to 8 key focus areas, ranked by Recoverable MT, each with:
-   title: named entity plus the Recoverable MT (city, then distributors, then DSRs or a material shop).
+2. focus — 4 to 8 key focus areas, ranked by Gap MT, each with:
+   title: named entity plus the Gap MT (city, then distributors, then DSRs or a material shop).
    why: the From-columns, Visit/Strike versus parent, and why this unit is behind its own Expected.
    do: one specific next action this week (who to call, what to inspect). Not slogans.
 
 How the pack is built (use these definitions; do not redefine them in the prose):
 
-- Expected = typical same calendar month from every matching month in the warehouse, blended with destationalized recent trend × month index, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Thin series shrink toward the parent month index; children's Expecteds are then scaled so they add to the parent Expected. It is not last year alone, and it is not last-year mix × what the parent billed now.
-- Lagging = behind this unit's own Expected by a material amount, not merely down YoY. Ahead = ahead of own Expected. On expected = billed in line with the typical month.
-- Recoverable = the hole versus this unit's own Expected as a positive number. Country Recoverable is the country miss versus Expected. Do not treat peer mix or "fair share of parent" as the call.
-- From drop / unvisited / unbilled add to Recoverable. Positive = part of the hole. Negative = billed more than Expected.
-- Drop size (MT) = billed MT ÷ billed shops. It is not From drop size.
+- Expected = last three closed months (same window as AMS), blended with the last-six-month median, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied. Children's Expecteds are then scaled so they add to the parent Expected. It is not last year alone, and an empty August last year does not zero Expected.
+- Lagging = behind this unit's own Expected by a material amount (Gap > 0). Ahead = billed above Expected. On expected = billed in line with the recent run-rate.
+- Gap = the hole versus this unit's own Expected as a positive number. Country Gap is the country miss versus Expected.
+- From drop / unvisited / unbilled add to Gap. Positive = part of the hole. Negative = billed more than Expected.
+- Drop size (MT) = billed MT ÷ billed shops. Remarks compare drop size vs expected drop (Expected ÷ billed shops) vs the national average. It is not From drop size.
 - Visit % = visited ÷ universe (a billed shop counts as visited). Strike % = billed ÷ universe.
-- AMS = 0 distributors/DSRs are already hidden. Shop lists already drop doors with Recoverable ≤ 0.25 MT; the remainder line is the tail.
+- AMS = 0 distributors/DSRs are already hidden. Shop lists already drop doors with Gap ≤ 0.25 MT; the remainder line is the tail.
 - Last-year = 0 can produce a huge YoY %. That is an artifact, not a win.
 
 Quality bar (pattern, not numbers to copy):
 
-If the country is far below AMS and Expected, that miss is Country Recoverable. Rank lagging cities by Recoverable versus their own Expected. Read Visit % vs Strike %: high visit and low strike means the hole is unbilled, confirmed when From unbilled dominates From unvisited. Name Ahead cities. Then name the lagging distributors and DSRs that own the city hole, and any single shop whose Recoverable is material (for example a visited-not-billed door). A distributor can lag inside a city that is Ahead or On expected — mention that pocket; do not send the city into the lagging-city list. If visit is already ~90%+, do not recommend "visit more"; recommend converting unbilled doors or lifting drop size.
+If the country is far below AMS and Expected, that miss is Country Gap. Rank lagging cities by Gap versus their own Expected. Read Visit % vs Strike %: high visit and low strike means the hole is unbilled, confirmed when From unbilled dominates From unvisited. Name Ahead cities. Then name the lagging distributors and DSRs that own the city hole, and any single shop whose Gap is material (for example a visited-not-billed door). A distributor can lag inside a city that is Ahead or On expected — mention that pocket; do not send the city into the lagging-city list. If visit is already ~90%+, do not recommend "visit more"; recommend converting unbilled doors or lifting drop size.
 
 Write for a sales head. Plain English. Named entities. No filler. No bullet salad inside situation paragraphs. Do not mention that you are an AI, the prompt, or the BRIEF JSON.
 """
@@ -158,7 +158,15 @@ def _city_split(cities: pd.DataFrame) -> tuple[dict[str, Any] | None, pd.DataFra
     country_df = cities[cities["City"].astype(str) == "Country"]
     rest = cities[cities["City"].astype(str) != "Country"].copy()
     country = _records(country_df)[0] if not country_df.empty else None
-    if "Situation" in rest.columns:
+    if "Gap (MT)" in rest.columns:
+        gap = pd.to_numeric(rest["Gap (MT)"], errors="coerce").fillna(0)
+        billed = pd.to_numeric(rest.get("Billed this period (MT)"), errors="coerce")
+        exp = pd.to_numeric(rest.get("Expected this month (MT)"), errors="coerce")
+        lag = rest[gap > 0]
+        ahead_mask = (gap <= 0) & billed.notna() & exp.notna() & (billed > exp + 0.5)
+        ahead = rest[ahead_mask.fillna(False)]
+        with_c = rest[(gap <= 0) & ~ahead_mask.fillna(False)]
+    elif "Situation" in rest.columns:
         lag = rest[rest["Situation"].astype(str) == "Lagging"]
         ahead = rest[rest["Situation"].astype(str) == "Ahead"]
         with_c = rest[rest["Situation"].astype(str).str.contains("On expected", case=False, na=False)]
@@ -176,12 +184,16 @@ def build_grounded_brief(pack: StrategyPack) -> dict[str, Any]:
     kpis = pack.kpis or {}
     extra = kpis.get("extra_hole_mt")
     rec_country = None
-    if country and "Recoverable (MT)" in country:
+    if country and "Gap (MT)" in country:
+        rec_country = country.get("Gap (MT)")
+    elif country and "Recoverable (MT)" in country:
         rec_country = country.get("Recoverable (MT)")
     lag_share: list[dict[str, Any]] = []
     denom = abs(float(rec_country)) if rec_country not in (None, "") else abs(float(extra or 0) or 0)
     for rec in _records(lag):
-        rec_mt = rec.get("Recoverable (MT)")
+        rec_mt = rec.get("Gap (MT)")
+        if rec_mt is None:
+            rec_mt = rec.get("Recoverable (MT)")
         share = None
         try:
             if denom and rec_mt is not None:

@@ -373,12 +373,16 @@ def _trend_bit(r: pd.Series, parent: dict[str, Any]) -> str:
     ams = _num(r.get("ams_3m"))
     vs_ams = _num(r.get("vs_ams_mt"))
     ly = _num(r.get("ly_mt"))
+    exp = _num(r.get("expected_mt"))
     parts = ["Trend:"]
     if ams is not None and ams > 1e-9 and vs_ams is not None:
         pct = 100.0 * vs_ams / ams
         parts.append(f"{vs_ams:+.0f} MT vs AMS ({pct:+.0f}%).")
     elif vol is not None:
         parts.append(f"billed {vol:.0f} MT.")
+    if exp is not None and vol is not None:
+        gap = vol - exp
+        parts.append(f"{gap:+.0f} MT vs Expected.")
     if ly is not None and ly > 1e-9 and vol is not None:
         yoy = 100.0 * (vol - ly) / ly
         p_yoy = parent.get("yoy_pct")
@@ -429,17 +433,27 @@ def _productivity_bit(r: pd.Series, parent: dict[str, Any], z) -> str:
 def _drop_bit(r: pd.Series, parent: dict[str, Any], z) -> str:
     del z
     drop = _num(r.get("drop_size_mt"))
-    if drop is None:
-        billed = _num(r.get("billed"))
-        vol = _num(r.get("volume_mt"))
-        if billed and billed > 0 and vol is not None:
-            drop = vol / billed
+    billed = _num(r.get("billed"))
+    vol = _num(r.get("volume_mt"))
+    if drop is None and billed and billed > 0 and vol is not None:
+        drop = vol / billed
     if drop is None:
         return ""
+    exp = _num(r.get("expected_mt"))
+    exp_drop = None
+    if exp is not None and billed and billed > 0:
+        exp_drop = exp / billed
     nat = _num(parent.get("drop_size_mt"))
+    if exp_drop is not None and nat is not None:
+        return (
+            f"Drop size: {drop:.2f} vs expected {exp_drop:.2f} vs national average {nat:.2f} "
+            f"(MT per billed shop)."
+        )
+    if exp_drop is not None and nat is None:
+        return f"Drop size: {drop:.2f} vs expected {exp_drop:.2f} (MT per billed shop, national average)."
     if nat is None:
         return f"Drop size: {drop:.2f} MT per billed shop (national average)."
-    return f"Drop size: {drop:.2f} MT per billed shop; national average {nat:.2f}."
+    return f"Drop size: {drop:.2f} vs national average {nat:.2f} (MT per billed shop)."
 
 
 def _z_tag(z) -> str:

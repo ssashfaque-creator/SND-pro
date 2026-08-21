@@ -390,9 +390,8 @@ def _page_upload(empty: bool):
 def _page_strategy(data, _latest, period, mtd, ledger):
     st.title("Briefing")
     st.caption(
-        f"**{mtd['label'] or period}** · expected is the typical same calendar month from every month "
-        "in your warehouse — not last year alone, and not a loading curve we specified. "
-        "Cities that moved with the country are not a local fire."
+        f"**{mtd['label'] or period}** · expected is the recent run-rate (last three closed months), "
+        "paced if the month is still open. An empty August last year does not zero Expected."
     )
     if mtd["open"]:
         st.info(banner_text(ledger, period))
@@ -513,8 +512,8 @@ def _page_strategy(data, _latest, period, mtd, ledger):
 
     st.markdown("##### 1. The country — every city")
     st.caption(
-        "Start here. The first row is the **country**. **Recoverable** is billed versus this unit’s own Expected. "
-        "**From drop size / unvisited / unbilled** add to Recoverable (positive = hole; negative = billed more than Expected). "
+        "Start here. The first row is the **country**. **Gap** is billed versus this unit’s own Expected (recent run-rate, paced if MTD is open). "
+        "**From drop size / unvisited / unbilled** add to Gap (positive = hole; negative = billed more than Expected). "
         "**Remarks** (last column) are four bullets: trend, coverage, productivity, drop size. "
         "Distributors and DSRs with AMS = 0 are hidden later."
     )
@@ -527,10 +526,10 @@ def _page_strategy(data, _latest, period, mtd, ledger):
             chart["city"] = chart["grain_id"]
             if "recoverable_mt" in chart.columns:
                 ycol = "recoverable_mt"
-                ylab = "Recoverable (MT)"
+                ylab = "Gap (MT)"
             else:
                 ycol = "isolated_mt" if "isolated_mt" in chart.columns else "gap_mt"
-                ylab = "Recoverable (MT)"
+                ylab = "Gap (MT)"
             color = "situation" if "situation" in chart.columns else "diagnosis"
             cmap = SITUATION_COLOR if color == "situation" else DIAGNOSIS_COLOR
             fig = px.bar(
@@ -587,7 +586,7 @@ def _page_strategy(data, _latest, period, mtd, ledger):
     st.markdown("##### 3. Those distributors — lagging shops")
     st.caption(
         (pack.shop_note or "Every shop with recoverable greater than 0.25 MT.")
-        + " **Recoverable** is the volume you get back if the door merely matches the city."
+        + " **Gap** is the volume you get back if the door billed its own Expected."
     )
     if pack.city_distributor_shops.empty:
         st.info("No material lagging shops under those distributors.")
@@ -605,7 +604,7 @@ def _page_strategy(data, _latest, period, mtd, ledger):
     st.caption("Salespeople behind their city. AMS = 0 is hidden. Ride-with this list.")
     _strategy_table(pack.lagging_dsrs.head(60))
 
-    st.markdown("##### 6. Every lagging shop above 0.25 MT recoverable")
+    st.markdown("##### 6. Every lagging shop above 0.25 MT gap")
     st.caption(pack.shop_note or "Every shop with recoverable greater than 0.25 MT. Shallower doors are the remainder line.")
     _strategy_table(pack.lagging_shops, height=420)
 

@@ -110,18 +110,18 @@ def brief(limit: int = typer.Option(20, help="How many ranked insights to show")
         waterfall.add_column("Billed", justify="right")
         waterfall.add_column("Expected", justify="right")
         waterfall.add_column("vs Expected", justify="right")
-        waterfall.add_column("Situation", width=14)
+        waterfall.add_column("Gap", justify="right")
         waterfall.add_column("Driver", width=12)
         for rec in cities.head(12).itertuples(index=False):
             fair = getattr(rec, "expected_mt", getattr(rec, "share_expected_mt", 0))
             iso = getattr(rec, "isolated_mt", rec.gap_mt)
-            sit_l = getattr(rec, "situation", rec.verdict)
+            gap = abs(min(0.0, float(iso or 0)))
             waterfall.add_row(
                 str(rec.grain_id)[:16],
                 f"{rec.volume_mt:.1f}",
                 f"{fair:.1f}",
                 f"{iso:+.1f}",
-                str(sit_l),
+                f"{gap:.1f}",
                 str(rec.diagnosis),
             )
         console.print(waterfall)

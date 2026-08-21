@@ -2,11 +2,11 @@
 
 Not a canned strategy. Every row is computed from the warehouse:
 
-* Expected is learned from the warehouse at every grain: typical same calendar
-  month across all history, blended with destationalized recent trend × this
-  month's index, shrunk toward the parent when history is thin, then scaled so
-  children add to the parent Expected. Last year is one input, not the call.
-* Recoverable = hole versus that Expected. From drop / unvisited / unbilled
+* Expected is recent run-rate at every grain: last three closed months (same
+  window as AMS), blended with the last-six-month median, paced if MTD is
+  open. Calendar-month seasonality is not applied. Children add to the parent
+  Expected. Last year is one input, not the call.
+* Gap = hole versus that Expected. From drop / unvisited / unbilled
   partition it.
 * National hole = billed versus national Expected (additive after reconcile).
 * Inside a city, hole = like-for-like drop size + lost-shop volume − new volume.

@@ -34,6 +34,7 @@ from sndintel.briefing import (
     how_to_read_steps,
     is_national_pack,
     iter_report_sheets,
+    row_tone,
 )
 
 NAVY = colors.HexColor("#0F172A")
@@ -53,8 +54,8 @@ HEADER_ALIAS = {
     "vs AMS (MT)": "vs AMS<br/>(MT)",
     "Same month last year (MT)": "LY same<br/>month",
     "Expected this month (MT)": "Expected<br/>(MT)",
+    "Gap (MT)": "Gap<br/>(MT)",
     "Drop size (MT)": "Drop size<br/>(MT)",
-    "Recoverable (MT)": "Recoverable<br/>(MT)",
     "From drop size (MT)": "From drop<br/>(MT)",
     "From unvisited shops (MT)": "From<br/>unvisited",
     "From unbilled shops (MT)": "From<br/>unbilled",
@@ -139,7 +140,7 @@ def write_pdf(pack: StrategyPack, path: Path | str | BytesIO, detailed: bool = F
         )
         canvas.setFillColor(SLATE)
         canvas.setFont("Helvetica", 7)
-        canvas.drawString(10 * mm, 5 * mm, "Figures in MT are rounded to whole numbers. From drop / unvisited / unbilled add to Recoverable.")
+        canvas.drawString(10 * mm, 5 * mm, "Figures in MT are rounded to whole numbers. From drop / unvisited / unbilled add to Gap.")
         canvas.drawRightString(pagesize[0] - 10 * mm, 5 * mm, f"Page {doc_.page}")
         canvas.restoreState()
 
@@ -271,7 +272,7 @@ def _glossary_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle], d
         Paragraph(
             "Read this page first. Every later table uses these words. "
             "Figures in MT are whole numbers; drop size is two decimals. "
-            "From drop / unvisited / unbilled add to Recoverable.",
+            "From drop / unvisited / unbilled add to Gap.",
             styles["note"],
         ),
         Spacer(1, 4),
@@ -389,7 +390,6 @@ def _table_flowable(df: pd.DataFrame, styles: dict[str, ParagraphStyle], usable:
     widths = _col_widths(cols, usable)
     header = [Paragraph(HEADER_ALIAS.get(c, xml_escape(str(c))), styles["th"]) for c in cols]
     data = [header]
-    sit_col = "Situation" if "Situation" in cols else None
     for _, row in df.iterrows():
         cells = [_cell(row[c], c, styles) for c in cols]
         data.append(cells)
@@ -409,12 +409,12 @@ def _table_flowable(df: pd.DataFrame, styles: dict[str, ParagraphStyle], usable:
         ("BACKGROUND", (0, 1), (-1, -1), WHITE),
     ]
     for r_idx, (_, row) in enumerate(df.iterrows(), start=1):
-        sit = str(row[sit_col] or "") if sit_col else ""
-        if sit == "Lagging":
+        sit = row_tone(row)
+        if sit == "lagging":
             cmds.append(("BACKGROUND", (0, r_idx), (-1, r_idx), LAG))
-        elif sit == "Ahead":
+        elif sit == "ahead":
             cmds.append(("BACKGROUND", (0, r_idx), (-1, r_idx), AHEAD))
-        elif sit == "Country":
+        elif sit == "country":
             cmds.append(("BACKGROUND", (0, r_idx), (-1, r_idx), COUNTRY))
         elif r_idx % 2 == 0:
             cmds.append(("BACKGROUND", (0, r_idx), (-1, r_idx), WASH))

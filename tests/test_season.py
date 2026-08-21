@@ -54,8 +54,8 @@ def test_nineteen_months_learn_august_is_a_high_month():
     assert fit.n_same_month == 1  # only Aug 2025 is a prior August
     assert fit.national_index[8] > 1.05
     assert fit.national_index[1] < 0.95
-    # Expected uses typical August (140), not a curve we specified.
-    assert fit.expected_full_national > 120
+    # Expected uses last-3-month run-rate (May–Jul 2026 are 100), not typical August (140).
+    assert 90 < fit.expected_full_national < 115
 
 
 def test_typical_august_is_mean_of_every_august_not_last_year_only():
@@ -68,7 +68,7 @@ def test_typical_august_is_mean_of_every_august_not_last_year_only():
     sm = pd.DataFrame(rows)
     fit = fit_seasonality(sm, "2026-08")
     assert fit.n_same_month == 2
-    # Mean of 100 and 80 is 90 — last year alone is 80.
+    # Last three closed months (May–Jul) are 90. Same-month Augusts are not the call.
     typical = fit.city_expected.iloc[0]["typical_mt"]
     assert abs(typical - 90.0) < 0.5
     pack = build_hierarchy_pack(
@@ -79,7 +79,7 @@ def test_typical_august_is_mean_of_every_august_not_last_year_only():
         ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]),
     )
     khi = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Karachi")].iloc[0]
-    # Expected closer to 90 than to last year's 80.
+    # Expected follows recent 90 MT months, not last August 80.
     assert float(khi["expected_mt"]) > 84
     assert abs(float(khi["expected_mt"]) - 80.0) > 3
 
@@ -251,4 +251,73 @@ def test_distributor_expected_is_own_typical_august_not_parent_scale():
     assert abs(float(eva["expected_mt"]) + float(south["expected_mt"]) - float(khi["expected_mt"])) < 0.2
     # Eva billed 70 vs ~80 typical: on or slightly behind Expected, not a 37 MT hole vs 107.
     assert float(eva["volume_mt"]) - float(eva["expected_mt"]) > -25
+
+
+def test_expected_follows_recent_ams_when_august_history_is_empty():
+    """Larkana-style: no August last year, but May–Jul run-rate is 44 MT.
+
+    Seasonality used to print Expected ≈ 4 and mark the city Ahead. Expected
+    must stay near the 44 MT AMS, then pace if MTD is open.
+    """
+    rows = []
+    for per, vol in [
+        ("2026-05", 44.0),
+        ("2026-06", 44.0),
+        ("2026-07", 44.0),
+        ("2026-08", 18.0),
+    ]:
+        rows.append(_shop_month("L1", per, vol, "Larkana"))
+    sm = pd.DataFrame(rows)
+    fit = fit_seasonality(sm, "2026-08")
+    assert abs(float(fit.city_expected.iloc[0]["expected_full_mt"]) - 44.0) < 3
+    stores = sm.drop_duplicates("store_id")[
+        ["store_id", "store_name", "distributor", "dsr_name", "zone", "city", "section"]
+    ]
+    pack = build_hierarchy_pack(
+        sm,
+        stores,
+        ledger=pd.DataFrame(
+            [
+                {"period": "2026-05", "status": "closed"},
+                {"period": "2026-06", "status": "closed"},
+                {"period": "2026-07", "status": "closed"},
+                {
+                    "period": "2026-08",
+                    "status": "mtd_open",
+                    "as_of_day": 20,
+                    "days_in_month": 31,
+                },
+            ]
+        ),
+    )
+    city = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Larkana")].iloc[0]
+    expected = float(city["expected_mt"])
+    # Paced 44 × 20/31 ≈ 28, not 4.
+    assert 20.0 < expected < 36.0
+    assert float(city["volume_mt"]) < expected
+    assert city["situation"] == "lagging"
+
+
+def test_city_with_only_old_august_does_not_steal_expected_from_live_cities():
+    """A city that billed last August but nothing in May–Jul must Expected 0.
+
+    Treating that 0 as 'missing' used to fall back to last August, then
+    reconcile stole Expected from cities that actually have a run-rate.
+    """
+    rows = []
+    for per, vol in [("2026-05", 40.0), ("2026-06", 40.0), ("2026-07", 40.0), ("2026-08", 30.0)]:
+        rows.append(_shop_month("K1", per, vol, "Karachi"))
+    rows.append(_shop_month("G1", "2025-08", 40.0, "GhostCity"))
+    rows.append(_shop_month("G1", "2026-08", 1.0, "GhostCity"))
+    sm = pd.DataFrame(rows)
+    stores = sm.drop_duplicates("store_id")[
+        ["store_id", "store_name", "distributor", "dsr_name", "zone", "city", "section"]
+    ]
+    pack = build_hierarchy_pack(
+        sm, stores, ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}])
+    )
+    ghost = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "GhostCity")].iloc[0]
+    khi = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Karachi")].iloc[0]
+    assert float(ghost["expected_mt"]) < 5.0
+    assert float(khi["expected_mt"]) > 30.0
 

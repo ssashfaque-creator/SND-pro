@@ -1,27 +1,24 @@
-"""Expected-based isolation: billed vs the warehouse-learned typical month.
+"""Expected-based isolation: billed vs recent run-rate.
 
 Excel compares each unit to last year. Peer fair share compares each unit to
-its parent. Both hide a miss when the whole book is down, or invent a miss
-when a unit merely moved with a declining parent.
+its parent. Calendar-month seasonality zeros a city that never billed in
+August even when AMS is 44 MT.
 
 The call in this pack is:
 
-    After this unit's own Expected (typical same calendar month from history,
-    blended with destationalized recent trend × this month's index, paced if
-    MTD is open), is it still a problem?
+    After this unit's own Expected (last three closed months, blended with
+    the last-six-month median, paced if MTD is open), is it still a problem?
 
-Expected is learned at every grain. Thin doors shrink toward the parent
-seasonal index, then children's Expecteds are scaled so they add to the
-parent Expected (forecast-based proportions — not last-year mix × parent
-billed now). Recoverable is the hole versus Expected. From drop / unvisited /
-unbilled partition that hole.
+Expected is learned at every grain. Children's Expecteds are scaled so they
+add to the parent Expected. Gap is the hole versus Expected. From drop /
+unvisited / unbilled partition that hole.
 
 Residuals are shrunk with empirical Bayes so a 0.02 MT shop cannot outrank
 Eva Foods on a percentage, and scored with a robust z.
 
 Intra-month day shape is learned from mid-month MTD cuts when they exist.
 Month-end totals cannot teach day 20. If those cuts are missing, open MTD
-uses elapsed calendar days of the *learned* typical month.
+uses elapsed calendar days of the recent run-rate.
 """
 
 from __future__ import annotations
@@ -101,7 +98,7 @@ def weighted_distribution(lost_mt: float, ly_mt: float) -> float | None:
 
 
 def apply_expected_gap(df: pd.DataFrame, k: float, z_clip: float = 4.0) -> pd.DataFrame:
-    """Hole versus this unit's own Expected. share_expected_mt tracks Expected so From-columns add to Recoverable."""
+    """Hole versus this unit's own Expected. share_expected_mt tracks Expected so From-columns add to Gap."""
     out = df.copy()
     exp = pd.to_numeric(out.get("expected_mt"), errors="coerce").fillna(0.0)
     vol = pd.to_numeric(out.get("volume_mt"), errors="coerce").fillna(0.0)
@@ -288,17 +285,17 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
         weather = (
             f"{label}: the country billed {vol:.1f} MT against {expected:.1f} expected "
             f"from {int(national.get('n_history_periods') or 0)} months of history "
-            f"(last year {ly:.1f} MT, {pct:+.0f}% vs expected). Recoverable is that miss "
+            f"(last year {ly:.1f} MT, {pct:+.0f}% vs expected). Gap is that miss "
             f"({miss:.1f} MT) — not a leftover versus peers."
         )
     elif weather_dir == "growing":
         weather = (
             f"{label}: the country billed {vol:.1f} MT against {expected:.1f} expected "
-            f"(last year {ly:.1f} MT). Ahead of the learned typical month."
+            f"(last year {ly:.1f} MT). Ahead of the recent run-rate."
         )
     else:
         weather = (
-            f"{label}: the country is on its learned typical month ({vol:.1f} vs {expected:.1f} MT). "
+            f"{label}: the country is on its recent run-rate ({vol:.1f} vs {expected:.1f} MT). "
             "Focus on units that are off their own Expected."
         )
     if intra_src == "learned_mtd_cuts":
@@ -332,19 +329,19 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
             "Hold city firefights. Work the national driver split (coverage vs velocity vs mix) "
             "and the named shops that lag their own Expected, not a city hit-list."
         )
-        headline = f"National is {weather_dir} vs Expected. No city is behind its own typical month."
+        headline = f"National is {weather_dir} vs Expected. No city is behind its own Expected."
     else:
         names = ", ".join(str(x) for x in lag["grain_id"].head(4).tolist())
         extra = float(lag["isolated_mt"].sum())
         problem = (
             f"Cities behind their own Expected: {names} ({extra:.1f} MT). "
-            "Each hole is billed versus that city's typical same calendar month, not versus the country's current book."
+            "Each hole is billed versus that city's recent run-rate, not versus last August or the country's current book."
         )
         action = (
             f"This week: {names}. Inside each, do the driver the card names "
             "(unbilled / unvisited / drop size), on the named distributors and shops — not the tail."
         )
-        headline = f"National is {weather_dir} vs Expected. Behind their typical month: {names} ({extra:.1f} MT)."
+        headline = f"National is {weather_dir} vs Expected. Behind their Expected: {names} ({extra:.1f} MT)."
     if not beat.empty:
         winners = ", ".join(str(x) for x in beat["grain_id"].head(3).tolist())
         problem += f" Ahead of Expected: {winners} — copy, do not raid."
@@ -378,7 +375,7 @@ def rewrite_action(r: pd.Series, mtd: dict[str, Any], grain_label: str) -> str:
     if sit == "with_market" and grain_label != "national":
         base = (
             f"{name} billed {vol:.1f} MT vs {share:.1f} Expected (z {z:+.1f}). "
-            "On its typical same calendar month — not a local exception."
+            "On its recent run-rate — not a local exception."
         )
     elif sit == "outperforming":
         base = (

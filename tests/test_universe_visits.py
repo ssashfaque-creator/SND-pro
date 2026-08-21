@@ -173,6 +173,7 @@ def test_country_row_and_remarks_on_city_table():
     assert "Trend:" in remarks
     assert "Coverage:" in remarks or "visit" in remarks.lower()
     assert "per billed shop" in remarks
+    assert "vs expected" in remarks.lower()
     assert "national average" in remarks.lower()
     assert "• Trend:" in str(report.cities.iloc[0]["Remarks"])
     assert list(report.cities.columns)[-1] == "Remarks"

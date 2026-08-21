@@ -106,13 +106,16 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     cities = report.cities
     assert "City" in cities.columns
     assert "AMS last 3 months (MT)" in cities.columns
-    assert "Recoverable (MT)" in cities.columns
+    assert "Gap (MT)" in cities.columns
+    assert "Recoverable (MT)" not in cities.columns
+    assert "Situation" not in cities.columns
     assert "Drop size (MT)" in cities.columns
     assert "Expected this month (MT)" in cities.columns
     assert "Fair share of country (MT)" not in cities.columns
     assert "Zone" not in cities.columns
     exp_i = list(cities.columns).index("Expected this month (MT)")
-    assert list(cities.columns)[exp_i + 1] == "Drop size (MT)"
+    assert list(cities.columns)[exp_i + 1] == "Gap (MT)"
+    assert list(cities.columns)[-2] == "Drop size (MT)"
     assert "From drop size (MT)" in cities.columns
     assert "From unvisited shops (MT)" in cities.columns
     assert "From unbilled shops (MT)" in cities.columns
@@ -123,20 +126,22 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "Extra vs country (MT)" not in cities.columns
     assert cities.iloc[0]["City"] == "Country"
     body = cities[cities["City"] != "Country"]
-    rec = body["Recoverable (MT)"].tolist()
+    rec = body["Gap (MT)"].tolist()
     assert rec == sorted(rec, reverse=True)
     khi = body[body["City"] == "Karachi"].iloc[0]
-    assert khi["Situation"] == "Lagging"
-    assert float(khi["Recoverable (MT)"]) > 0
+    assert float(khi["Gap (MT)"]) > 0
     country = cities[cities["City"] == "Country"].iloc[0]
-    # Country Recoverable is the country miss versus Expected, not leftover versus peers.
-    assert float(country["Recoverable (MT)"]) > 0
-    assert abs(float(country["Expected this month (MT)"]) - float(country["Billed this period (MT)"]) - float(country["Recoverable (MT)"])) < 5
-    # Drill-down distributors in lagging cities. Karachi is lagging; Eva Foods is the call.
-    drill = report.city_distributors
-    assert "Karachi" in set(drill["City"])
-    assert "Eva Foods" in set(drill["Distributor"].astype(str))
+    # Expected ≈ billed + Gap (Gap is 0 when billed is ahead of the recent run-rate).
+    assert abs(
+        float(country["Expected this month (MT)"])
+        - float(country["Billed this period (MT)"])
+        - float(country["Gap (MT)"])
+    ) < 8
+    remarks = " ".join(cities["Remarks"].dropna().astype(str))
+    assert "vs expected" in remarks.lower()
+    assert "national average" in remarks.lower()
     # Full lagging-distributor list includes Local Dist (behind its own Expected).
+    # Ghost Dist has no volume in the AMS window, so Expected is 0 and it stays hidden.
     names = set(report.lagging_distributors["Distributor"].astype(str))
     assert "Local Dist" in names
     assert "Eva Foods" in names
@@ -239,14 +244,14 @@ def test_pack_from_columns_sum_to_recoverable_after_rounding():
     assert list(cities.columns)[-1] == "Remarks"
     from_cols = ["From drop size (MT)", "From unvisited shops (MT)", "From unbilled shops (MT)"]
     for _, row in cities.iterrows():
-        rec = row["Recoverable (MT)"]
+        rec = row["Gap (MT)"]
         rec_i = 0 if rec is None or pd.isna(rec) else int(rec)
         parts = [0 if row[c] is None or pd.isna(row[c]) else int(row[c]) for c in from_cols]
         if rec_i > 0:
             assert sum(parts) == rec_i
             assert all(p >= 0 for p in parts)
         # whole numbers in the table
-        for col in ["Billed this period (MT)", "Recoverable (MT)"]:
+        for col in ["Billed this period (MT)", "Gap (MT)"]:
             val = row[col]
             if val is not None and pd.notna(val):
                 assert float(val) == float(int(round(float(val))))

@@ -1,15 +1,15 @@
-"""Learn seasonality from the warehouse panel — not a curve we shipped.
+"""Expected is recent run-rate, not a calendar-month seasonal index.
 
-Nineteen months of shop-month totals are enough to estimate:
+A city that never billed in August (LY = 0) can still be running 40 MT/month
+in May–July. Multiplying destationalized trend by an August index of ~0
+produces a 4 MT Expected against a 44 MT AMS — a false “ahead”. Expected
+therefore uses the last three closed months (same window as AMS), blended
+with the last-six-month median, then paced if MTD is open. Children still
+add to the parent Expected.
 
-* A 12-month seasonal index (August vs January) nationally and by city
-* A typical same-month level (mean of every August on file, not only last year)
-* A destationalized recent trend × this month's index
-
-They are **not** enough to estimate a day-of-month loading curve. A closed
-August row is one number (the month total). Day 20's share of August only
-appears if mid-month MTD cuts were ingested. Those we learn when present;
-otherwise open MTD uses elapsed calendar days of the learned typical August.
+A 12-month index is stored for diagnostics. It is not applied to Expected.
+Day-of-month pace is unchanged: learned MTD cuts when present, otherwise
+elapsed calendar days.
 """
 
 from __future__ import annotations
@@ -73,9 +73,9 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
     nat["month"] = nat["period"].astype(str).str.slice(5, 7).astype(int)
     nat_idx = _iterative_month_index(nat)
     n_same = int((nat["month"] == month).sum())
-    typical_nat = float(nat.loc[nat["month"] == month, "volume_mt"].mean()) if n_same else float("nan")
-    trend_nat = _trend_seasonal(nat, nat_idx, month)
-    expected_nat = _blend(typical_nat, trend_nat, n_same)
+    recent_ps = _tail_periods(nat, 3)
+    longer_ps = _tail_periods(nat, 6)
+    expected_nat, _, _, _ = _recent_level(nat, recent_ps, longer_ps)
 
     city_period = hist.groupby(["city", "period"], as_index=False)["volume_mt"].sum()
     city_period["month"] = city_period["period"].astype(str).str.slice(5, 7).astype(int)
@@ -94,18 +94,16 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
             else:
                 mixed[m] = _finite(cred * float(local) + (1 - cred) * _finite(natv))
         same = g[g["month"] == month]
-        typical = float(same["volume_mt"].mean()) if not same.empty else float("nan")
         n_s = int(len(same))
-        trend = _trend_seasonal(g, mixed, month)
-        expected = _blend(typical, trend, n_s)
+        expected, ams, trend, _ = _recent_level(g, recent_ps, longer_ps)
         city_exp_rows.append(
             {
                 "city": city,
-                "expected_full_mt": expected,
-                "typical_mt": typical if pd.notna(typical) else None,
+                "expected_full_mt": float(expected) if pd.notna(expected) else 0.0,
+                "typical_mt": ams if pd.notna(ams) else None,
                 "trend_mt": trend if pd.notna(trend) else None,
                 "n_same_month": n_s,
-                "seasonal_index": _finite(mixed.get(month, 1.0)),
+                "seasonal_index": 1.0,
             }
         )
         for m, val in mixed.items():
@@ -191,6 +189,7 @@ def _iterative_month_index(frame: pd.DataFrame, rounds: int = 2) -> dict[int, fl
 
 
 def _trend_seasonal(frame: pd.DataFrame, idx: dict[int, float], month: int) -> float:
+    """Kept for diagnostics. Expected does not use this."""
     if frame.empty:
         return float("nan")
     df = frame.copy()
@@ -205,6 +204,51 @@ def _trend_seasonal(frame: pd.DataFrame, idx: dict[int, float], month: int) -> f
         return float("nan")
     trend = float(tail["dest"].median())
     return trend * float(idx.get(month, 1.0))
+
+
+def _tail_periods(frame: pd.DataFrame, n: int) -> list[str]:
+    if frame is None or frame.empty or "period" not in frame.columns:
+        return []
+    return sorted(frame["period"].astype(str).unique())[-int(n) :]
+
+
+def _recent_level(
+    frame: pd.DataFrame,
+    recent_periods: list[str] | None = None,
+    longer_periods: list[str] | None = None,
+    n_recent: int = 3,
+    n_longer: int = 6,
+) -> tuple[float, float, float, int]:
+    """Full-month Expected from recent run-rate — no calendar-month index.
+
+    Uses the caller's recent window (last three / six periods on the parent
+    panel). A distributor with no volume in May–Jul gets 0, not last August.
+    Periods the unit actually billed inside that window are averaged the same
+    way AMS is — missing months are not zero-filled, but months *outside* the
+    window are ignored.
+    """
+    nan = float("nan")
+    if frame is None or frame.empty or "volume_mt" not in frame.columns:
+        return nan, nan, nan, 0
+    df = frame.copy()
+    if "period" in df.columns:
+        per = df.groupby("period", as_index=False)["volume_mt"].sum()
+        per["period"] = per["period"].astype(str)
+    else:
+        return nan, nan, nan, 0
+    if not recent_periods:
+        recent_periods = _tail_periods(per, n_recent)
+    if not longer_periods:
+        longer_periods = _tail_periods(per, n_longer)
+    recent = per[per["period"].isin(list(recent_periods or []))]
+    longer = per[per["period"].isin(list(longer_periods or []))]
+    n = int(per["period"].nunique())
+    if recent.empty:
+        return 0.0, 0.0, 0.0, n
+    ams = float(recent["volume_mt"].mean())
+    longer_m = float(longer["volume_mt"].median()) if not longer.empty else ams
+    expected = _blend(ams, longer_m, int(len(recent)))
+    return expected, ams, longer_m, n
 
 
 def _blend(typical: float, trend: float, n_same: int) -> float:
@@ -247,11 +291,11 @@ def expected_for_keys(
     parent_key: str | None = None,
     shrink_k: float = 4.0,
 ) -> pd.DataFrame:
-    """Learned typical same-month + destationalized trend, per key tuple.
+    """Recent run-rate Expected per key tuple. No calendar-month seasonal index.
 
-    Seasonal indexes shrink toward the parent (city → national, dist/DSR → city).
-    Same formula as the national/city Expected the pack already prints.
+    parent_index / national_index are ignored (kept so callers do not change).
     """
+    del parent_index, national_index, parent_key, shrink_k
     cols = list(keys) + [
         "expected_full_mt",
         "typical_mt",
@@ -275,43 +319,27 @@ def expected_for_keys(
     hist = sm[sm["period"].astype(str) != str(period)]
     if hist.empty:
         return empty
-    nat_idx = national_index or {m: 1.0 for m in range(1, 13)}
-    parent_index = parent_index or {}
-    parent_key = parent_key or (keys[0] if keys else None)
     grouped = hist.groupby(keys + ["period"], as_index=False)["volume_mt"].sum()
     grouped["month"] = grouped["period"].astype(str).str.slice(5, 7).astype(int)
+    recent_ps = _tail_periods(grouped, 3)
+    longer_ps = _tail_periods(grouped, 6)
     rows = []
     for key_vals, g in grouped.groupby(keys, dropna=False):
         if not isinstance(key_vals, tuple):
             key_vals = (key_vals,)
         rec = {k: key_vals[i] for i, k in enumerate(keys)}
-        raw = _iterative_month_index(g)
         n_g = int(g["period"].nunique())
-        cred = n_g / (n_g + shrink_k)
-        parent_id = str(rec.get(parent_key) or "") if parent_key else ""
-        pidx = parent_index.get(parent_id) or nat_idx
-        mixed: dict[int, float] = {}
-        for m in range(1, 13):
-            local = raw.get(m)
-            prior = _finite((pidx or {}).get(m, nat_idx.get(m, 1.0)))
-            if local is None or not np.isfinite(_finite(local, default=float("nan"))):
-                mixed[m] = prior
-            else:
-                mixed[m] = _finite(cred * float(local) + (1 - cred) * prior)
-        same = g[g["month"] == month]
-        typical = float(same["volume_mt"].mean()) if not same.empty else float("nan")
-        n_s = int(len(same))
-        trend = _trend_seasonal(g, mixed, month)
-        expected = _blend(typical, trend, n_s)
+        n_s = int((g["month"] == month).sum())
+        expected, ams, trend, _ = _recent_level(g, recent_ps, longer_ps)
         rec.update(
             {
                 "expected_full_mt": float(expected) if pd.notna(expected) else 0.0,
-                "typical_mt": typical if pd.notna(typical) else None,
+                "typical_mt": ams if pd.notna(ams) else None,
                 "trend_mt": trend if pd.notna(trend) else None,
-                "seasonal_index": _finite(mixed.get(month, 1.0)),
+                "seasonal_index": 1.0,
                 "n_same_month": n_s,
                 "n_periods": n_g,
-                "credibility": _finite(cred, 0.0),
+                "credibility": n_g / (n_g + 4.0) if n_g else 0.0,
             }
         )
         rows.append(rec)
@@ -328,7 +356,7 @@ def apply_child_expected(
     parent_key: str = "city",
     shrink_k: float = 4.0,
 ) -> pd.DataFrame:
-    """Own-history Expected at this grain, shrunk toward the parent's month index."""
+    """Own-history Expected at this grain from recent run-rate, then paced."""
     if children is None or children.empty:
         return children
     out = children.copy()
@@ -362,7 +390,7 @@ def apply_child_expected(
     out = out.merge(learned, on=keys, how="left")
     full = pd.to_numeric(out.get("expected_full_mt"), errors="coerce")
     ly = pd.to_numeric(out.get("ly_mt"), errors="coerce").fillna(0.0)
-    full = full.where(full.notna() & (full > 0), ly)
+    full = full.where(full.notna(), ly)
     out["seasonal_typical_mt"] = full.fillna(0.0)
     out["expected_mt"] = out["seasonal_typical_mt"] * frac
     out["gap_mt"] = pd.to_numeric(out["volume_mt"], errors="coerce").fillna(0) - out["expected_mt"]
@@ -418,50 +446,36 @@ def fit_shop_expected(
     fit: SeasonFit,
     intra_frac: float,
 ) -> pd.DataFrame:
-    """Per-shop Expected: same-month typical + destationalized trend, shrunk toward the city.
+    """Per-shop Expected: last-3-month AMS blended with last-6-month median, shrunk toward the city.
 
-    Sparse doors borrow the city's learned August. Never-billed whitespace stays 0.
+    Sparse doors borrow the city's Expected via AMS mix. Never-billed whitespace stays 0.
+    No calendar-month seasonal index.
     """
     empty = pd.DataFrame(columns=["store_id", "city", "expected_full_mt", "expected_mt", "credibility"])
     if shop_month is None or shop_month.empty or not period:
         return empty
     sm = shop_month.copy()
     sm["store_id"] = sm["store_id"].astype(str)
-    if "month" not in sm.columns:
-        sm["month"] = sm["period"].astype(str).str.slice(5, 7).astype(int)
     if "city" not in sm.columns:
         sm["city"] = "(unmapped)"
     sm["city"] = sm["city"].fillna("(unmapped)").replace("", "(unmapped)").astype(str)
-    month = int(str(period)[5:7]) if len(str(period)) >= 7 else 0
     hist = sm[sm["period"].astype(str) != str(period)]
     if hist.empty:
         return empty
     city_full: dict[str, float] = {}
-    city_si: dict[str, float] = {}
     if fit is not None and fit.city_expected is not None and not fit.city_expected.empty:
         for _, r in fit.city_expected.iterrows():
             city_full[str(r["city"])] = float(r.get("expected_full_mt") or 0.0)
-            city_si[str(r["city"])] = _finite(r.get("seasonal_index"), 1.0)
-    nat_idx = (fit.national_index if fit else None) or {m: 1.0 for m in range(1, 13)}
-    city_month = month_index_by_grain(fit, "city") if fit else {}
-
-    def _si(city: str, m: int) -> float:
-        local = (city_month.get(str(city)) or {}).get(int(m))
-        if local is not None:
-            return _finite(local)
-        return _finite(nat_idx.get(int(m), 1.0))
 
     hist = hist.copy()
-    hist["si"] = [_si(c, m) for c, m in zip(hist["city"], hist["month"])]
-    hist["si"] = hist["si"].replace(0, 1.0)
-    hist["dest"] = pd.to_numeric(hist["volume_mt"], errors="coerce") / hist["si"]
-    typical = hist[hist["month"] == month].groupby("store_id")["volume_mt"].mean().rename("typical_mt")
-    n_same = hist[hist["month"] == month].groupby("store_id").size().rename("n_same")
+    recent_ps = set(_tail_periods(hist, 3))
+    longer_ps = set(_tail_periods(hist, 6))
     n_per = hist.groupby("store_id")["period"].nunique().rename("n_periods")
-    hist["prank"] = hist.groupby("store_id")["period"].rank(method="first", ascending=False)
-    tail = hist[hist["prank"] <= 6]
-    trend_dest = tail.groupby("store_id")["dest"].median().rename("trend_dest")
-    ams = hist.sort_values("period").groupby("store_id").tail(3).groupby("store_id")["volume_mt"].mean().rename("ams")
+    in_recent = hist[hist["period"].astype(str).isin(recent_ps)]
+    in_longer = hist[hist["period"].astype(str).isin(longer_ps)]
+    ams = in_recent.groupby("store_id")["volume_mt"].mean().rename("ams")
+    n_recent = in_recent.groupby("store_id")["period"].nunique().rename("n_recent")
+    longer = in_longer.groupby("store_id")["volume_mt"].median().rename("longer_mt")
     cities = sm.groupby("store_id")["city"].last()
     from sndintel.io_utils import shift_period
 
@@ -473,26 +487,23 @@ def fit_shop_expected(
     )
     ids = pd.Index(sorted(set(hist["store_id"].astype(str))))
     out = pd.DataFrame({"store_id": ids})
-    out = out.merge(typical.reset_index(), on="store_id", how="left")
-    out = out.merge(n_same.reset_index(), on="store_id", how="left")
-    out = out.merge(n_per.reset_index(), on="store_id", how="left")
-    out = out.merge(trend_dest.reset_index(), on="store_id", how="left")
     out = out.merge(ams.reset_index(), on="store_id", how="left")
+    out = out.merge(n_recent.reset_index(), on="store_id", how="left")
+    out = out.merge(n_per.reset_index(), on="store_id", how="left")
+    out = out.merge(longer.reset_index(), on="store_id", how="left")
     if ly_s is not None and not ly_s.empty:
         out = out.merge(ly_s.reset_index(), on="store_id", how="left")
     else:
         out["ly_mt"] = np.nan
     out["city"] = out["store_id"].map(cities).fillna("(unmapped)")
-    out["n_same"] = pd.to_numeric(out.get("n_same"), errors="coerce").fillna(0)
+    out["n_recent"] = pd.to_numeric(out.get("n_recent"), errors="coerce").fillna(0)
     out["n_periods"] = pd.to_numeric(out.get("n_periods"), errors="coerce").fillna(0)
-    this_si = out["city"].map(lambda c: city_si.get(str(c), _finite(nat_idx.get(month, 1.0))))
-    out["trend_mt"] = pd.to_numeric(out.get("trend_dest"), errors="coerce") * this_si
     out["local_mt"] = [
-        _blend(t, tr, int(n))
-        for t, tr, n in zip(
-            pd.to_numeric(out.get("typical_mt"), errors="coerce"),
-            pd.to_numeric(out.get("trend_mt"), errors="coerce"),
-            out["n_same"].fillna(0),
+        _blend(a, lng, int(n))
+        for a, lng, n in zip(
+            pd.to_numeric(out.get("ams"), errors="coerce"),
+            pd.to_numeric(out.get("longer_mt"), errors="coerce"),
+            out["n_recent"].fillna(0),
         )
     ]
     city_ly = out.groupby("city")["ly_mt"].transform("sum")
@@ -523,23 +534,30 @@ def fit_shop_expected(
     out["expected_mt"] = out["expected_full_mt"] * frac
     return out[["store_id", "city", "expected_full_mt", "expected_mt", "credibility"]]
 
-
 def apply_city_expected(city_units: pd.DataFrame, fit: SeasonFit, intra_frac: float) -> pd.DataFrame:
-    """Replace last-year×pace expected with the warehouse-learned seasonal expected."""
+    """Replace last-year×pace expected with recent run-rate Expected, then pace."""
     if city_units is None or city_units.empty:
         return city_units
     out = city_units.copy()
     lookup = {}
     if fit.city_expected is not None and not fit.city_expected.empty:
-        lookup = fit.city_expected.set_index("city")["expected_full_mt"].to_dict()
+        lookup = {str(k): v for k, v in fit.city_expected.set_index("city")["expected_full_mt"].to_dict().items()}
     full = []
     idx = []
     for _, r in out.iterrows():
         city = str(r.get("grain_id") or r.get("city") or "")
-        exp = lookup.get(city)
-        if exp is None or (isinstance(exp, float) and (pd.isna(exp) or exp <= 0)):
+        # 0 is a valid Expected (no volume in the AMS window). Only a missing
+        # city falls back to last year — never treat a zero run-rate as LY.
+        if city in lookup:
+            try:
+                exp = float(lookup[city])
+            except (TypeError, ValueError):
+                exp = float("nan")
+            if pd.isna(exp):
+                exp = float(r.get("ly_mt") or 0)
+        else:
             exp = float(r.get("ly_mt") or 0)
-        full.append(float(exp or 0.0))
+        full.append(float(exp) if pd.notna(exp) else 0.0)
         si = fit.national_index.get(fit.month, 1.0)
         if fit.city_expected is not None and not fit.city_expected.empty:
             hit = fit.city_expected[fit.city_expected["city"] == city]
