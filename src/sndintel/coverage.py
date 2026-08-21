@@ -2,7 +2,9 @@
 
 Identity (one shop, then summed to a grain):
 
-    opportunity = AMS × pace, else last-year × pace (0 if the door has no history)
+    opportunity = this shop's Expected (typical same month + trend, shrunk toward
+    the city, paced). Fallback AMS × pace, else last-year × pace. 0 if the door
+    has no history.
     visited     = visit count > 0 OR billed this period
     billed      = volume > 0
 
@@ -50,6 +52,8 @@ def build_coverage_book(
     period: str,
     pace: float = 1.0,
     ledger: pd.DataFrame | None = None,
+    shop_expected: pd.DataFrame | None = None,
+    city_expected: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if stores is None or stores.empty or not period:
         return pd.DataFrame()
@@ -109,6 +113,26 @@ def build_coverage_book(
     ams_v = book["ams_3m"].fillna(0.0)
     pace = float(pace or 1.0)
     book["opportunity_mt"] = np.where(ams_v > 1e-9, ams_v * pace, book["ly_mt"] * pace)
+    if shop_expected is not None and not shop_expected.empty and "store_id" in shop_expected.columns:
+        se = shop_expected[["store_id", "expected_mt"]].copy()
+        se["store_id"] = se["store_id"].astype(str)
+        book = book.merge(se, on="store_id", how="left", suffixes=("", "_se"))
+        learned = pd.to_numeric(book.get("expected_mt"), errors="coerce")
+        book["opportunity_mt"] = np.where(learned.fillna(0) > 1e-9, learned, book["opportunity_mt"])
+        if "expected_mt_se" in book.columns:
+            book = book.drop(columns=["expected_mt_se"])
+    if city_expected is not None and not city_expected.empty and "city" in book.columns:
+        targets = {}
+        id_col = "grain_id" if "grain_id" in city_expected.columns else "city"
+        for _, r in city_expected.iterrows():
+            targets[str(r.get(id_col) or r.get("city") or "")] = float(r.get("expected_mt") or 0.0)
+        scaled = book["opportunity_mt"].copy()
+        for city, g in book.groupby(book["city"].astype(str), dropna=False):
+            target = targets.get(str(city))
+            total = float(pd.to_numeric(g["opportunity_mt"], errors="coerce").fillna(0).sum())
+            if target is not None and target > 1e-9 and total > 1e-9:
+                scaled.loc[g.index] = g["opportunity_mt"] * (target / total)
+        book["opportunity_mt"] = scaled
     book["from_unvisited_mt"] = np.where(
         (book["visited"] == 0) & has_visit_file, -book["opportunity_mt"], 0.0
     )
@@ -164,11 +188,11 @@ def allocate_recoverable_drivers(df: pd.DataFrame) -> pd.DataFrame:
     """Partition recoverable across drop size / unvisited / unbilled.
 
     Recoverable is not recalculated. The three From columns keep the same
-    coverage identity as weights, then scale so they add to the extra vs fair
-    share:
+    coverage identity as weights, then scale so they add to the hole versus
+    Expected:
 
     * behind (recoverable > 0) — positive pieces of the hole, summing to recoverable
-    * ahead (billed > fair share) — negative pieces of the surplus; recoverable stays 0
+    * ahead (billed > Expected) — negative pieces of the surplus; recoverable stays 0
     * in line — zeros
     """
     if df is None or df.empty:
@@ -195,6 +219,8 @@ def allocate_recoverable_drivers(df: pd.DataFrame) -> pd.DataFrame:
         isolated_f = float(isolated) if pd.notna(isolated) else 0.0
         billed = vol.iloc[i] if i < len(vol) else np.nan
         share = fair.iloc[i] if i < len(fair) else np.nan
+        if pd.isna(share) and "expected_mt" in out.columns:
+            share = pd.to_numeric(out["expected_mt"], errors="coerce").iloc[i]
         ahead = isolated_f > 1e-9
         if not ahead and pd.notna(billed) and pd.notna(share):
             ahead = float(billed) > float(share) + 1e-9

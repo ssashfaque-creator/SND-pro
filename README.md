@@ -137,7 +137,7 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 - Every calendar month **present in the file** is replaced in full. That is how MTD works: 20 Aug 0.60 MT at a shop becomes 0.95 MT when the 20 Aug extract is superseded. Shops that drop off that month’s extract are removed from that month, not left as stale MTD.
 - Months **not** in the file stay as they are. July does not change when you upload August.
 - Insights are rebuilt from the **whole warehouse** (closed July + open August MTD + any earlier history), not from the new file in isolation.
-- Focus is **exception-based**. National weather is stripped first (shift-share / fair share of the parent). A city that declined with the country is not a local fire; a city that grew slower than a growing country is. Intra-month pace uses a back-loaded GT prior until successive MTD cuts train your own curve.
+- Focus is **Expected-based**. Every grain is scored billed versus its own typical same calendar month (history + destationalized trend, then children scaled so they add to the parent Expected). A city that declined with the country is still a hole if it missed that typical month. Intra-month pace uses elapsed calendar days of the learned typical month until successive MTD cuts train your own curve.
 - If the SSRS header has `Execution Date & Time` before month-end, that month is tagged `mtd_open`. Briefings use run-rate vs last year’s **closed** August instead of comparing 20 days to 31.
 
 ## Strategy questions this is built to answer

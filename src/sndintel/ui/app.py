@@ -513,8 +513,8 @@ def _page_strategy(data, _latest, period, mtd, ledger):
 
     st.markdown("##### 1. The country — every city")
     st.caption(
-        "Start here. The first row is the **country**. **Recoverable** is the local hole after national weather. "
-        "**From drop size / unvisited / unbilled** add to Recoverable (positive = hole; negative = billed more than fair share). "
+        "Start here. The first row is the **country**. **Recoverable** is billed versus this unit’s own Expected. "
+        "**From drop size / unvisited / unbilled** add to Recoverable (positive = hole; negative = billed more than Expected). "
         "**Remarks** (last column) are four bullets: trend, coverage, productivity, drop size. "
         "Distributors and DSRs with AMS = 0 are hidden later."
     )
@@ -817,7 +817,7 @@ def _page_focus(data, period):
             y=ycol,
             color=color,
             color_discrete_map=cmap,
-            labels={"grain_id": grains, ycol: "vs fair share (MT)"},
+            labels={"grain_id": grains, ycol: "vs Expected (MT)"},
         )
         fig.update_layout(height=360, xaxis_tickangle=-30)
         st.plotly_chart(fig, use_container_width=True)

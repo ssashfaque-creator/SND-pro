@@ -2,10 +2,13 @@
 
 Not a canned strategy. Every row is computed from the warehouse:
 
-* Expected is learned from the warehouse: typical same calendar month across
-  all history, blended with destationalized recent trend × this month's index.
-  Last year is one input, not the only one.
-* National hole = sum of city holes (additive waterfall).
+* Expected is learned from the warehouse at every grain: typical same calendar
+  month across all history, blended with destationalized recent trend × this
+  month's index, shrunk toward the parent when history is thin, then scaled so
+  children add to the parent Expected. Last year is one input, not the call.
+* Recoverable = hole versus that Expected. From drop / unvisited / unbilled
+  partition it.
+* National hole = billed versus national Expected (additive after reconcile).
 * Inside a city, hole = like-for-like drop size + lost-shop volume − new volume.
 * Diagnosis is whichever component dominates — drop size vs coverage vs whitespace.
 * Targets are the named distributors / DSRs / shops that contribute most to that hole.
@@ -28,7 +31,7 @@ from sndintel.features import latest_period
 from sndintel.io_utils import shift_period
 from sndintel.isolate import (
     apply_coverage_velocity,
-    apply_shift_share,
+    apply_expected_gap,
     attach_mix,
     attach_seasonal_mom,
     empirical_bayes,
@@ -39,7 +42,14 @@ from sndintel.isolate import (
     sku_industry_mix,
 )
 from sndintel.mtd import period_state
-from sndintel.season import apply_city_expected, fit_seasonality, intra_month_fraction, scale_children_expected
+from sndintel.season import (
+    apply_child_expected,
+    apply_city_expected,
+    fit_seasonality,
+    fit_shop_expected,
+    intra_month_fraction,
+    reconcile_expected,
+)
 from sndintel.storage import dumps
 
 
@@ -191,11 +201,15 @@ def build_hierarchy_pack(
     city_units["city"] = city_units["grain_id"]
     season = fit_seasonality(sm, period)
     city_units = apply_city_expected(city_units, season, pace)
+    nat_expected = (season.expected_full_national * pace) if season.expected_full_national else float(city_units["expected_mt"].sum())
+    nat_parent = pd.DataFrame([{"grain_id": "ALL", "expected_mt": nat_expected}])
+    city_units["parent_id"] = "ALL"
+    city_units = reconcile_expected(city_units, nat_parent, intra_frac=pace)
     nat_now = float(city_units["volume_mt"].sum())
     nat_ly = float(city_units["ly_mt"].sum())
     city_k = k_from_ly(city_units["ly_mt"], default=1.0)
     city_units = apply_coverage_velocity(city_units)
-    city_units = apply_shift_share(city_units, nat_now, nat_ly, city_k)
+    city_units = apply_expected_gap(city_units, city_k)
     facts_city = _facts_with_geo(facts, stores, sm, period, yoy_p)
     if facts_city is not None:
         fnow, fly = facts_city
@@ -217,8 +231,9 @@ def build_hierarchy_pack(
     dist_units["parent_grain"] = "city"
     dist_units["parent_id"] = dist_units["city"].astype(str)
     dist_units["grain_id"] = dist_units["distributor"].astype(str)
-    dist_units = scale_children_expected(dist_units, city_units, pace)
-    dist_units = _enrich_children(dist_units, city_units, default_k=0.5)
+    dist_units = apply_child_expected(dist_units, sm, period, ["city", "distributor"], season, pace)
+    dist_units = reconcile_expected(dist_units, city_units, intra_frac=pace)
+    dist_units = _enrich_children(dist_units, default_k=0.5)
     dist_units["intra_month_frac"] = pace
     dist_units["contrib_national_gap"] = dist_units["isolated_mt"]
     dist_units = _annotate_units(dist_units, mtd, grain_label="distributor")
@@ -231,8 +246,9 @@ def build_hierarchy_pack(
     dsr_units["parent_grain"] = "city"
     dsr_units["parent_id"] = dsr_units["city"].astype(str)
     dsr_units["grain_id"] = dsr_units["dsr_name"].astype(str)
-    dsr_units = scale_children_expected(dsr_units, city_units, pace)
-    dsr_units = _enrich_children(dsr_units, city_units, default_k=0.2)
+    dsr_units = apply_child_expected(dsr_units, sm, period, ["city", "dsr_name"], season, pace)
+    dsr_units = reconcile_expected(dsr_units, city_units, intra_frac=pace)
+    dsr_units = _enrich_children(dsr_units, default_k=0.2)
     dsr_units["intra_month_frac"] = pace
     dsr_units["contrib_national_gap"] = dsr_units["isolated_mt"]
     dsr_units = _annotate_units(dsr_units, mtd, grain_label="dsr")
@@ -245,8 +261,9 @@ def build_hierarchy_pack(
     section_units["parent_grain"] = "city"
     section_units["parent_id"] = section_units["city"].astype(str)
     section_units["grain_id"] = section_units["section"].astype(str)
-    section_units = scale_children_expected(section_units, city_units, pace)
-    section_units = _enrich_children(section_units, city_units, default_k=0.3)
+    section_units = apply_child_expected(section_units, sm, period, ["city", "section"], season, pace)
+    section_units = reconcile_expected(section_units, city_units, intra_frac=pace)
+    section_units = _enrich_children(section_units, default_k=0.3)
     section_units["intra_month_frac"] = pace
     section_units["contrib_national_gap"] = section_units["isolated_mt"]
     section_units = _annotate_units(section_units, mtd, grain_label="section")
@@ -256,16 +273,13 @@ def build_hierarchy_pack(
     nat_row = _national_unit(city_units, period, mtd, pace, factor)
     if not nat_row.empty:
         nat_row["parent_index"] = 1.0
-        nat_row["share_expected_mt"] = nat_row["expected_mt"]
-        nat_row["competitive_mt"] = 0.0
-        nat_row["isolated_mt"] = 0.0
-        nat_row["z_score"] = 0.0
-        nat_row["focus_score"] = 0.0
-        nat_row["situation"] = "with_market"
-        nat_row["intra_month_frac"] = pace
+        nat_row["expected_mt"] = nat_expected
         nat_row["seasonal_typical_mt"] = season.expected_full_national
         nat_row["seasonal_index"] = season.national_index.get(season.month, 1.0)
+        nat_row["gap_mt"] = nat_row["volume_mt"].fillna(0) - nat_row["expected_mt"]
         nat_row = apply_coverage_velocity(nat_row)
+        nat_row = apply_expected_gap(nat_row, 1.0)
+        nat_row["intra_month_frac"] = pace
         nat_row = _annotate_units(nat_row, mtd, grain_label="national")
         nat_row = _rewrite_actions(nat_row, mtd, "national")
 
@@ -275,18 +289,25 @@ def build_hierarchy_pack(
         sort=False,
     )
     units["period"] = period
-    book = build_coverage_book(stores, sm, visits, period, pace=pace, ledger=ledger)
+    shop_exp = fit_shop_expected(sm, period, season, pace)
+    if shop_exp is not None and not shop_exp.empty and "city" in shop_exp.columns and not city_units.empty:
+        shop_exp = shop_exp.copy()
+        shop_exp["parent_id"] = shop_exp["city"].astype(str)
+        shop_exp = reconcile_expected(shop_exp, city_units, intra_frac=pace)
+    book = build_coverage_book(
+        stores, sm, visits, period, pace=pace, ledger=ledger, shop_expected=shop_exp, city_expected=city_units
+    )
     units = attach_coverage_split(units, book)
     units = _fit_unit_columns(units)
 
     targets = _focus_targets(
-        cur, ly, city_units, dist_units, dsr_units, section_units, stores, period, mtd, pace
+        cur, ly, city_units, dist_units, dsr_units, section_units, stores, period, mtd, pace, shop_exp
     )
     national = {
         "volume_mt": nat_now,
         "ly_mt": nat_ly,
-        "expected_mt": (season.expected_full_national * pace)
-        if season.expected_full_national
+        "expected_mt": nat_expected
+        if nat_expected
         else nat_ly * pace,
         "run_rate_mt": nat_now * factor,
         "gap_mt": nat_gap,
@@ -332,25 +353,12 @@ def _rewrite_actions(df: pd.DataFrame, mtd: dict[str, Any], grain_label: str) ->
     return out
 
 
-def _enrich_children(df: pd.DataFrame, parents: pd.DataFrame, default_k: float) -> pd.DataFrame:
+def _enrich_children(df: pd.DataFrame, default_k: float) -> pd.DataFrame:
     if df is None or df.empty:
         return df
-    parent_now = {}
-    parent_ly = {}
-    if parents is not None and not parents.empty:
-        for _, r in parents.iterrows():
-            parent_now[str(r["grain_id"])] = float(r["volume_mt"] or 0)
-            parent_ly[str(r["grain_id"])] = float(r["ly_mt"] or 0)
-    parts = []
-    for pid, g in df.groupby("parent_id", dropna=False):
-        pid_s = str(pid)
-        now = parent_now.get(pid_s, float(g["volume_mt"].sum()))
-        ly = parent_ly.get(pid_s, float(g["ly_mt"].sum()))
-        k = k_from_ly(g["ly_mt"], default=default_k)
-        g = apply_coverage_velocity(g)
-        g = apply_shift_share(g, now, ly, k)
-        parts.append(g)
-    return pd.concat(parts, ignore_index=True) if parts else df
+    k = k_from_ly(df["ly_mt"], default=default_k)
+    out = apply_coverage_velocity(df)
+    return apply_expected_gap(out, k)
 
 
 def _facts_with_geo(
@@ -718,6 +726,7 @@ def _focus_targets(
     period: str,
     mtd: dict[str, Any],
     pace: float,
+    shop_expected: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     if cities.empty:
@@ -732,18 +741,16 @@ def _focus_targets(
         extra = ranked_cities[ranked_cities["gap_mt"] <= -1.0]
         focus_cities = pd.concat([focus_cities, extra]).drop_duplicates("grain_id")
 
-    shop_gap = _shop_gaps(cur, ly, pace)
-    if not shop_gap.empty and not cities.empty:
-        idx_map = {
-            str(r.grain_id): (float(r.volume_mt or 0) / float(r.ly_mt) if float(r.ly_mt or 0) else 1.0)
-            for r in cities.itertuples(index=False)
-        }
-        shop_gap["parent_index"] = shop_gap["city"].map(idx_map).fillna(1.0)
-        shop_gap["competitive_mt"] = shop_gap["volume_mt"] - shop_gap["ly_mt"] * shop_gap["parent_index"]
+    shop_gap = _shop_gaps(cur, ly, pace, shop_expected=shop_expected)
+    if not shop_gap.empty:
+        shop_gap["competitive_mt"] = shop_gap["volume_mt"] - shop_gap["expected_mt"]
         k_shop = k_from_ly(shop_gap["ly_mt"], 0.05)
+        size = np.maximum(
+            pd.to_numeric(shop_gap["ly_mt"], errors="coerce").fillna(0.0),
+            pd.to_numeric(shop_gap["expected_mt"], errors="coerce").fillna(0.0),
+        )
         shop_gap["isolated_mt"] = [
-            empirical_bayes(c, ly, k_shop)
-            for c, ly in zip(shop_gap["competitive_mt"], shop_gap["ly_mt"])
+            empirical_bayes(c, s, k_shop) for c, s in zip(shop_gap["competitive_mt"], size)
         ]
     else:
         shop_gap["competitive_mt"] = shop_gap.get("gap_mt", 0)
@@ -779,7 +786,7 @@ def _focus_targets(
                     rec.gap_mt,
                     rec.diagnosis,
                     rec.do_this_week,
-                    f"{rec.grain_id} is {iso:+.1f} MT vs fair share of {city_name} (billed {float(rec.volume_mt):.1f} vs {float(getattr(rec, 'share_expected_mt', rec.ly_mt) or 0):.1f} expected from parent).",
+                    f"{rec.grain_id} is {iso:+.1f} MT vs Expected (billed {float(rec.volume_mt):.1f} vs {float(getattr(rec, 'expected_mt', rec.ly_mt) or 0):.1f}).",
                     iso,
                     iso,
                     float(getattr(rec, "z_score", 0) or 0),
@@ -813,7 +820,7 @@ def _focus_targets(
                     rec.gap_mt,
                     rec.diagnosis,
                     f"Ride-with {rec.grain_id} this week. {rec.do_this_week}",
-                    f"{rec.grain_id} is {iso:+.1f} MT vs fair share of {city_name}.",
+                    f"{rec.grain_id} is {iso:+.1f} MT vs Expected.",
                     iso,
                     iso,
                     float(getattr(rec, "z_score", 0) or 0),
@@ -847,7 +854,7 @@ def _focus_targets(
                     rec.gap_mt,
                     rec.diagnosis,
                     f"Beat {rec.grain_id}: {rec.do_this_week}",
-                    f"Section {rec.grain_id} is {iso:+.1f} MT vs fair share of {city_name}.",
+                    f"Section {rec.grain_id} is {iso:+.1f} MT vs Expected.",
                     iso,
                     iso,
                     float(getattr(rec, "z_score", 0) or 0),
@@ -860,9 +867,9 @@ def _focus_targets(
             vol = float(rec.volume_mt)
             iso = float(getattr(rec, "isolated_mt", rec.gap_mt) or 0)
             action = (
-                "Must-visit: this door is behind its city's fair share. Confirm stock, credit, competitor fill-in."
+                "Must-visit: this door is behind its own Expected. Confirm stock, credit, competitor fill-in."
                 if vol > 0
-                else "Must-visit: billed last year, quiet this period — and behind the city's index."
+                else "Must-visit: billed last year, quiet this period — and behind its own Expected."
             )
             if diagnosis == "whitespace" and vol <= 0:
                 action = "Universe door, not billed this period. Put it on a coverage beat — do not wait for inbound."
@@ -885,7 +892,7 @@ def _focus_targets(
                     diagnosis,
                     action,
                     f"{rec.store_name or rec.store_id} {float(rec.volume_mt):.2f} MT vs {float(rec.ly_mt):.2f} last year "
-                    f"({iso:+.2f} MT vs the city's fair share).",
+                    f"({iso:+.2f} MT vs Expected).",
                     iso,
                     iso,
                     0.0,
@@ -952,7 +959,9 @@ def _pick_city_shops(
     return pool.nsmallest(8, sort_col)
 
 
-def _shop_gaps(cur: pd.DataFrame, ly: pd.DataFrame, pace: float) -> pd.DataFrame:
+def _shop_gaps(
+    cur: pd.DataFrame, ly: pd.DataFrame, pace: float, shop_expected: pd.DataFrame | None = None
+) -> pd.DataFrame:
     cols = {
         "store_name": "last",
         "city": "last",
@@ -991,8 +1000,18 @@ def _shop_gaps(cur: pd.DataFrame, ly: pd.DataFrame, pace: float) -> pd.DataFrame
     m = now.merge(ref, on="store_id", how="outer")
     m["volume_mt"] = m["volume_mt"].fillna(0)
     m["ly_mt"] = m["ly_mt"].fillna(0)
-    m["gap_mt"] = m["volume_mt"] - m["ly_mt"] * pace
     m["expected_mt"] = m["ly_mt"] * pace
+    if shop_expected is not None and not shop_expected.empty and "store_id" in shop_expected.columns:
+        se = shop_expected[["store_id", "expected_mt"]].copy()
+        se["store_id"] = se["store_id"].astype(str)
+        m["store_id"] = m["store_id"].astype(str)
+        m = m.merge(se, on="store_id", how="left", suffixes=("", "_learned"))
+        learned = pd.to_numeric(m.get("expected_mt_learned"), errors="coerce")
+        if learned is not None:
+            base = pd.to_numeric(m["expected_mt"], errors="coerce")
+            m["expected_mt"] = learned.where(learned.notna() & (learned > 1e-9), base)
+            m = m.drop(columns=["expected_mt_learned"])
+    m["gap_mt"] = m["volume_mt"] - m["expected_mt"]
     for col in cols:
         ly_col = f"{col}_ly"
         if col not in m.columns:
@@ -1095,7 +1114,7 @@ def plays_from_pack(run_id: int, pack: HierarchyPack) -> pd.DataFrame:
                 "why": nat.get("weather") or "",
                 "do_this_week": nat.get("action_summary") or nat.get("problem") or "",
                 "owner": "NSM",
-                "metric_value": abs(float(nat.get("extra_hole_mt") or nat.get("gap_mt") or 0)),
+                "metric_value": abs(float(nat.get("gap_mt") or 0)),
                 "shops": [],
                 "metrics": nat,
             }

@@ -197,3 +197,58 @@ def test_rescore_persists_seasonality_with_sparse_cities(tmp_path):
     assert not season.empty
     assert season["seasonal_index"].notna().all()
     assert not units.empty
+
+
+def test_distributor_expected_is_own_typical_august_not_parent_scale():
+    """Eva's August typical is 80. City typical/LY scale would push Eva toward 107.
+
+    Forecast-based proportions keep Eva near its own typical month, then scale
+    so distributors add to the city Expected — not last-year mix × city billed now.
+    """
+    rows = []
+    def add(store_id, dist, period, volume, name):
+        rows.append(
+            {
+                "store_id": store_id,
+                "period": period,
+                "year": int(period[:4]),
+                "month": int(period[5:7]),
+                "volume_mt": volume,
+                "sku_count": 1,
+                "billed": 1,
+                "distributor": dist,
+                "dsr_name": "Amir Surveyor" if dist == "Eva Foods" else "South Rep",
+                "section": "Nazimabad",
+                "store_name": name,
+                "zone": "South",
+                "city": "Karachi",
+            }
+        )
+
+    add("E1", "Eva Foods", "2024-08", 80.0, "Eva Shop")
+    add("S1", "South Dist", "2024-08", 120.0, "South Shop")
+    add("E1", "Eva Foods", "2025-08", 80.0, "Eva Shop")
+    add("S1", "South Dist", "2025-08", 40.0, "South Shop")
+    for m in range(1, 8):
+        add("E1", "Eva Foods", f"2026-{m:02d}", 70.0, "Eva Shop")
+        add("S1", "South Dist", f"2026-{m:02d}", 50.0, "South Shop")
+    add("E1", "Eva Foods", "2026-08", 70.0, "Eva Shop")
+    add("S1", "South Dist", "2026-08", 30.0, "South Shop")
+    sm = pd.DataFrame(rows)
+    stores = sm.drop_duplicates("store_id")[
+        ["store_id", "store_name", "distributor", "dsr_name", "zone", "city", "section"]
+    ]
+    pack = build_hierarchy_pack(
+        sm, stores, ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}])
+    )
+    eva = pack.units[(pack.units["grain"] == "distributor") & (pack.units["grain_id"] == "Eva Foods")].iloc[0]
+    south = pack.units[(pack.units["grain"] == "distributor") & (pack.units["grain_id"] == "South Dist")].iloc[0]
+    khi = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Karachi")].iloc[0]
+    # Parent-scale fair share: 80 × (city typical 160 / city LY 120) ≈ 107.
+    parent_scale = 80.0 * (160.0 / 120.0)
+    assert abs(float(eva["expected_mt"]) - parent_scale) > 15
+    assert 60.0 < float(eva["expected_mt"]) < 95.0
+    assert abs(float(eva["expected_mt"]) + float(south["expected_mt"]) - float(khi["expected_mt"])) < 0.2
+    # Eva billed 70 vs ~80 typical: on or slightly behind Expected, not a 37 MT hole vs 107.
+    assert float(eva["volume_mt"]) - float(eva["expected_mt"]) > -25
+

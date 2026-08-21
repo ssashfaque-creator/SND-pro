@@ -86,9 +86,9 @@ def test_ams_is_mean_of_last_three_closed_months():
 
 
 def test_pack_layers_cities_then_those_dists_then_all_dists():
-    """Karachi lags the country. Inside Lahore (ahead), Local Dist still lags the city."""
+    """Karachi and Local Dist both miss their own Expected. Ghost Dist has AMS = 0 so it is hidden."""
     rows = []
-    # Karachi −80% vs LY, Lahore −20% vs LY, national −50%.
+    # Karachi far behind typical August; Lahore also down vs last year (so vs Expected).
     rows.append(_row("K1", "2026-08", 5.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     rows.append(_row("K1", "2025-08", 80.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     rows.append(_row("K2", "2026-08", 15.0, "Karachi", "South Dist", "Amir", name="Hold K"))
@@ -108,9 +108,11 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "AMS last 3 months (MT)" in cities.columns
     assert "Recoverable (MT)" in cities.columns
     assert "Drop size (MT)" in cities.columns
+    assert "Expected this month (MT)" in cities.columns
+    assert "Fair share of country (MT)" not in cities.columns
     assert "Zone" not in cities.columns
-    fair_i = list(cities.columns).index("Fair share of country (MT)")
-    assert list(cities.columns)[fair_i + 1] == "Drop size (MT)"
+    exp_i = list(cities.columns).index("Expected this month (MT)")
+    assert list(cities.columns)[exp_i + 1] == "Drop size (MT)"
     assert "From drop size (MT)" in cities.columns
     assert "From unvisited shops (MT)" in cities.columns
     assert "From unbilled shops (MT)" in cities.columns
@@ -126,12 +128,15 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     khi = body[body["City"] == "Karachi"].iloc[0]
     assert khi["Situation"] == "Lagging"
     assert float(khi["Recoverable (MT)"]) > 0
-    # Drill-down distributors only in lagging cities → Karachi, not Lahore.
+    country = cities[cities["City"] == "Country"].iloc[0]
+    # Country Recoverable is the country miss versus Expected, not leftover versus peers.
+    assert float(country["Recoverable (MT)"]) > 0
+    assert abs(float(country["Expected this month (MT)"]) - float(country["Billed this period (MT)"]) - float(country["Recoverable (MT)"])) < 5
+    # Drill-down distributors in lagging cities. Karachi is lagging; Eva Foods is the call.
     drill = report.city_distributors
-    assert set(drill["City"]) <= {"Karachi"}
+    assert "Karachi" in set(drill["City"])
     assert "Eva Foods" in set(drill["Distributor"].astype(str))
-    assert "Local Dist" not in set(drill["Distributor"].astype(str))
-    # Full lagging-distributor list includes Local Dist in Lahore (city is ahead).
+    # Full lagging-distributor list includes Local Dist (behind its own Expected).
     names = set(report.lagging_distributors["Distributor"].astype(str))
     assert "Local Dist" in names
     assert "Eva Foods" in names
@@ -140,6 +145,8 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "Strike %" in report.lagging_distributors.columns
     assert "Universe" in report.lagging_distributors.columns
     assert "Drop size (MT)" in report.lagging_distributors.columns
+    assert "Expected this month (MT)" in report.lagging_distributors.columns
+    assert "Fair share of its city (MT)" not in report.lagging_distributors.columns
     assert "Zone" not in report.lagging_distributors.columns
     assert "Remarks" in report.lagging_dsrs.columns
     assert "Strike %" in report.lagging_dsrs.columns

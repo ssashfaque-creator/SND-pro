@@ -1,4 +1,4 @@
-"""Parent-adjusted isolation is the difference vs Excel YoY."""
+"""Isolation is billed versus this unit's own Expected — not peer fair share."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pandas as pd
 
 from sndintel.hierarchy import build_hierarchy_pack
 from sndintel.isolate import (
-    apply_shift_share,
+    apply_expected_gap,
     coverage_velocity,
     empirical_bayes,
     intra_month_fraction,
@@ -14,78 +14,102 @@ from sndintel.isolate import (
 )
 
 
-def test_equal_decline_is_weather_not_a_city_fire():
-    """National −50% and every city −50% → residuals ~0, no lagging city."""
+def test_billed_in_line_with_expected_is_on_expected():
     df = pd.DataFrame(
         {
             "grain_id": ["Karachi", "Lahore"],
             "volume_mt": [50.0, 50.0],
             "ly_mt": [100.0, 100.0],
+            "expected_mt": [50.0, 50.0],
             "billed": [10, 10],
             "billed_ly": [10, 10],
             "lost_mt": [0, 0],
             "universe": [20, 20],
         }
     )
-    out = apply_shift_share(df, parent_now=100, parent_ly=200, k=1.0)
-    assert abs(float(out["competitive_mt"].sum())) < 1e-6
+    out = apply_expected_gap(df, k=1.0)
     assert (out["situation"] == "with_market").all()
     brief = situation_brief(
-        {"volume_mt": 100, "expected_mt": 200, "ly_mt": 200, "gap_mt": -100, "label": "2026-08"},
+        {"volume_mt": 100, "expected_mt": 100, "ly_mt": 200, "gap_mt": 0, "label": "2026-08"},
         out,
     )
-    assert "No city is a statistical exception" in brief["problem"] or "No city is an exception" in brief["headline"]
+    assert "No city is behind" in brief["problem"] or "No city is behind" in brief["headline"]
 
 
-def test_extra_decline_is_the_local_problem():
-    """National −50%. Karachi −80%, Lahore −20% → only Karachi is lagging."""
+def test_equal_miss_versus_expected_is_lagging_everywhere():
+    """Old fair share called equal decline 'weather'. Both cities missed their typical month."""
     df = pd.DataFrame(
         {
             "grain_id": ["Karachi", "Lahore"],
-            "volume_mt": [20.0, 80.0],
+            "volume_mt": [50.0, 50.0],
             "ly_mt": [100.0, 100.0],
+            "expected_mt": [100.0, 100.0],
             "billed": [10, 10],
             "billed_ly": [10, 10],
             "lost_mt": [0, 0],
             "universe": [20, 20],
         }
     )
-    out = apply_shift_share(df, parent_now=100, parent_ly=200, k=1.0)
-    assert abs(float(out["competitive_mt"].sum())) < 1e-6
-    khi = out[out["grain_id"] == "Karachi"].iloc[0]
-    lhe = out[out["grain_id"] == "Lahore"].iloc[0]
-    assert khi["situation"] == "lagging"
-    assert lhe["situation"] == "outperforming"
-    assert khi["isolated_mt"] < -20
+    out = apply_expected_gap(df, k=1.0)
+    assert (out["situation"] == "lagging").all()
     brief = situation_brief(
         {"volume_mt": 100, "expected_mt": 200, "ly_mt": 200, "gap_mt": -100, "label": "2026-08"},
         out,
     )
     assert "Karachi" in brief["headline"]
-    assert "Lahore" in brief["problem"] or "beating" in brief["problem"].lower() or "Holding" in brief["problem"]
+    assert "Lahore" in brief["headline"] or "Lahore" in brief["problem"]
 
 
-def test_slower_growth_is_the_problem_when_national_is_up():
+def test_behind_own_expected_is_the_local_problem():
     df = pd.DataFrame(
         {
-            "grain_id": ["Rawalpindi", "Multan"],
-            "volume_mt": [102.0, 118.0],
+            "grain_id": ["Karachi", "Lahore"],
+            "volume_mt": [20.0, 100.0],
             "ly_mt": [100.0, 100.0],
+            "expected_mt": [100.0, 100.0],
             "billed": [10, 10],
             "billed_ly": [10, 10],
             "lost_mt": [0, 0],
             "universe": [20, 20],
         }
     )
-    out = apply_shift_share(df, parent_now=220, parent_ly=200, k=1.0)
-    rwp = out[out["grain_id"] == "Rawalpindi"].iloc[0]
-    assert rwp["volume_mt"] > rwp["ly_mt"]  # still grew
-    assert rwp["situation"] == "lagging"  # but slower than national +10%
+    out = apply_expected_gap(df, k=1.0)
+    khi = out[out["grain_id"] == "Karachi"].iloc[0]
+    lhe = out[out["grain_id"] == "Lahore"].iloc[0]
+    assert khi["situation"] == "lagging"
+    assert lhe["situation"] == "with_market"
+    assert khi["isolated_mt"] < -20
     brief = situation_brief(
-        {"volume_mt": 220, "expected_mt": 200, "ly_mt": 200, "gap_mt": 20, "label": "2026-08"},
+        {"volume_mt": 120, "expected_mt": 200, "ly_mt": 200, "gap_mt": -80, "label": "2026-08"},
         out,
     )
-    assert "growing" in brief["headline"]
+    assert "Karachi" in brief["headline"]
+    assert "Lahore" not in brief["headline"] or "Ahead" in brief["problem"]
+
+
+def test_grew_versus_last_year_but_missed_expected_is_lagging():
+    df = pd.DataFrame(
+        {
+            "grain_id": ["Rawalpindi", "Multan"],
+            "volume_mt": [102.0, 118.0],
+            "ly_mt": [100.0, 100.0],
+            "expected_mt": [118.0, 118.0],
+            "billed": [10, 10],
+            "billed_ly": [10, 10],
+            "lost_mt": [0, 0],
+            "universe": [20, 20],
+        }
+    )
+    out = apply_expected_gap(df, k=1.0)
+    rwp = out[out["grain_id"] == "Rawalpindi"].iloc[0]
+    mul = out[out["grain_id"] == "Multan"].iloc[0]
+    assert rwp["volume_mt"] > rwp["ly_mt"]  # still grew versus last year
+    assert rwp["situation"] == "lagging"  # but missed its own Expected
+    assert mul["situation"] == "with_market"
+    brief = situation_brief(
+        {"volume_mt": 220, "expected_mt": 236, "ly_mt": 200, "gap_mt": -16, "label": "2026-08"},
+        out,
+    )
     assert "Rawalpindi" in brief["headline"]
 
 
@@ -151,6 +175,6 @@ def test_hierarchy_isolates_shop_inside_a_city():
     pack = build_hierarchy_pack(sm, stores, ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
     shops = pack.targets[pack.targets["grain"] == "shop"]
     assert "Kifaya Mart" in set(shops["entity_name"])
-    # Single city: city residual is ~0 (it IS the nation). Isolation still names the door.
     khi = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Karachi")].iloc[0]
-    assert abs(float(khi["competitive_mt"])) < 0.05
+    assert float(khi["expected_mt"]) > float(khi["volume_mt"])
+    assert khi["situation"] == "lagging"

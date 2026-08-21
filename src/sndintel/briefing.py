@@ -25,11 +25,12 @@ from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibl
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
 from sndintel.io_utils import shift_period
+from sndintel.season import fit_seasonality, fit_shop_expected, reconcile_expected
 
 
 SITUATION_LABEL = {
     "lagging": "Lagging",
-    "with_market": "With the country",
+    "with_market": "On expected",
     "outperforming": "Ahead",
 }
 
@@ -47,41 +48,35 @@ GLOSSARY = [
     ("AMS last 3 months", "Average monthly secondary volume over the last three *closed* months. A typical recent month, not last year."),
     ("vs AMS", "This period minus AMS × fraction of the month elapsed. Negative = behind the recent run-rate."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month)."),
-    ("Expected this month", "Warehouse-learned typical same calendar month (every August on file, not last year alone), paced if MTD is open."),
-    ("Fair share of country / city", "This unit’s last-year mix × what the parent billed now. The volume it would have if it only moved with its parent. Different from Expected — Expected is seasonality; fair share is ‘moved with the parent’."),
+    ("Expected this month", "Warehouse-learned typical same calendar month (every August on file, not last year alone), blended with destationalized recent trend × this month’s index, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Thin doors shrink toward the parent’s month index; children’s Expecteds are then scaled so they add to the parent."),
     ("Drop size (MT)", "Average billed volume per billed shop this period (billed MT ÷ billed shops). Not the same as From drop size, which is that driver’s share of Recoverable."),
-    ("Recoverable", "The extra hole versus the parent, as a positive number — volume that comes back if this unit merely matched its parent."),
-    ("From drop size (MT)", "Share of recoverable explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than fair share. The three From columns add to Recoverable when the unit is behind."),
-    ("From unvisited shops (MT)", "Share of recoverable from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of fair share."),
-    ("From unbilled shops (MT)", "Share of recoverable from doors that were visited (or, if no visit file, simply not billed) but did not buy. Positive = hole; negative = ahead of fair share."),
+    ("Recoverable", "The hole versus this unit’s own Expected, as a positive number — volume that comes back if the unit merely billed its typical month. Country Recoverable is the country miss versus Expected."),
+    ("From drop size (MT)", "Share of recoverable explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than Expected. The three From columns add to Recoverable when the unit is behind."),
+    ("From unvisited shops (MT)", "Share of recoverable from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of Expected."),
+    ("From unbilled shops (MT)", "Share of recoverable from doors that were visited (or, if no visit file, simply not billed) but did not buy. Positive = hole; negative = ahead of Expected."),
     ("Remarks", "Four bullets: trend vs AMS and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; this unit’s drop size and the national average (MT per billed shop)."),
     ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
     ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
     ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
     ("Shop lists", "Every door with recoverable greater than 0.25 MT. Shallower holes are one remainder line."),
     ("AMS = 0 distributors / DSRs", "Hidden everywhere in the report. No recent three-month run-rate, so they are not a call."),
-    ("Situation: Lagging", "Worse than the parent’s current book. A city can be down with the country and *not* lagging."),
-    ("Situation: With the country", "Moved in line with the parent. Weather, not a local fire."),
-    ("Situation: Ahead", "Better than the parent’s current book."),
-    ("Weather vs extra hole", "Gap versus Expected is national weather. Extra hole / country Recoverable is only the residual after that weather — the sum of lagging cities’ isolated MT."),
+    ("Situation: Lagging", "Behind this unit’s own Expected by a material amount."),
+    ("Situation: On expected", "Billed in line with this unit’s typical same calendar month."),
+    ("Situation: Ahead", "Ahead of this unit’s own Expected."),
 ]
 
 CALCULATION_NOTES = [
     (
         "Expected this month",
-        "Mean of every same calendar month already in the warehouse (every August, not only last year) blended with destationalized recent trend × that month’s seasonal index. City indexes are shrunk toward the national index. If the month is still open, Expected is that full-month typical × the intra-month fraction (learned mid-month MTD cuts when they exist; otherwise elapsed calendar days).",
+        "Mean of every same calendar month already in the warehouse (every August, not only last year) blended with destationalized recent trend × that month’s seasonal index. The same recipe runs at country, city, distributor, DSR, and shop. City indexes shrink toward national; dist/DSR/shop indexes shrink toward the city. Children’s Expecteds are then scaled so they add to the parent Expected (forecast-based proportions, not last-year mix × parent billed now). If the month is still open, Expected is that full-month typical × the intra-month fraction.",
     ),
     (
-        "Fair share",
-        "This unit’s last-year volume × (parent billed now ÷ parent billed last year). Cities versus the country; distributors and DSRs versus their city. Country fair share equals Expected. Fair share is ‘moved with the parent’; Expected is ‘typical same calendar month’.",
-    ),
-    (
-        "Recoverable / extra hole",
-        "Isolated volume versus the parent after taking out the parent’s current book. Lagging means worse than the parent, not merely down versus last year. Country Recoverable is the absolute extra hole: the sum of lagging cities’ isolated MT. A city can be down with the country and not lagging.",
+        "Recoverable",
+        "max(0, Expected − billed), after a small empirical-Bayes shrink so a noisy 0.02 MT door cannot outrank a large one. Country Recoverable is the country miss versus Expected. Lagging means behind own Expected; Ahead means ahead of it; On expected means in line.",
     ),
     (
         "From drop / unvisited / unbilled",
-        "Shop-level identity: opportunity is AMS × pace (else last-year × pace). Unvisited = not called and not billed. Unbilled = called (or, with no visit file, simply not billed) and did not buy. Drop size = billed volume versus opportunity on billed doors. Those three are weights, then scaled so they add to Recoverable. Positive = part of the hole; negative = billed more than fair share.",
+        "Shop-level identity: opportunity is that shop’s Expected (fallback AMS × pace, else last-year × pace). Unvisited = not called and not billed. Unbilled = called (or, with no visit file, simply not billed) and did not buy. Drop size = billed volume versus opportunity on billed doors. Those three are weights, then scaled so they add to Recoverable. Positive = part of the hole; negative = billed more than Expected.",
     ),
     (
         "Drop size (MT) versus From drop size",
@@ -110,20 +105,20 @@ def how_to_read_steps(pack: StrategyPack, detailed: bool = False) -> list[str]:
     scope = (pack.scope or "national").lower()
     if scope == "city":
         return [
-            "City scorecard versus the country. Recoverable is the local hole after national weather.",
+            "City scorecard versus its own Expected. Recoverable is billed versus that typical month.",
             "Every distributor in this city with AMS greater than 0.",
             "Every DSR in this city with AMS greater than 0.",
             "Shops in this city with recoverable greater than 0.25 MT.",
         ]
     if scope == "distributor":
         return [
-            "Distributor scorecard versus its city.",
+            "Distributor scorecard versus its own Expected.",
             "DSRs on this distributor’s doors.",
             "Shops under this distributor with recoverable greater than 0.25 MT.",
         ]
     if scope == "dsr":
         return [
-            "DSR scorecard versus its city.",
+            "DSR scorecard versus its own Expected.",
             "Shops on this beat with recoverable greater than 0.25 MT.",
         ]
     if detailed:
@@ -134,10 +129,10 @@ def how_to_read_steps(pack: StrategyPack, detailed: bool = False) -> list[str]:
             "National shops — every door with recoverable greater than 0.25 MT.",
         ]
     return [
-        "Country by city — every city versus national weather. Highest recoverable first.",
+        "Country by city — every city versus its own Expected. Highest recoverable first.",
         "Lagging cities → distributors — first calls. AMS = 0 is hidden.",
         "Those distributors → shops with recoverable greater than 0.25 MT.",
-        "Every lagging distributor (AMS > 0), including cities that are not national exceptions.",
+        "Every lagging distributor (AMS > 0), including cities that are on expected.",
         "Every lagging DSR (AMS > 0).",
         "Every shop with recoverable greater than 0.25 MT (shallower doors rolled into the last row).",
     ]
@@ -152,7 +147,6 @@ CITY_VIEW = [
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("expected_mt", "Expected this month (MT)"),
-    ("share_expected_mt", "Fair share of country (MT)"),
     ("drop_size_mt", "Drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
@@ -174,7 +168,7 @@ DIST_IN_CITY_VIEW = [
     ("ams_3m", "AMS last 3 months (MT)"),
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
-    ("share_expected_mt", "Fair share of this city (MT)"),
+    ("expected_mt", "Expected this month (MT)"),
     ("drop_size_mt", "Drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
@@ -196,7 +190,7 @@ DIST_ALL_VIEW = [
     ("ams_3m", "AMS last 3 months (MT)"),
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
-    ("share_expected_mt", "Fair share of its city (MT)"),
+    ("expected_mt", "Expected this month (MT)"),
     ("drop_size_mt", "Drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
@@ -218,7 +212,7 @@ DSR_VIEW = [
     ("ams_3m", "AMS last 3 months (MT)"),
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
-    ("share_expected_mt", "Fair share of its city (MT)"),
+    ("expected_mt", "Expected this month (MT)"),
     ("drop_size_mt", "Drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
@@ -393,9 +387,6 @@ def build_strategy_pack(
         nat_grain["zone"] = ""
         nat_grain["situation_label"] = "Country"
         nat_grain["share_expected_mt"] = nat_grain.get("expected_mt")
-        extra = kpis.get("extra_hole_mt")
-        if extra is not None:
-            nat_grain["recoverable_mt"] = abs(float(extra or 0))
         nat_grain = allocate_recoverable_drivers(nat_grain)
         nat_parent = _parent_stats(nat_grain.iloc[0])
         nat_grain = attach_remarks(nat_grain, {}, None)
@@ -655,28 +646,39 @@ def focus_pack(pack: StrategyPack, report_type: str, entity: str) -> StrategyPac
 
 
 def score_shops(shop_month: pd.DataFrame, cities: pd.DataFrame, period: str, pace: float) -> pd.DataFrame:
-    """Shop extra vs its city's current book × last-year mix. Recoverable = the extra hole."""
+    """Shop hole versus its own Expected. Recoverable = that miss after EB shrink."""
     if shop_month is None or shop_month.empty or not period:
         return pd.DataFrame()
     yoy = shift_period(period, -12)
     cur = shop_month[shop_month["period"] == period]
     ly = shop_month[shop_month["period"] == yoy]
-    gaps = _shop_gaps(cur, ly, pace)
+    season = fit_seasonality(shop_month, period)
+    shop_exp = fit_shop_expected(shop_month, period, season, pace)
+    if (
+        shop_exp is not None
+        and not shop_exp.empty
+        and "city" in shop_exp.columns
+        and cities is not None
+        and not cities.empty
+        and "expected_mt" in cities.columns
+    ):
+        parents = cities.copy()
+        if "grain_id" not in parents.columns and "city" in parents.columns:
+            parents["grain_id"] = parents["city"]
+        shop_exp = shop_exp.copy()
+        shop_exp["parent_id"] = shop_exp["city"].astype(str)
+        shop_exp = reconcile_expected(shop_exp, parents, intra_frac=pace)
+    gaps = _shop_gaps(cur, ly, pace, shop_expected=shop_exp)
     if gaps is None or gaps.empty:
         return pd.DataFrame()
-    idx_map = {}
-    if cities is not None and not cities.empty:
-        for _, r in cities.iterrows():
-            ly_v = float(r.get("ly_mt") or 0)
-            now_v = float(r.get("volume_mt") or 0)
-            idx_map[str(r.get("grain_id") or r.get("city") or "")] = (now_v / ly_v) if ly_v > 1e-9 else 1.0
-    gaps["parent_index"] = gaps["city"].astype(str).map(idx_map).fillna(1.0)
-    gaps["fair_share_mt"] = gaps["ly_mt"].fillna(0) * gaps["parent_index"]
-    gaps["competitive_mt"] = gaps["volume_mt"].fillna(0) - gaps["fair_share_mt"]
+    exp = pd.to_numeric(gaps.get("expected_mt"), errors="coerce").fillna(0.0)
+    vol = pd.to_numeric(gaps.get("volume_mt"), errors="coerce").fillna(0.0)
+    ly_s = pd.to_numeric(gaps.get("ly_mt"), errors="coerce").fillna(0.0)
+    gaps["share_expected_mt"] = exp
+    gaps["competitive_mt"] = vol - exp
     k_shop = k_from_ly(gaps["ly_mt"], 0.05)
-    gaps["isolated_mt"] = [
-        empirical_bayes(c, ly_v, k_shop) for c, ly_v in zip(gaps["competitive_mt"], gaps["ly_mt"])
-    ]
+    size = ly_s.where(ly_s >= exp, exp)
+    gaps["isolated_mt"] = [empirical_bayes(c, s, k_shop) for c, s in zip(gaps["competitive_mt"], size)]
     gaps["recoverable_mt"] = gaps["isolated_mt"].clip(upper=0).abs()
     gaps["store_name"] = gaps["store_name"].replace("", pd.NA).fillna(gaps["store_id"])
     return gaps.loc[gaps["recoverable_mt"] > 0].copy()
@@ -826,8 +828,8 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
         return [
             (
                 "01 City",
-                f"{label} versus the country",
-                "Country row is first when included. Recoverable is the local hole after national weather. From drop / unvisited / unbilled add to Recoverable.",
+                f"{label} versus its Expected",
+                "Country row is first when included. Recoverable is billed versus this unit’s own Expected. From drop / unvisited / unbilled add to Recoverable.",
                 pack.cities,
             ),
             (
@@ -855,7 +857,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "01 Distributor",
                 f"{label}",
-                "Scorecard versus its city. From drop / unvisited / unbilled add to Recoverable.",
+                "Scorecard versus its own Expected. From drop / unvisited / unbilled add to Recoverable.",
                 dist_tbl,
             ),
             (
@@ -876,7 +878,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "01 DSR",
                 f"{label}",
-                "Scorecard versus its city. From drop / unvisited / unbilled add to Recoverable.",
+                "Scorecard versus its own Expected. From drop / unvisited / unbilled add to Recoverable.",
                 pack.all_dsrs,
             ),
             (
@@ -922,33 +924,33 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
     return [
         (
             "01 Country by city",
-            "Every city versus the country",
-            "Recoverable is the local hole after national weather. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than fair share). Country row is first. Distributors and DSRs with AMS = 0 are hidden.",
+            "Every city versus its own Expected",
+            "Recoverable is billed versus this unit’s own Expected. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than Expected). Country row is first. Distributors and DSRs with AMS = 0 are hidden.",
             pack.cities,
         ),
         (
             "02 Lagging cities-dists",
             "Distributors inside lagging cities",
-            "Only cities on the lagging list. A distributor here is behind its city — that is who to call first.",
+            "Only cities on the lagging list. A distributor here is behind its own Expected — that is who to call first.",
             pack.city_distributors,
         ),
         (
             "03 Those dists-shops",
             "Lagging shops under those distributors",
             (pack.shop_note or "Shops with recoverable greater than 0.25 MT.")
-            + " Recoverable is volume that comes back if the door matches the city.",
+            + " Recoverable is volume that comes back if the door billed its own Expected.",
             pack.city_distributor_shops,
         ),
         (
             "04 All lagging distributors",
             "Every lagging distributor (all cities)",
-            "Includes distributors that are behind a city even when the city itself moved with the country. Sheet 02 only showed distributors in lagging cities.",
+            "Includes distributors that are behind their own Expected even when the city is on expected. Sheet 02 only showed distributors in lagging cities.",
             pack.lagging_distributors,
         ),
         (
             "05 All lagging DSRs",
             "Every lagging DSR (all cities)",
-            "Salespeople behind their city. Ride-with this list; do not build a city hit-list from national weather.",
+            "Salespeople behind their own Expected. Ride-with this list; do not build a city hit-list from the country miss.",
             pack.lagging_dsrs,
         ),
         (
@@ -971,7 +973,7 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
         [
         _html_section(
             "1. The country — every city",
-            "Recoverable is the local hole after national weather, highest first. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than fair share). Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first. Remarks are the last column.",
+            "Recoverable is billed versus this unit’s own Expected, highest first. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than Expected). Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first. Remarks are the last column.",
             pack.cities,
         ),
         _html_section(
@@ -981,17 +983,17 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
         ),
         _html_section(
             "3. Those distributors — lagging shops",
-            "Doors behind their city under the distributors above. Every shop with recoverable greater than 0.25 MT; remainder line is the tail.",
+            "Doors behind their own Expected under the distributors above. Every shop with recoverable greater than 0.25 MT; remainder line is the tail.",
             pack.city_distributor_shops,
         ),
         _html_section(
             "4. Every lagging distributor (all cities)",
-            "Distributors behind their city even when the city is not a national exception. AMS = 0 is hidden.",
+            "Distributors behind their own Expected even when the city is on expected. AMS = 0 is hidden.",
             pack.lagging_distributors,
         ),
         _html_section(
             "5. Every lagging DSR (all cities)",
-            "Salespeople behind their city. AMS = 0 is hidden.",
+            "Salespeople behind their own Expected. AMS = 0 is hidden.",
             pack.lagging_dsrs,
         ),
         _html_section(

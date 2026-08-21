@@ -1,27 +1,27 @@
-"""Exception-based isolation: parent-adjusted residuals, seasonality, drivers.
+"""Expected-based isolation: billed vs the warehouse-learned typical month.
 
-Excel compares each unit to last year. That flags every city when the country
-is down. Enterprise S&D tools (Nielsen Business Drivers, IRI volume decomp,
-shift-share, exception-based selling) ask a different question:
+Excel compares each unit to last year. Peer fair share compares each unit to
+its parent. Both hide a miss when the whole book is down, or invent a miss
+when a unit merely moved with a declining parent.
 
-    After the parent moved, is this unit still a problem?
+The call in this pack is:
 
-* National declining → cities that declined *more* than national are the problem.
-* National growing → cities whose growth is *slower* than national are the problem.
-* A city that moved with the market is weather, not a local fire.
+    After this unit's own Expected (typical same calendar month from history,
+    blended with destationalized recent trend × this month's index, paced if
+    MTD is open), is it still a problem?
 
-Residuals are additive (they sum to zero at each parent), shrunk with empirical
-Bayes so a 0.02 MT shop cannot outrank Eva Foods on a percentage, and scored
-with a robust z so we only brief statistically unusual units.
+Expected is learned at every grain. Thin doors shrink toward the parent
+seasonal index, then children's Expecteds are scaled so they add to the
+parent Expected (forecast-based proportions — not last-year mix × parent
+billed now). Recoverable is the hole versus Expected. From drop / unvisited /
+unbilled partition that hole.
 
-Seasonality:
+Residuals are shrunk with empirical Bayes so a 0.02 MT shop cannot outrank
+Eva Foods on a percentage, and scored with a robust z.
 
-* Calendar-month shape is **learned from every month in the warehouse** (typical
-  August, city indices shrunk toward national) — not last year alone, and not a
-  curve shipped in the code.
-* Intra-month day shape is learned from mid-month MTD cuts when they exist.
-  Month-end totals cannot teach day 20. If those cuts are missing, open MTD
-  uses elapsed calendar days of the *learned* typical month.
+Intra-month day shape is learned from mid-month MTD cuts when they exist.
+Month-end totals cannot teach day 20. If those cuts are missing, open MTD
+uses elapsed calendar days of the *learned* typical month.
 """
 
 from __future__ import annotations
@@ -100,6 +100,24 @@ def weighted_distribution(lost_mt: float, ly_mt: float) -> float | None:
     return 1.0 - max(0.0, float(lost_mt or 0.0)) / ly_mt
 
 
+def apply_expected_gap(df: pd.DataFrame, k: float, z_clip: float = 4.0) -> pd.DataFrame:
+    """Hole versus this unit's own Expected. share_expected_mt tracks Expected so From-columns add to Recoverable."""
+    out = df.copy()
+    exp = pd.to_numeric(out.get("expected_mt"), errors="coerce").fillna(0.0)
+    vol = pd.to_numeric(out.get("volume_mt"), errors="coerce").fillna(0.0)
+    ly = pd.to_numeric(out.get("ly_mt"), errors="coerce").fillna(0.0)
+    out["share_expected_mt"] = exp
+    out["competitive_mt"] = vol - exp
+    size = np.maximum(ly.to_numpy(dtype=float), exp.to_numpy(dtype=float))
+    out["isolated_mt"] = [empirical_bayes(c, s, k) for c, s in zip(out["competitive_mt"], size)]
+    out["gap_mt"] = vol - exp
+    out["gap_pct"] = np.where(exp > 1e-9, (vol - exp) / exp * 100, np.nan)
+    out["z_score"] = robust_z(pd.Series(out["isolated_mt"], index=out.index)).clip(-z_clip, z_clip)
+    out["focus_score"] = -pd.Series(out["isolated_mt"]) * (1.0 + out["z_score"].abs() / 4.0)
+    out["situation"] = out.apply(_situation_label, axis=1)
+    return out
+
+
 def apply_shift_share(
     df: pd.DataFrame,
     parent_now: float,
@@ -107,27 +125,19 @@ def apply_shift_share(
     k: float,
     z_clip: float = 4.0,
 ) -> pd.DataFrame:
-    """Attach fair-share expected, competitive residual, shrinkage, robust z."""
+    """Deprecated peer residual. Kept for tests; scoring uses apply_expected_gap."""
     out = df.copy()
     idx = parent_index(parent_now, parent_ly)
     out["parent_index"] = idx
-    out["share_expected_mt"] = out["ly_mt"].fillna(0) * idx
-    out["competitive_mt"] = out["volume_mt"].fillna(0) - out["share_expected_mt"]
-    out["isolated_mt"] = [
-        empirical_bayes(c, ly, k)
-        for c, ly in zip(out["competitive_mt"], out["ly_mt"].fillna(0))
-    ]
-    out["z_score"] = robust_z(pd.Series(out["isolated_mt"], index=out.index)).clip(-z_clip, z_clip)
-    out["focus_score"] = -pd.Series(out["isolated_mt"]) * (1.0 + out["z_score"].abs() / 4.0)
-    out["situation"] = out.apply(_situation_label, axis=1)
-    return out
+    if "expected_mt" not in out.columns or pd.to_numeric(out.get("expected_mt"), errors="coerce").fillna(0).eq(0).all():
+        out["expected_mt"] = out["ly_mt"].fillna(0) * idx
+    return apply_expected_gap(out, k, z_clip=z_clip)
 
 
 def _situation_label(r: pd.Series) -> str:
     iso = float(r.get("isolated_mt") or 0)
-    ly = float(r.get("ly_mt") or 0)
-    # Additive hole vs a percentage: 0.5 MT (or 2% of own LY) is a city-scale exception.
-    material = max(0.5, 0.02 * ly) if ly >= 8 else max(0.15, 0.05 * max(ly, 0.0))
+    exp = float(r.get("expected_mt") or r.get("ly_mt") or 0)
+    material = max(0.5, 0.02 * exp) if exp >= 8 else max(0.15, 0.05 * max(exp, 0.0))
     if iso <= -material:
         return "lagging"
     if iso >= material:
@@ -264,7 +274,7 @@ def k_from_ly(ly: pd.Series, default: float = 0.05) -> float:
 
 
 def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str, Any]:
-    """One-screen narrative: weather vs exceptions vs what to do."""
+    """One-screen narrative: billed vs Expected, then the units behind their own Expected."""
     vol = float(national.get("volume_mt") or 0)
     expected = float(national.get("expected_mt") or 0)
     ly = float(national.get("ly_mt") or 0)
@@ -273,22 +283,23 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
     weather_dir = "declining" if gap < -1 else ("growing" if gap > 1 else "flat")
     pct = (gap / expected * 100) if expected else None
     intra_src = national.get("intra_month_source") or "closed"
+    miss = max(0.0, -gap)
     if weather_dir == "declining":
         weather = (
             f"{label}: the country billed {vol:.1f} MT against {expected:.1f} expected "
             f"from {int(national.get('n_history_periods') or 0)} months of history "
-            f"(last year {ly:.1f} MT, {pct:+.0f}% vs expected). That is the weather. "
-            "A city that is simply down with the country is not a local fire."
+            f"(last year {ly:.1f} MT, {pct:+.0f}% vs expected). Recoverable is that miss "
+            f"({miss:.1f} MT) — not a leftover versus peers."
         )
     elif weather_dir == "growing":
         weather = (
-            f"{label}: the country is ahead of last year ({vol:.1f} vs {expected:.1f} MT). "
-            "The problem is units whose growth is slower than that fair share — not anyone still growing."
+            f"{label}: the country billed {vol:.1f} MT against {expected:.1f} expected "
+            f"(last year {ly:.1f} MT). Ahead of the learned typical month."
         )
     else:
         weather = (
-            f"{label}: the country is roughly on last year's book ({vol:.1f} vs {expected:.1f} MT). "
-            "Focus on units that are off that fair share."
+            f"{label}: the country is on its learned typical month ({vol:.1f} vs {expected:.1f} MT). "
+            "Focus on units that are off their own Expected."
         )
     if intra_src == "learned_mtd_cuts":
         weather += (
@@ -313,33 +324,30 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
 
     if lag.empty:
         problem = (
-            "No city is a statistical exception versus the national index. "
+            "No city is behind its own Expected. "
             "Do not send extra people to the biggest city just because it is big. "
-            "The miss is national — mix, drop size, supply, or the category."
+            "If the country is also on Expected, hold. If the country is behind, the miss is national — mix, drop size, supply, or the category."
         )
         action = (
             "Hold city firefights. Work the national driver split (coverage vs velocity vs mix) "
-            "and the named shops that lag their own city, not a city hit-list."
+            "and the named shops that lag their own Expected, not a city hit-list."
         )
-        headline = f"National is {weather_dir}. No city is an exception."
+        headline = f"National is {weather_dir} vs Expected. No city is behind its own typical month."
     else:
         names = ", ".join(str(x) for x in lag["grain_id"].head(4).tolist())
         extra = float(lag["isolated_mt"].sum())
         problem = (
-            f"After national weather, extra hole is {extra:.1f} MT in {names}. "
-            "Those cities declined more (or grew slower) than the country — that is the local problem."
+            f"Cities behind their own Expected: {names} ({extra:.1f} MT). "
+            "Each hole is billed versus that city's typical same calendar month, not versus the country's current book."
         )
         action = (
             f"This week: {names}. Inside each, do the driver the card names "
-            "(velocity / coverage / mix), on the named distributors and shops — not the tail."
+            "(unbilled / unvisited / drop size), on the named distributors and shops — not the tail."
         )
-        if weather_dir == "growing":
-            headline = f"National is growing. Slow-growth exceptions: {names} ({extra:.1f} MT vs fair share)."
-        else:
-            headline = f"National is {weather_dir}. Extra hole after weather: {names} ({extra:.1f} MT)."
+        headline = f"National is {weather_dir} vs Expected. Behind their typical month: {names} ({extra:.1f} MT)."
     if not beat.empty:
         winners = ", ".join(str(x) for x in beat["grain_id"].head(3).tolist())
-        problem += f" Holding / beating fair share: {winners} — copy, do not raid."
+        problem += f" Ahead of Expected: {winners} — copy, do not raid."
 
     return {
         "headline": headline,
@@ -354,13 +362,13 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
 
 
 def rewrite_action(r: pd.Series, mtd: dict[str, Any], grain_label: str) -> str:
-    """Action text that leads with parent-adjusted residual, then the driver."""
+    """Action text that leads with billed versus this unit's Expected, then the driver."""
     name = str(r.get("grain_id") or grain_label)
     if name == "ALL":
         name = "National"
     sit = str(r.get("situation") or "with_market")
     iso = float(r.get("isolated_mt") or 0)
-    share = float(r.get("share_expected_mt") or 0)
+    share = float(r.get("expected_mt") or r.get("share_expected_mt") or 0)
     vol = float(r.get("volume_mt") or 0)
     cov = float(r.get("coverage_effect_mt") or 0)
     vel = float(r.get("velocity_effect_mt") or 0)
@@ -369,18 +377,18 @@ def rewrite_action(r: pd.Series, mtd: dict[str, Any], grain_label: str) -> str:
     z = float(r.get("z_score") or 0)
     if sit == "with_market" and grain_label != "national":
         base = (
-            f"{name} billed {vol:.1f} MT vs {share:.1f} fair share of its parent (z {z:+.1f}). "
-            "It moved with the market — not a local exception."
+            f"{name} billed {vol:.1f} MT vs {share:.1f} Expected (z {z:+.1f}). "
+            "On its typical same calendar month — not a local exception."
         )
     elif sit == "outperforming":
         base = (
-            f"{name} billed {vol:.1f} MT vs {share:.1f} fair share ({iso:+.1f} MT, z {z:+.1f}). "
-            "Beating the parent. Protect drop size; do not load; copy the beat."
+            f"{name} billed {vol:.1f} MT vs {share:.1f} Expected ({iso:+.1f} MT, z {z:+.1f}). "
+            "Ahead of its typical month. Protect drop size; do not load; copy the beat."
         )
     else:
         base = (
-            f"{name} billed {vol:.1f} MT vs {share:.1f} fair share of its parent "
-            f"({iso:+.1f} MT extra hole, z {z:+.1f}). This is the local problem."
+            f"{name} billed {vol:.1f} MT vs {share:.1f} Expected "
+            f"({iso:+.1f} MT hole, z {z:+.1f}). This is the local problem."
         )
     driver = f" Drivers: velocity {vel:+.1f} MT, coverage {cov:+.1f} MT, mix {mix:+.1f} MT."
     if diagnosis == "drop_size":
