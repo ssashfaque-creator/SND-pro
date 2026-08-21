@@ -8,11 +8,15 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from sndintel.briefing import (
+    SUMMARY_DIST_N,
+    SUMMARY_DSR_N,
+    SUMMARY_SHOP_N,
     ams_last_n,
     build_strategy_pack,
     excel_bytes,
     excel_bytes_detailed,
     focus_pack,
+    keep_top_holes,
     list_report_entities,
     pdf_bytes,
     render_html,
@@ -174,8 +178,10 @@ def test_excel_and_html_are_readable_packs():
     names = wb.sheetnames
     assert names[0] == "00 Cover"
     assert "01 Country by city" in names
-    assert "04 Key lagging distributors" in names
-    assert "06 Key lagging shops" in names
+    assert "02 Top 10 distributors" in names
+    assert "04 Top 10 dists all cities" in names
+    assert "05 Top 10 DSRs of those" in names
+    assert "06 Top 50 shops" in names
     cover = wb["00 Cover"]
     col_a = [c.value for row in cover.iter_rows(min_col=1, max_col=1, values_only=False) for c in row]
     assert "Glossary" in col_a
@@ -299,8 +305,23 @@ def test_tiny_shops_are_not_on_visit_lists():
     assert drill.str.contains("Kifaya Mart").any() or drill.str.contains("Medium Mart").any()
 
 
+def test_keep_top_holes_caps_and_remainder():
+    df = pd.DataFrame(
+        {
+            "grain_id": [f"D{i}" for i in range(15)],
+            "recoverable_mt": [float(15 - i) for i in range(15)],
+        }
+    )
+    kept, meta = keep_top_holes(df, 10)
+    assert list(kept["grain_id"]) == [f"D{i}" for i in range(10)]
+    assert meta["n_kept"] == 10
+    assert meta["n_hidden"] == 5
+    assert meta["hidden_mt"] == 15.0  # 5+4+3+2+1
+    assert meta["top_n"] == 10
+
+
 def test_summary_pack_hides_tiny_lagging_distributors_as_remainder():
-    """One big lagging dist plus many small ones: summary keeps the vital few only."""
+    """More than 10 lagging dists: summary names the top 10 by Gap; the rest are remainder."""
     rows = []
     rows.append(_row("BIG", "2026-08", 10.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     rows.append(_row("BIG", "2025-08", 80.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
@@ -316,9 +337,88 @@ def test_summary_pack_hides_tiny_lagging_distributors_as_remainder():
     report = build_strategy_pack(pack_h.units, sm, period="2026-08")
     named = [x for x in report.lagging_distributors["Distributor"].astype(str) if not str(x).startswith("Not listed")]
     assert "Eva Foods" in named
-    assert sum(1 for x in named if str(x).startswith("Tiny Dist")) <= 2
+    assert len(named) == SUMMARY_DIST_N
     assert report.lagging_distributors["Distributor"].astype(str).str.contains("Not listed").any()
-    # Detailed list still has the tiny distributors.
     all_names = set(report.all_distributors["Distributor"].astype(str))
     assert "Tiny Dist 0" in all_names
+    assert "Tiny Dist 14" in all_names
+
+
+def test_summary_dsrs_are_top_10_from_those_distributors():
+    """DSRs on the summary are only from the top 10 distributors, at most 10 named."""
+    rows = []
+    for i in range(12):
+        dist = f"Dist {i:02d}"
+        dsr = f"Rep {i:02d}"
+        sid = f"S{i:02d}"
+        billed = float(i)
+        rows.append(_row(sid, "2026-08", billed, "Karachi", dist, dsr, name=f"Shop {i:02d}"))
+        rows.append(_row(sid, "2025-08", 30.0, "Karachi", dist, dsr, name=f"Shop {i:02d}"))
+    rows = _with_recent_ams(rows, volume_by_store={f"S{i:02d}": 30.0 for i in range(12)})
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
+    report = build_strategy_pack(pack_h.units, sm, period="2026-08")
+    dist_named = [x for x in report.lagging_distributors["Distributor"].astype(str) if not str(x).startswith("Not listed")]
+    assert dist_named == [f"Dist {i:02d}" for i in range(10)]
+    dsr_named = [x for x in report.lagging_dsrs["DSR"].astype(str) if not str(x).startswith("Not listed")]
+    assert len(dsr_named) == SUMMARY_DSR_N
+    assert dsr_named == [f"Rep {i:02d}" for i in range(10)]
+    assert "Rep 10" not in dsr_named
+    assert "Rep 11" not in dsr_named
+    all_dsrs = set(report.all_dsrs["DSR"].astype(str))
+    assert "Rep 10" in all_dsrs
+    assert "Rep 11" in all_dsrs
+
+
+def test_summary_excludes_dsr_from_distributor_outside_top_10():
+    """A large DSR hole under an 11th distributor must not outrank smaller DSRs from the top 10."""
+    rows = []
+    volume_by_store = {}
+    for d in range(10):
+        for r in range(3):
+            sid = f"D{d:02d}R{r}"
+            dist = f"Fat Dist {d:02d}"
+            dsr = f"Fat Rep {d:02d}-{r}"
+            volume_by_store[sid] = 20.0
+            rows.append(_row(sid, "2026-08", 5.0, "Karachi", dist, dsr, name=sid))
+            rows.append(_row(sid, "2025-08", 20.0, "Karachi", dist, dsr, name=sid))
+    volume_by_store["WHALE"] = 40.0
+    rows.append(_row("WHALE", "2026-08", 0.0, "Lahore", "Thin Dist", "Whale Rep", name="Whale Shop"))
+    rows.append(_row("WHALE", "2025-08", 40.0, "Lahore", "Thin Dist", "Whale Rep", name="Whale Shop"))
+    rows = _with_recent_ams(rows, volume_by_store=volume_by_store)
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
+    report = build_strategy_pack(pack_h.units, sm, period="2026-08")
+    dist_named = [x for x in report.lagging_distributors["Distributor"].astype(str) if not str(x).startswith("Not listed")]
+    assert all(str(x).startswith("Fat Dist") for x in dist_named)
+    assert "Thin Dist" not in dist_named
+    dsr_named = [x for x in report.lagging_dsrs["DSR"].astype(str) if not str(x).startswith("Not listed")]
+    assert "Whale Rep" not in dsr_named
+    assert all(str(x).startswith("Fat Rep") for x in dsr_named)
+    assert "Whale Rep" in set(report.all_dsrs["DSR"].astype(str))
+
+
+def test_summary_shops_are_top_50_by_gap():
+    """National and those-distributor shop lists name at most 50 doors; detailed still has everyone above 0.25 MT."""
+    rows = []
+    volume_by_store = {}
+    for i in range(60):
+        sid = f"P{i:02d}"
+        ams = 3.0 + i * 0.1
+        volume_by_store[sid] = ams
+        rows.append(_row(sid, "2026-08", 0.0, "Karachi", "Eva Foods", "Amir", name=f"Door {i:02d}"))
+        rows.append(_row(sid, "2025-08", ams, "Karachi", "Eva Foods", "Amir", name=f"Door {i:02d}"))
+    rows = _with_recent_ams(rows, volume_by_store=volume_by_store)
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
+    report = build_strategy_pack(pack_h.units, sm, period="2026-08")
+    named = [x for x in report.lagging_shops["Shop"].astype(str) if not str(x).startswith("Not listed")]
+    assert len(named) == SUMMARY_SHOP_N
+    assert named[0] == "Door 59"
+    assert "Door 00" not in named
+    assert report.lagging_shops["Shop"].astype(str).str.contains("Not listed").any()
+    drill = [x for x in report.city_distributor_shops["Shop"].astype(str) if not str(x).startswith("Not listed")]
+    assert len(drill) == SUMMARY_SHOP_N
+    detailed = [x for x in report.all_shops["Shop"].astype(str) if not str(x).startswith("Not listed")]
+    assert len(detailed) == 60
 

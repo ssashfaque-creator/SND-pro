@@ -1,7 +1,9 @@
-"""One strategy pack: country → lagging cities → people → doors, plus full lagging lists.
+"""One strategy pack: country → top lagging distributors → DSRs → doors, plus full lists.
 
 Built for a sales head to print or filter. Column names are in English; jargon lives
 in the glossary, not the headers. Excel is the working file. PDF is the board pack.
+The national summary names the top 10 distributors by Gap, the top 10 DSRs from
+those distributors, and the top 50 shops. Report packs and the detailed pack are full lists.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibling_z_frame
 from sndintel.hierarchy import _shop_gaps
-from sndintel.isolate import empirical_bayes, isolate_key_holes, k_from_ly
+from sndintel.isolate import empirical_bayes, k_from_ly
 from sndintel.io_utils import shift_period
 from sndintel.season import fit_seasonality, fit_shop_expected, reconcile_expected
 
@@ -58,11 +60,11 @@ GLOSSARY = [
     ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
     ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
     ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
-    ("Shop lists", "Summary pack: only the vital few doors (modified z of Gap vs other lagging shops in the city, then Pareto of that city’s hole). Gaps ≤ 0.25 MT and the statistical tail are one remainder line. Detailed pack still lists every door above 0.25 MT."),
+    ("Shop lists", "Summary pack: top 50 lagging doors by Gap (after dropping gaps ≤ 0.25 MT). The rest of the hole is one remainder line. Detailed pack still lists every door above 0.25 MT."),
     ("AMS = 0 distributors / DSRs", "Hidden everywhere in the report. No recent three-month run-rate, so they are not a call."),
     (
-        "Vital few (summary pack)",
-        "Among lagging distributors / DSRs / shops in the same city (shops under a distributor, on that sheet), keep a name if its Gap is a robust outlier (Iglewicz–Hoaglin modified z ≥ 1 vs other lagging Gaps) or it is at least 5% of that parent’s lagging Gap and is needed so named rows cover 80% of the hole. Equal micro holes are not listed — they are a coverage KPI. The detailed pack is the full list.",
+        "Summary pack lists",
+        "Hard caps by Gap, not a statistical cut: top 10 lagging distributors nationally; top 10 lagging DSRs whose shops sit under those 10 distributors; top 50 lagging shops. Remainder lines are the tail. The detailed pack is the full list (AMS > 0 distributors/DSRs; shops above 0.25 MT).",
     ),
 ]
 
@@ -97,11 +99,11 @@ CALCULATION_NOTES = [
     ),
     (
         "Rounding and lists",
-        "MT, shop counts, and percents print as whole numbers. From-columns are adjusted so they still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. The summary pack then keeps only the vital few lagging names (modified z of Gap + Pareto of the hole). Shops with gap ≤ 0.25 MT and the statistical tail are remainder lines. The detailed pack lists every AMS > 0 distributor/DSR and every shop above 0.25 MT.",
+        "MT, shop counts, and percents print as whole numbers. From-columns are adjusted so they still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names the top 10 lagging distributors by Gap, the top 10 lagging DSRs from those distributors, and the top 50 lagging shops (after the 0.25 MT floor). Remainder lines are the tail. The detailed pack lists every AMS > 0 distributor/DSR and every shop above 0.25 MT.",
     ),
     (
-        "Vital few",
-        "Iglewicz–Hoaglin modified z of Gap among lagging siblings in the same parent (city, or distributor on the shop drill). Keep z ≥ 1. Then add the next-largest names that are at least 5% of that parent’s lagging Gap until 80% of the hole is named. Do not list a long tail of equal small holes just to hit 80%. Always keep the largest hole in the group.",
+        "Top-N lists",
+        "National summary only. Rank lagging units by Gap. Keep 10 distributors, then 10 DSRs that appear on doors under those 10 distributors, then 50 shops (Gap > 0.25 MT). City / distributor / DSR Report packs and the detailed pack are still the full lists.",
     ),
 ]
 
@@ -135,16 +137,15 @@ def how_to_read_steps(pack: StrategyPack, detailed: bool = False) -> list[str]:
         ]
     return [
         "Country by city — every city versus its own Expected. Highest gap first.",
-        "Lagging cities → key distributors — first calls. AMS = 0 is hidden. Vital few of each city’s hole, not every lagging dist.",
-        "Those distributors → key shops (vital few of that distributor’s hole; gaps ≤ 0.25 MT rolled off).",
-        "Key lagging distributors in every city, including pockets inside cities that are on expected.",
-        "Key lagging DSRs (vital few per city).",
-        "Key lagging shops (vital few per city). The rest of the hole is the remainder line.",
+        "Top 10 lagging distributors nationally, biggest Gap first. AMS = 0 is hidden.",
+        "Top 10 lagging DSRs from those 10 distributors. Ride-with this list.",
+        "Top 50 lagging shops by Gap (doors ≤ 0.25 MT and the tail are the remainder line).",
     ]
 
 SHOP_RECOVERABLE_FLOOR = 0.25
-DIST_HOLE_FLOOR = 0.5
-DSR_HOLE_FLOOR = 0.5
+SUMMARY_DIST_N = 10
+SUMMARY_DSR_N = 10
+SUMMARY_SHOP_N = 50
 
 SCORECARD_METRICS = [
     ("volume_mt", "Billed this period (MT)"),
@@ -349,19 +350,17 @@ def build_strategy_pack(
     lagging_cities = cities[cities["situation"] == "lagging"] if not cities.empty else cities
     lagging_city_names = [str(x) for x in lagging_cities["grain_id"].tolist()] if not lagging_cities.empty else []
 
-    city_dists = pd.DataFrame()
-    city_dist_meta = {"n_hidden": 0, "hidden_mt": 0.0}
-    if not dists.empty and lagging_city_names:
-        city_dists = dists[dists["parent_id"].astype(str).isin(lagging_city_names)].copy()
-        city_dists = city_dists[city_dists["situation"] == "lagging"] if "situation" in city_dists.columns else city_dists
-        city_dists, city_dist_meta = isolate_key_holes(
-            city_dists, value_col="recoverable_mt", group_col="parent_id", abs_floor=DIST_HOLE_FLOOR
-        )
-        city_dists = _sort_focus(city_dists)
+    all_lag_dist = dists[dists["situation"] == "lagging"].copy() if not dists.empty else dists
+    all_lag_dist, lag_dist_meta = keep_top_holes(all_lag_dist, SUMMARY_DIST_N)
+    all_lag_dist = _sort_focus(all_lag_dist)
 
     lagging_dist_names: list[str] = []
-    if not city_dists.empty:
-        lagging_dist_names = sorted({str(x) for x in city_dists["grain_id"].tolist()})
+    if not all_lag_dist.empty:
+        lagging_dist_names = [str(x) for x in all_lag_dist["grain_id"].tolist()]
+
+    # Same ten names on both distributor sheets — not a per-city statistical cut.
+    city_dists = all_lag_dist
+    city_dist_meta = lag_dist_meta
 
     shops = score_shops(shop_month, cities, period, pace)
     shops = _attach_ams(shops, shop_month, period, ["store_id"], ledger, pace)
@@ -369,37 +368,29 @@ def build_strategy_pack(
     hole_floor = SHOP_RECOVERABLE_FLOOR
 
     city_dist_shops = pd.DataFrame()
-    city_dist_shop_meta = {"n_hidden": 0, "hidden_mt": 0.0}
+    city_dist_shop_meta = {"n_hidden": 0, "hidden_mt": 0.0, "top_n": SUMMARY_SHOP_N}
     if not shops.empty and lagging_dist_names:
-        city_dist_shops = shops[
-            shops["distributor"].astype(str).isin(lagging_dist_names)
-            & shops["city"].astype(str).isin(lagging_city_names)
-        ].copy()
+        city_dist_shops = shops[shops["distributor"].astype(str).isin(set(lagging_dist_names))].copy()
         city_dist_shops, floor_meta = keep_visit_shops(city_dist_shops, hole_floor)
-        city_dist_shops, vital_meta = isolate_key_holes(
-            city_dist_shops, value_col="recoverable_mt", group_col="distributor", abs_floor=hole_floor
-        )
-        city_dist_shop_meta = _merge_hole_meta(floor_meta, vital_meta)
+        city_dist_shops, top_meta = keep_top_holes(city_dist_shops, SUMMARY_SHOP_N)
+        city_dist_shop_meta = _merge_hole_meta(floor_meta, top_meta)
 
-    all_lag_dist = dists[dists["situation"] == "lagging"].copy() if not dists.empty else dists
-    all_lag_dist, lag_dist_meta = isolate_key_holes(
-        all_lag_dist, value_col="recoverable_mt", group_col="parent_id", abs_floor=DIST_HOLE_FLOOR
-    )
-    all_lag_dist = _sort_focus(all_lag_dist)
     all_lag_dsr = dsrs[dsrs["situation"] == "lagging"].copy() if not dsrs.empty else dsrs
-    all_lag_dsr, lag_dsr_meta = isolate_key_holes(
-        all_lag_dsr, value_col="recoverable_mt", group_col="parent_id", abs_floor=DSR_HOLE_FLOOR
-    )
-    all_lag_dsr = _sort_focus(all_lag_dsr)
+    if all_lag_dsr is None or all_lag_dsr.empty or not lagging_dist_names:
+        all_lag_dsr = all_lag_dsr.iloc[0:0].copy() if all_lag_dsr is not None else pd.DataFrame()
+        lag_dsr_meta = keep_top_holes(all_lag_dsr, SUMMARY_DSR_N)[1]
+    else:
+        dsr_keys = _dsr_keys_under_distributors(shop_month, set(lagging_dist_names), period, shops)
+        all_lag_dsr = _filter_dsrs_by_keys(all_lag_dsr, dsr_keys)
+        all_lag_dsr, lag_dsr_meta = keep_top_holes(all_lag_dsr, SUMMARY_DSR_N)
+        all_lag_dsr = _sort_focus(all_lag_dsr)
 
     lag_shops = pd.DataFrame()
-    lag_meta = {"n_hidden": 0, "hidden_mt": 0.0}
+    lag_meta = {"n_hidden": 0, "hidden_mt": 0.0, "top_n": SUMMARY_SHOP_N}
     if not shops.empty:
         lag_shops, floor_meta = keep_visit_shops(shops, hole_floor)
-        lag_shops, vital_meta = isolate_key_holes(
-            lag_shops, value_col="recoverable_mt", group_col="city", abs_floor=hole_floor
-        )
-        lag_meta = _merge_hole_meta(floor_meta, vital_meta)
+        lag_shops, top_meta = keep_top_holes(lag_shops, SUMMARY_SHOP_N)
+        lag_meta = _merge_hole_meta(floor_meta, top_meta)
 
     all_shops, all_shop_meta = keep_visit_shops(shops, hole_floor) if not shops.empty else (pd.DataFrame(), lag_meta)
 
@@ -412,7 +403,7 @@ def build_strategy_pack(
     kpis["n_dists_hidden"] = int(lag_dist_meta.get("n_hidden") or 0)
     kpis["n_dsrs_hidden"] = int(lag_dsr_meta.get("n_hidden") or 0)
     shop_note = (
-        f"Vital few shops of each city’s hole (modified z of Gap, then Pareto). "
+        f"Top {SUMMARY_SHOP_N} lagging shops by Gap. "
         f"{int(lag_meta.get('n_hidden') or 0)} other doors totalling "
         f"{float(lag_meta.get('hidden_mt') or 0):.0f} MT gap are the remainder line "
         f"(includes gaps ≤ {hole_floor:.2f} MT)."
@@ -685,12 +676,97 @@ def keep_visit_shops(
     return kept, meta
 
 
+def keep_top_holes(
+    df: pd.DataFrame,
+    n: int,
+    *,
+    value_col: str = "recoverable_mt",
+    min_value: float = 0.0,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Keep the n largest lagging rows by Gap; roll the rest into a remainder."""
+    empty_meta: dict[str, float] = {
+        "n_kept": 0,
+        "n_hidden": 0,
+        "hidden_mt": 0.0,
+        "n_pool": 0,
+        "top_n": int(n),
+    }
+    if df is None or df.empty or int(n) <= 0:
+        return (df if df is not None else pd.DataFrame()), empty_meta
+    work = df.copy()
+    val = pd.to_numeric(work.get(value_col), errors="coerce").fillna(0.0)
+    holes = work.loc[val > float(min_value)].copy()
+    if holes.empty:
+        return work.iloc[0:0].copy(), {**empty_meta, "n_pool": int(len(work))}
+    ranked = holes.assign(_gap=pd.to_numeric(holes[value_col], errors="coerce").fillna(0.0))
+    ranked = ranked.sort_values("_gap", ascending=False, kind="mergesort")
+    named = ranked.head(int(n)).drop(columns=["_gap"], errors="ignore")
+    rest = ranked.iloc[int(n) :].drop(columns=["_gap"], errors="ignore")
+    meta = {
+        **empty_meta,
+        "n_kept": int(len(named)),
+        "n_hidden": int(len(rest)),
+        "hidden_mt": float(pd.to_numeric(rest.get(value_col), errors="coerce").fillna(0).sum()) if not rest.empty else 0.0,
+        "n_pool": int(len(holes)),
+    }
+    return named, meta
+
+
+def _dsr_keys_under_distributors(
+    shop_month: pd.DataFrame,
+    dist_names: set[str],
+    period: str,
+    shops: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """City + DSR pairs that appear on doors under the named distributors."""
+    frames: list[pd.DataFrame] = []
+    cols = ["city", "dsr_name"]
+    if shop_month is not None and not shop_month.empty and dist_names:
+        cur = shop_month
+        if "period" in cur.columns:
+            this = cur[cur["period"].astype(str) == str(period)]
+            if not this.empty:
+                cur = this
+        if "distributor" in cur.columns:
+            mask = cur["distributor"].astype(str).isin(dist_names)
+            have = [c for c in cols if c in cur.columns]
+            if have:
+                frames.append(cur.loc[mask, have].copy())
+    if shops is not None and not shops.empty and dist_names and "distributor" in shops.columns:
+        mask = shops["distributor"].astype(str).isin(dist_names)
+        have = [c for c in cols if c in shops.columns]
+        if have:
+            frames.append(shops.loc[mask, have].copy())
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    out = pd.concat(frames, ignore_index=True)
+    for c in cols:
+        if c not in out.columns:
+            out[c] = ""
+    return out[cols].drop_duplicates()
+
+
+def _filter_dsrs_by_keys(dsrs: pd.DataFrame, keys: pd.DataFrame) -> pd.DataFrame:
+    if dsrs is None or dsrs.empty or keys is None or keys.empty:
+        return dsrs.iloc[0:0].copy() if dsrs is not None else pd.DataFrame()
+    city_col = "city" if "city" in dsrs.columns else "parent_id"
+    dsr_col = "dsr_name" if "dsr_name" in dsrs.columns else "grain_id"
+    key_city = "city" if "city" in keys.columns else None
+    key_dsr = "dsr_name" if "dsr_name" in keys.columns else None
+    if not key_city or not key_dsr:
+        return dsrs.iloc[0:0].copy()
+    left = dsrs[city_col].astype(str) + "\0" + dsrs[dsr_col].astype(str)
+    right = set(keys[key_city].astype(str) + "\0" + keys[key_dsr].astype(str))
+    return dsrs.loc[left.isin(right)].copy()
+
+
 def _merge_hole_meta(floor_meta: dict[str, float], vital_meta: dict[str, float]) -> dict[str, float]:
     out = dict(floor_meta or {})
     out["n_kept"] = int(vital_meta.get("n_kept") or 0)
     out["n_hidden"] = int(floor_meta.get("n_hidden") or 0) + int(vital_meta.get("n_hidden") or 0)
     out["hidden_mt"] = float(floor_meta.get("hidden_mt") or 0) + float(vital_meta.get("hidden_mt") or 0)
-    out["vital"] = True
+    if vital_meta.get("top_n") is not None:
+        out["top_n"] = vital_meta["top_n"]
     return out
 
 
@@ -722,10 +798,22 @@ def _append_remainder(
     if n_hidden <= 0:
         return table
     rest = {label: None for _, label in view}
-    rest[name_field] = (
-        f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
-        "Vital-few tail (modified z of Gap + Pareto of the hole), not a first call."
-    )
+    top_n = meta.get("top_n")
+    if top_n:
+        rest[name_field] = (
+            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            f"Ranked by Gap; only the top {int(top_n)} are named on this sheet."
+        )
+    elif name_field == "Shop":
+        rest[name_field] = (
+            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            "Gaps of 0.25 MT or less, not a first call."
+        )
+    else:
+        rest[name_field] = (
+            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            "The rest of the hole after the named rows."
+        )
     rest["Gap (MT)"] = _round_num(hidden_mt)
     extra = pd.DataFrame([rest])
     if table is None or table.empty:
@@ -835,7 +923,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             (
                 "02 Distributors",
                 f"Distributors in {label}",
-                "AMS = 0 is hidden. Highest gap first. This city pack lists every distributor with a run-rate, not only the national vital few.",
+                "AMS = 0 is hidden. Highest gap first. This city pack lists every distributor with a run-rate, not only the national top 10.",
                 pack.all_distributors,
             ),
             (
@@ -929,34 +1017,34 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             pack.cities,
         ),
         (
-            "02 Lagging cities-dists",
-            "Key distributors inside lagging cities",
-            "Vital few of each lagging city’s hole (modified z of Gap vs other lagging dists, then Pareto). AMS = 0 is hidden. The tail is the remainder line.",
+            "02 Top 10 distributors",
+            "Top 10 lagging distributors by Gap",
+            "Biggest Gap first. AMS = 0 is hidden. Remainder line is everyone after the tenth.",
             pack.city_distributors,
         ),
         (
-            "03 Those dists-shops",
-            "Key shops under those distributors",
-            (pack.shop_note or "Vital few shops of that distributor’s hole.")
+            "03 Top 50 shops of those",
+            "Top 50 lagging shops under those distributors",
+            (pack.shop_note or "Top 50 shops by Gap under the distributors above.")
             + " Gap is volume that comes back if the door billed its own Expected.",
             pack.city_distributor_shops,
         ),
         (
-            "04 Key lagging distributors",
-            "Key lagging distributors (all cities)",
-            "Vital few per city, including pockets inside cities that are on expected. Sheet 02 only showed lagging cities. Remainder line is the tail.",
+            "04 Top 10 dists all cities",
+            "Top 10 lagging distributors (all cities)",
+            "Same ten names as sheet 02 — national rank by Gap, including pockets inside cities that are on expected.",
             pack.lagging_distributors,
         ),
         (
-            "05 Key lagging DSRs",
-            "Key lagging DSRs (all cities)",
-            "Vital few salespeople per city (modified z of Gap, then Pareto). Ride-with this list. Remainder line is the tail.",
+            "05 Top 10 DSRs of those",
+            "Top 10 lagging DSRs from those distributors",
+            "Salespeople whose shops sit under the top 10 distributors, then the ten biggest Gaps. Ride-with this list.",
             pack.lagging_dsrs,
         ),
         (
-            "06 Key lagging shops",
-            "Key lagging shops",
-            pack.shop_note or "Vital few shops per city. The rest of the hole is the remainder line.",
+            "06 Top 50 shops",
+            "Top 50 lagging shops",
+            pack.shop_note or "Top 50 doors by Gap after the 0.25 MT floor. The rest of the hole is the remainder line.",
             pack.lagging_shops,
         ),
     ]
@@ -977,28 +1065,28 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
             pack.cities,
         ),
         _html_section(
-            "2. Lagging cities — key distributors",
-            "Vital few of each lagging city’s hole. AMS = 0 is hidden. Remainder line is the tail.",
+            "2. Top 10 lagging distributors",
+            "Biggest Gap first. AMS = 0 is hidden. Remainder line is everyone after the tenth.",
             pack.city_distributors,
         ),
         _html_section(
-            "3. Those distributors — key shops",
-            "Vital few doors under the distributors above. Remainder line is the tail of that hole.",
+            "3. Top 50 shops of those distributors",
+            "Top 50 doors by Gap under the distributors above. Remainder line is the tail of that hole.",
             pack.city_distributor_shops,
         ),
         _html_section(
-            "4. Key lagging distributors (all cities)",
-            "Vital few per city, including pockets inside cities that are on expected.",
+            "4. Top 10 lagging distributors (all cities)",
+            "Same ten names as section 2 — national rank by Gap.",
             pack.lagging_distributors,
         ),
         _html_section(
-            "5. Key lagging DSRs (all cities)",
-            "Vital few salespeople per city. Remainder line is the tail.",
+            "5. Top 10 lagging DSRs from those distributors",
+            "Salespeople whose shops sit under the top 10 distributors, then the ten biggest Gaps. Ride-with this list.",
             pack.lagging_dsrs,
         ),
         _html_section(
-            "6. Key lagging shops",
-            pack.shop_note or "Vital few shops per city. The rest of the hole is the remainder line.",
+            "6. Top 50 lagging shops",
+            pack.shop_note or "Top 50 doors by Gap after the 0.25 MT floor. The rest of the hole is the remainder line.",
             pack.lagging_shops,
         ),
         ]
