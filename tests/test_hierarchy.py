@@ -177,6 +177,40 @@ def test_national_hole_is_sum_of_city_holes():
     assert pack.national["n_cities"] == 2
 
 
+def test_distributor_and_dsr_universe_come_from_shop_master():
+    rows = [
+        _row("K1", "2026-08", 10.0, "Karachi", "Eva Foods", "Amir Surveyor", "A", "Shop K"),
+        _row("K1", "2025-08", 30.0, "Karachi", "Eva Foods", "Amir Surveyor", "A", "Shop K"),
+    ]
+    stores = _stores(rows)
+    extra = pd.DataFrame(
+        [
+            {
+                "store_id": f"U{i}",
+                "store_name": f"U{i}",
+                "distributor": "Eva Foods",
+                "dsr_name": "Amir Surveyor",
+                "zone": "South",
+                "city": "Karachi",
+                "section": "A",
+            }
+            for i in range(5)
+        ]
+    )
+    stores = pd.concat([stores, extra], ignore_index=True)
+    pack = build_hierarchy_pack(
+        pd.DataFrame(rows),
+        stores,
+        ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]),
+    )
+    dist = pack.units[(pack.units["grain"] == "distributor") & (pack.units["grain_id"] == "Eva Foods")].iloc[0]
+    dsr = pack.units[(pack.units["grain"] == "dsr") & (pack.units["grain_id"] == "Amir Surveyor")].iloc[0]
+    assert int(dist["universe"]) >= 6
+    assert int(dsr["universe"]) >= 6
+    assert int(dist["billed"]) == 1
+    assert dist["strike_rate"] is not None and float(dist["strike_rate"]) < 1
+
+
 def test_open_mtd_prorates_expected():
     rows = []
     rows.append(_row("K1", "2026-08", 10.0, "Karachi", "Eva Foods", "Amir Surveyor", "A", "Shop K"))

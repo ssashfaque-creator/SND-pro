@@ -222,7 +222,7 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
         except Exception:
             situation = pd.DataFrame()
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
-    from sndintel.briefing import build_strategy_pack, write_excel, write_html
+    from sndintel.briefing import build_strategy_pack, write_excel, write_excel_detailed, write_html
     from sndintel.features import latest_period
 
     period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
@@ -232,8 +232,14 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
     write_excel(pack, path)
     html_path = path.with_suffix(".html")
     write_html(pack, html_path)
+    detailed_xlsx = path.with_name(path.stem + "_detailed.xlsx")
+    detailed_html = path.with_name(path.stem + "_detailed.html")
+    write_excel_detailed(pack, detailed_xlsx)
+    write_html(pack, detailed_html, detailed=True)
     console.print(f"Wrote {path}")
     console.print(f"Wrote {html_path}  (open and File → Print → Save as PDF)")
+    console.print(f"Wrote {detailed_xlsx}")
+    console.print(f"Wrote {detailed_html}")
 
 
 @app.command()

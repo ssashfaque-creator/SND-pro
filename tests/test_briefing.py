@@ -7,8 +7,25 @@ from io import BytesIO
 import pandas as pd
 from openpyxl import load_workbook
 
-from sndintel.briefing import ams_last_n, build_strategy_pack, excel_bytes, render_html
+from sndintel.briefing import ams_last_n, build_strategy_pack, excel_bytes, excel_bytes_detailed, render_html
 from sndintel.hierarchy import build_hierarchy_pack
+
+
+def _with_recent_ams(rows, volume_by_store=None, months=("2026-05", "2026-06", "2026-07")):
+    """Give named doors three closed months so AMS is defined (and not zero)."""
+    extra = []
+    seen = set()
+    for r in rows:
+        sid = r["store_id"]
+        if sid in seen or r["period"] != "2026-08":
+            continue
+        seen.add(sid)
+        if volume_by_store is not None and sid not in volume_by_store:
+            continue
+        vol = volume_by_store.get(sid, max(float(r["volume_mt"]), 1.0)) if volume_by_store else max(float(r["volume_mt"]), 1.0)
+        for per in months:
+            extra.append({**r, "period": per, "year": int(per[:4]), "month": int(per[5:7]), "volume_mt": vol})
+    return rows + extra
 
 
 def _row(store_id, period, volume, city, dist, dsr, section="A", name="Shop"):
@@ -70,6 +87,9 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     rows.append(_row("L1", "2025-08", 100.0, "Lahore", "Holding Dist", "Lahore Ace", name="Big L"))
     rows.append(_row("L2", "2026-08", 10.0, "Lahore", "Local Dist", "Lahore Weak", name="Small L"))
     rows.append(_row("L2", "2025-08", 100.0, "Lahore", "Local Dist", "Lahore Weak", name="Small L"))
+    rows.append(_row("G1", "2026-08", 1.0, "Karachi", "Ghost Dist", "Ghost DSR", name="Ghost Shop"))
+    rows.append(_row("G1", "2025-08", 40.0, "Karachi", "Ghost Dist", "Ghost DSR", name="Ghost Shop"))
+    rows = _with_recent_ams(rows, volume_by_store={"K1": 8.0, "K2": 18.0, "L1": 95.0, "L2": 80.0})
     sm = pd.DataFrame(rows)
     pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
     report = build_strategy_pack(pack_h.units, sm, period="2026-08")
@@ -77,7 +97,11 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "City" in cities.columns
     assert "AMS last 3 months (MT)" in cities.columns
     assert "Recoverable (MT)" in cities.columns
-    assert "Extra vs country (MT)" in cities.columns
+    assert "From coverage (MT)" in cities.columns
+    assert "From drop size (MT)" in cities.columns
+    assert "Extra vs country (MT)" not in cities.columns
+    rec = cities["Recoverable (MT)"].tolist()
+    assert rec == sorted(rec, reverse=True)
     khi = cities[cities["City"] == "Karachi"].iloc[0]
     assert khi["Situation"] == "Lagging"
     assert float(khi["Recoverable (MT)"]) > 0
@@ -90,6 +114,14 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     names = set(report.lagging_distributors["Distributor"].astype(str))
     assert "Local Dist" in names
     assert "Eva Foods" in names
+    assert "Ghost Dist" not in names
+    assert "Billed shops" in report.lagging_distributors.columns
+    assert "Strike %" in report.lagging_distributors.columns
+    assert "Universe" in report.lagging_distributors.columns
+    assert "From coverage (MT)" in report.lagging_dsrs.columns
+    assert "Strike %" in report.lagging_dsrs.columns
+    assert "Ghost DSR" not in set(report.lagging_dsrs["DSR"].astype(str))
+    assert "Ghost Dist" not in set(report.all_distributors["Distributor"].astype(str))
 
 
 def test_excel_and_html_are_readable_packs():
@@ -114,32 +146,47 @@ def test_excel_and_html_are_readable_packs():
     html = render_html(report)
     assert "AMS last 3 months" in html or "Recoverable" in html
     assert "Glossary" in html
-    assert "Fair share" in html or "Extra vs" in html
+    assert "Fair share" in html or "From coverage" in html
+    detailed = render_html(report, detailed=True)
+    assert "Distributor detail" in detailed
+    assert "National detail" in detailed
+    raw_d = excel_bytes_detailed(report)
+    wb_d = load_workbook(BytesIO(raw_d))
+    assert "01 City detail" in wb_d.sheetnames
+    assert "05 National shops" in wb_d.sheetnames
 
 
 def test_tiny_shops_are_not_on_visit_lists():
-    """Kiryana tail is rolled off; a real account with a real hole stays."""
+    """Kiryana with recoverable ≤ 0.25 MT is rolled off; any shop above that cut stays, even if AMS is small."""
     rows = []
     rows.append(_row("BIG", "2026-08", 4.0, "Karachi", "Eva Foods", "Amir", name="Kifaya Mart"))
     rows.append(_row("BIG", "2025-08", 12.0, "Karachi", "Eva Foods", "Amir", name="Kifaya Mart"))
     rows.append(_row("HOLD", "2026-08", 12.0, "Karachi", "South Dist", "Amir", name="Hold Super"))
     rows.append(_row("HOLD", "2025-08", 12.0, "Karachi", "South Dist", "Amir", name="Hold Super"))
+    # Small AMS (~0.4 MT) but a hole above 0.25 MT — must still appear.
+    # Put it in a city that moved with the country so the shop hole is the full drop.
+    rows.append(_row("MED", "2026-08", 0.0, "Lahore", "Holding Dist", "Ace", name="Medium Mart"))
+    rows.append(_row("MED", "2025-08", 0.40, "Lahore", "Holding Dist", "Ace", name="Medium Mart"))
     for i in range(40):
         rows.append(_row(f"T{i}", "2026-08", 0.0, "Karachi", "Eva Foods", "Amir", name=f"Kiryana {i}"))
         rows.append(_row(f"T{i}", "2025-08", 0.04, "Karachi", "Eva Foods", "Amir", name=f"Kiryana {i}"))
     rows.append(_row("L1", "2026-08", 80.0, "Lahore", "Holding Dist", "Ace", name="Lahore Super"))
     rows.append(_row("L1", "2025-08", 80.0, "Lahore", "Holding Dist", "Ace", name="Lahore Super"))
+    rows = _with_recent_ams(
+        rows,
+        volume_by_store={"BIG": 8.0, "HOLD": 12.0, "MED": 0.40, "L1": 80.0, **{f"T{i}": 0.04 for i in range(40)}},
+    )
     sm = pd.DataFrame(rows)
     pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
     report = build_strategy_pack(pack_h.units, sm, period="2026-08")
-    assert report.kpis["shop_size_floor_mt"] >= 0.5
-    assert report.kpis["shop_hole_floor_mt"] >= 0.25
+    assert report.kpis["shop_hole_floor_mt"] == 0.25
     names = report.lagging_shops["Shop"].astype(str)
     assert names.str.contains("Kifaya Mart").any()
+    assert names.str.contains("Medium Mart").any()
     assert not names.str.contains("Kiryana").any()
     assert names.str.contains("Not listed").any()
     assert report.kpis["n_shops_hidden"] >= 20
     drill = report.city_distributor_shops["Shop"].astype(str)
     assert not drill.str.contains("Kiryana").any()
-    assert drill.str.contains("Kifaya Mart").any() or drill.str.contains("Not listed").any()
+    assert drill.str.contains("Kifaya Mart").any() or drill.str.contains("Medium Mart").any()
 

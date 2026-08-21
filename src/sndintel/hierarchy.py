@@ -169,7 +169,7 @@ def build_hierarchy_pack(
     if cur.empty:
         return HierarchyPack(period=period, yoy_period=yoy_p, mtd=mtd, national={})
 
-    universe = _universe_by_city(stores)
+    universe = _universe_by_keys(stores, ["city"], fallback=sm)
     city_units = _grain_bridge(cur, ly, ["city"], universe, pace, factor)
     if "zone" in cur.columns:
         zone_map = cur.groupby("city")["zone"].agg(_mode_or_first)
@@ -199,7 +199,9 @@ def build_hierarchy_pack(
     city_units = _annotate_units(city_units, mtd, grain_label="city")
     city_units = _rewrite_actions(city_units, mtd, "city")
 
-    dist_units = _grain_bridge(cur, ly, ["city", "distributor"], None, pace, factor)
+    dist_units = _grain_bridge(
+        cur, ly, ["city", "distributor"], _universe_by_keys(stores, ["city", "distributor"], fallback=sm), pace, factor
+    )
     dist_units["grain"] = "distributor"
     dist_units["parent_grain"] = "city"
     dist_units["parent_id"] = dist_units["city"].astype(str)
@@ -211,7 +213,9 @@ def build_hierarchy_pack(
     dist_units = _annotate_units(dist_units, mtd, grain_label="distributor")
     dist_units = _rewrite_actions(dist_units, mtd, "distributor")
 
-    dsr_units = _grain_bridge(cur, ly, ["city", "dsr_name"], None, pace, factor)
+    dsr_units = _grain_bridge(
+        cur, ly, ["city", "dsr_name"], _universe_by_keys(stores, ["city", "dsr_name"], fallback=sm), pace, factor
+    )
     dsr_units["grain"] = "dsr"
     dsr_units["parent_grain"] = "city"
     dsr_units["parent_id"] = dsr_units["city"].astype(str)
@@ -223,7 +227,9 @@ def build_hierarchy_pack(
     dsr_units = _annotate_units(dsr_units, mtd, grain_label="dsr")
     dsr_units = _rewrite_actions(dsr_units, mtd, "dsr")
 
-    section_units = _grain_bridge(cur, ly, ["city", "section"], None, pace, factor)
+    section_units = _grain_bridge(
+        cur, ly, ["city", "section"], _universe_by_keys(stores, ["city", "section"], fallback=sm), pace, factor
+    )
     section_units["grain"] = "section"
     section_units["parent_grain"] = "city"
     section_units["parent_id"] = section_units["city"].astype(str)
@@ -365,10 +371,45 @@ def _facts_with_geo(
 
 
 def _universe_by_city(stores: pd.DataFrame | None) -> pd.Series:
-    if stores is None or stores.empty or "city" not in stores.columns:
+    return _universe_by_keys(stores, ["city"])
+
+
+def _universe_by_keys(
+    stores: pd.DataFrame | None,
+    keys: list[str],
+    fallback: pd.DataFrame | None = None,
+) -> pd.Series:
+    """Unique shops on the master (or billed history) at this grain."""
+    src = None
+    if stores is not None and not stores.empty and "store_id" in stores.columns and all(k in stores.columns for k in keys):
+        src = stores
+    elif fallback is not None and not fallback.empty and "store_id" in fallback.columns and all(
+        k in fallback.columns for k in keys
+    ):
+        src = fallback
+    if src is None:
         return pd.Series(dtype=float)
-    cities = stores["city"].fillna("(unmapped)").replace("", "(unmapped)")
-    return stores.assign(_city=cities).groupby("_city")["store_id"].nunique()
+    work = src.copy()
+    for k in keys:
+        work[k] = work[k].fillna("(unmapped)").replace("", "(unmapped)")
+    return work.groupby(keys, dropna=False)["store_id"].nunique()
+
+
+def _lookup_universe(universe: pd.Series | None, rec: dict, keys: list[str]) -> int:
+    if universe is None or len(universe) == 0:
+        return 0
+    if len(keys) == 1:
+        val = rec.get(keys[0], rec.get("grain_id"))
+        if val in universe.index:
+            return int(universe.loc[val])
+        tup = (val,)
+        if tup in universe.index:
+            return int(universe.loc[tup])
+        return 0
+    key = tuple(rec.get(k) for k in keys)
+    if key in universe.index:
+        return int(universe.loc[key])
+    return 0
 
 
 def _billed_ids(part: pd.DataFrame) -> set[str]:
@@ -480,9 +521,7 @@ def _bridge_row(
             "new_mt": new_mt,
             "billed": len(c_ids),
             "billed_ly": len(l_ids),
-            "universe": int(universe.get(rec.get("city", rec.get("grain_id")), 0))
-            if universe is not None and len(universe)
-            else 0,
+            "universe": _lookup_universe(universe, rec, keys),
             "strike_rate": None,
         }
     )

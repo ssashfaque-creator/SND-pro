@@ -13,7 +13,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from sndintel.briefing import GLOSSARY, build_strategy_pack, excel_bytes, html_bytes
+from sndintel.briefing import GLOSSARY, build_strategy_pack, excel_bytes, excel_bytes_detailed, html_bytes, html_bytes_detailed
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
@@ -256,7 +256,11 @@ def _page_strategy(data, latest, period, mtd, ledger):
         return
 
     cities = units[units["grain"] == "city"].copy()
-    if "isolated_mt" in cities.columns:
+    if "recoverable_mt" in cities.columns:
+        rec = pd.to_numeric(cities["isolated_mt"], errors="coerce").fillna(0).clip(upper=0).abs()
+        cities["recoverable_mt"] = rec
+        cities = cities.sort_values("recoverable_mt", ascending=False)
+    elif "isolated_mt" in cities.columns:
         cities = cities.sort_values("isolated_mt")
     else:
         cities = cities.sort_values("gap_mt")
@@ -367,15 +371,32 @@ def _page_strategy(data, latest, period, mtd, ledger):
             file_name=f"SND_strategy_{period}.html",
             mime="text/html",
         )
+    ddl, ddr = st.columns(2)
+    with ddl:
+        st.download_button(
+            "Download detailed pack (Excel)",
+            excel_bytes_detailed(pack),
+            file_name=f"SND_strategy_{period}_detailed.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with ddr:
+        st.download_button(
+            "Download detailed briefing (HTML → Print to PDF)",
+            html_bytes_detailed(pack),
+            file_name=f"SND_strategy_{period}_detailed.html",
+            mime="text/html",
+        )
     st.caption(
         "Excel is the working file (filters, one sheet per layer). "
-        "HTML opens in a browser — File → Print → Save as PDF for a board pack."
+        "HTML opens in a browser — File → Print → Save as PDF for a board pack. "
+        "Detailed pack = every city, every distributor and DSR with AMS > 0, and every shop with recoverable > 0.25 MT."
     )
 
     st.markdown("##### 1. The country — every city")
     st.caption(
-        "Start here. **Extra vs country** is the local problem after national weather. "
-        "**Recoverable** is that hole as a positive number. **AMS** is the average of the last three closed months."
+        "Start here. **Recoverable** is the local hole after national weather (highest first). "
+        "**From coverage** / **From drop size** split that hole. **AMS** is the average of the last three closed months. "
+        "Distributors and DSRs with AMS = 0 are hidden later in this report."
     )
     left, right = st.columns((1.4, 1))
     with left:
@@ -384,7 +405,12 @@ def _page_strategy(data, latest, period, mtd, ledger):
         else:
             chart = cities.head(16).copy()
             chart["city"] = chart["grain_id"]
-            ycol = "isolated_mt" if "isolated_mt" in chart.columns else "gap_mt"
+            if "recoverable_mt" in chart.columns:
+                ycol = "recoverable_mt"
+                ylab = "Recoverable (MT)"
+            else:
+                ycol = "isolated_mt" if "isolated_mt" in chart.columns else "gap_mt"
+                ylab = "Recoverable (MT)"
             color = "situation" if "situation" in chart.columns else "diagnosis"
             cmap = SITUATION_COLOR if color == "situation" else DIAGNOSIS_COLOR
             fig = px.bar(
@@ -393,14 +419,14 @@ def _page_strategy(data, latest, period, mtd, ledger):
                 y=ycol,
                 color=color,
                 color_discrete_map=cmap,
-                labels={ycol: "Extra vs country (MT)", "city": ""},
+                labels={ycol: ylab, "city": ""},
             )
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_tickangle=-30)
             fig.add_hline(y=0, line_color="#94a3b8", line_width=1)
             st.plotly_chart(fig, use_container_width=True)
         _strategy_table(pack.cities)
     with right:
-        st.markdown("**Why the extra hole**")
+        st.markdown("**Why the hole**")
         st.caption("Coverage = fewer billed doors. Drop size = smaller drops on the same doors. Mix = SKU shift.")
         lag = cities[cities["situation"] == "lagging"] if "situation" in cities.columns else cities.head(4)
         if lag.empty:
@@ -430,7 +456,7 @@ def _page_strategy(data, latest, period, mtd, ledger):
 
     st.markdown("##### 2. Lagging cities — distributors")
     st.caption(
-        "Only cities on the lagging list, broken by distributor. "
+        "Only cities on the lagging list, broken by distributor. AMS = 0 is hidden. "
         "These are the first calls — not every distributor in the country."
     )
     if pack.city_distributors.empty:
@@ -440,7 +466,7 @@ def _page_strategy(data, latest, period, mtd, ledger):
 
     st.markdown("##### 3. Those distributors — lagging shops")
     st.caption(
-        (pack.shop_note or "Visit-worthy doors only.")
+        (pack.shop_note or "Every shop with recoverable greater than 0.25 MT.")
         + " **Recoverable** is the volume you get back if the door merely matches the city."
     )
     if pack.city_distributor_shops.empty:
@@ -451,16 +477,16 @@ def _page_strategy(data, latest, period, mtd, ledger):
     st.markdown("##### 4. Every lagging distributor (all cities)")
     st.caption(
         "Distributors behind their own city even when the city moved with the country. "
-        "Section 2 only showed distributors in lagging cities."
+        "AMS = 0 is hidden. Section 2 only showed distributors in lagging cities."
     )
     _strategy_table(pack.lagging_distributors)
 
     st.markdown("##### 5. Every lagging DSR (all cities)")
-    st.caption("Salespeople behind their city. Ride-with this list.")
+    st.caption("Salespeople behind their city. AMS = 0 is hidden. Ride-with this list.")
     _strategy_table(pack.lagging_dsrs.head(60))
 
-    st.markdown("##### 6. Every lagging shop worth a visit")
-    st.caption(pack.shop_note or "Visit-worthy doors behind their city. Tiny kiryana is a coverage KPI, not this list.")
+    st.markdown("##### 6. Every lagging shop above 0.25 MT recoverable")
+    st.caption(pack.shop_note or "Every shop with recoverable greater than 0.25 MT. Shallower doors are the remainder line.")
     _strategy_table(pack.lagging_shops, height=420)
 
     with st.expander("How to read the columns", expanded=False):
