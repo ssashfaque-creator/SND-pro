@@ -134,7 +134,7 @@ def looks_like_store_id(value) -> bool:
         return False
     letters = sum(ch.isalpha() for ch in text)
     digits = sum(ch.isdigit() for ch in text)
-    return digits >= 6 and letters <= 4 and 6 <= len(text) <= 24
+    return digits >= 6 and letters <= 4 and 6 <= len(text) <= 32
 
 
 def looks_like_total(value) -> bool:

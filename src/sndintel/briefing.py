@@ -21,6 +21,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.worksheet import Worksheet
 
+from sndintel.coverage import attach_remarks, sibling_z_frame
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
 from sndintel.io_utils import shift_period
@@ -48,17 +49,19 @@ GLOSSARY = [
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month)."),
     ("Expected this month", "Warehouse-learned typical same calendar month (every August on file, not last year alone), paced if MTD is open."),
     ("Fair share of country / city", "This unit’s last-year mix × what the parent billed now. The volume it would have if it only moved with its parent."),
-    ("From coverage (MT)", "Volume change explained by fewer (or more) billed doors. Negative = lost outlets."),
-    ("From drop size (MT)", "Volume change explained by smaller (or larger) drops on continuing doors."),
     ("Recoverable", "The extra hole versus the parent, as a positive number — volume that comes back if this unit merely matched its parent."),
-    ("Shop Extra vs city", "On shop lists only: billed minus fair share of the city. Recoverable is that hole as a positive number."),
-    ("Shop lists", "Every door with recoverable greater than 0.25 MT. Shallower holes are one remainder line — coverage, not a visit list."),
+    ("From drop size (MT)", "On billed doors: this period’s volume minus that door’s AMS (or last year), paced if MTD is open. Negative = smaller drops."),
+    ("From unvisited shops (MT)", "Minus the AMS/LY opportunity of universe doors that were not called this period (visit count 0 and not billed)."),
+    ("From unbilled shops (MT)", "Minus the AMS/LY opportunity of doors that were visited (or, if no visit file, simply not billed) but did not buy."),
+    ("Remarks", "Trend vs AMS and YoY; visit coverage vs country (robust z); productivity (billed ÷ visited) vs country; drop size."),
+    ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
+    ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
+    ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
+    ("Shop lists", "Every door with recoverable greater than 0.25 MT. Shallower holes are one remainder line."),
     ("AMS = 0 distributors / DSRs", "Hidden everywhere in the report. No recent three-month run-rate, so they are not a call."),
     ("Situation: Lagging", "Worse than the parent’s current book. A city can be down with the country and *not* lagging."),
     ("Situation: With the country", "Moved in line with the parent. Weather, not a local fire."),
     ("Situation: Ahead", "Better than the parent’s current book."),
-    ("Main driver", "The identity that explains most of the hole: drop size, coverage (doors), whitespace, or mix."),
-    ("Strike %", "Billed shops ÷ universe shops on the master list."),
 ]
 
 SHOP_RECOVERABLE_FLOOR = 0.25
@@ -73,14 +76,17 @@ CITY_VIEW = [
     ("ly_mt", "Same month last year (MT)"),
     ("expected_mt", "Expected this month (MT)"),
     ("share_expected_mt", "Fair share of country (MT)"),
-    ("from_coverage_mt", "From coverage (MT)"),
-    ("from_drop_size_mt", "From drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
+    ("from_drop_size_mt", "From drop size (MT)"),
+    ("from_unvisited_mt", "From unvisited shops (MT)"),
+    ("from_unbilled_mt", "From unbilled shops (MT)"),
+    ("remarks", "Remarks"),
     ("situation_label", "Situation"),
-    ("driver_label", "Main driver"),
     ("billed", "Billed shops"),
+    ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
+    ("visit_pct", "Visit %"),
 ]
 
 DIST_IN_CITY_VIEW = [
@@ -91,14 +97,17 @@ DIST_IN_CITY_VIEW = [
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("share_expected_mt", "Fair share of this city (MT)"),
-    ("from_coverage_mt", "From coverage (MT)"),
-    ("from_drop_size_mt", "From drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
+    ("from_drop_size_mt", "From drop size (MT)"),
+    ("from_unvisited_mt", "From unvisited shops (MT)"),
+    ("from_unbilled_mt", "From unbilled shops (MT)"),
+    ("remarks", "Remarks"),
     ("situation_label", "Situation"),
-    ("driver_label", "Main driver"),
     ("billed", "Billed shops"),
+    ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
+    ("visit_pct", "Visit %"),
 ]
 
 DIST_ALL_VIEW = [
@@ -110,15 +119,17 @@ DIST_ALL_VIEW = [
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("share_expected_mt", "Fair share of its city (MT)"),
-    ("from_coverage_mt", "From coverage (MT)"),
-    ("from_drop_size_mt", "From drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
+    ("from_drop_size_mt", "From drop size (MT)"),
+    ("from_unvisited_mt", "From unvisited shops (MT)"),
+    ("from_unbilled_mt", "From unbilled shops (MT)"),
+    ("remarks", "Remarks"),
     ("situation_label", "Situation"),
-    ("driver_label", "Main driver"),
     ("billed", "Billed shops"),
+    ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
-    ("do_this_week", "What to do"),
+    ("visit_pct", "Visit %"),
 ]
 
 DSR_VIEW = [
@@ -129,15 +140,17 @@ DSR_VIEW = [
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("share_expected_mt", "Fair share of its city (MT)"),
-    ("from_coverage_mt", "From coverage (MT)"),
-    ("from_drop_size_mt", "From drop size (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
+    ("from_drop_size_mt", "From drop size (MT)"),
+    ("from_unvisited_mt", "From unvisited shops (MT)"),
+    ("from_unbilled_mt", "From unbilled shops (MT)"),
+    ("remarks", "Remarks"),
     ("situation_label", "Situation"),
-    ("driver_label", "Main driver"),
     ("billed", "Billed shops"),
+    ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
-    ("do_this_week", "What to do"),
+    ("visit_pct", "Visit %"),
 ]
 
 SHOP_VIEW = [
@@ -150,9 +163,9 @@ SHOP_VIEW = [
     ("ams_3m", "AMS last 3 months (MT)"),
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
-    ("fair_share_mt", "Fair share of its city (MT)"),
-    ("isolated_mt", "Extra vs city (MT)"),
     ("recoverable_mt", "Recoverable (MT)"),
+    ("visits", "Visits MTD"),
+    ("call_status", "Call"),
 ]
 
 
@@ -186,6 +199,7 @@ def build_strategy_pack(
     ledger: pd.DataFrame | None = None,
     national: dict[str, Any] | None = None,
     period: str | None = None,
+    visits: pd.DataFrame | None = None,
 ) -> StrategyPack:
     empty = StrategyPack(period=period or "", label=period or "")
     if units is None or units.empty:
@@ -224,6 +238,26 @@ def build_strategy_pack(
     dists = _sort_focus(dists)
     dsrs = _sort_focus(dsrs)
 
+    nat_grain = _grain(units, "national")
+    if not nat_grain.empty:
+        nat_grain = _attach_national_ams(nat_grain, shop_month, period, ledger, pace)
+        nat_grain["grain_id"] = "Country"
+        nat_grain["city"] = "Country"
+        nat_grain["zone"] = ""
+        nat_grain["situation_label"] = "Country"
+        nat_grain["share_expected_mt"] = nat_grain.get("expected_mt")
+        extra = kpis.get("extra_hole_mt")
+        if extra is not None:
+            nat_grain["recoverable_mt"] = abs(float(extra or 0))
+        nat_parent = _parent_stats(nat_grain.iloc[0])
+        nat_grain = attach_remarks(nat_grain, {}, None)
+    else:
+        nat_parent = {}
+
+    cities = attach_remarks(cities, nat_parent, sibling_z_frame(cities))
+    dists = attach_remarks(dists, nat_parent, sibling_z_frame(dists))
+    dsrs = attach_remarks(dsrs, nat_parent, sibling_z_frame(dsrs))
+
     lagging_cities = cities[cities["situation"] == "lagging"] if not cities.empty else cities
     lagging_city_names = [str(x) for x in lagging_cities["grain_id"].tolist()] if not lagging_cities.empty else []
 
@@ -239,6 +273,7 @@ def build_strategy_pack(
 
     shops = score_shops(shop_month, cities, period, pace)
     shops = _attach_ams(shops, shop_month, period, ["store_id"], ledger, pace)
+    shops = _attach_shop_calls(shops, visits, period)
     hole_floor = SHOP_RECOVERABLE_FLOOR
 
     city_dist_shops = pd.DataFrame()
@@ -282,7 +317,7 @@ def build_strategy_pack(
         problem=sit.get("problem") or "",
         action=sit.get("action") or sit.get("action_summary") or "",
         kpis=kpis,
-        cities=_present(cities, CITY_VIEW),
+        cities=_present_with_national(nat_grain, cities, CITY_VIEW),
         city_distributors=_present(city_dists, DIST_IN_CITY_VIEW),
         city_distributor_shops=_present_shops(city_dist_shops, city_dist_meta),
         lagging_distributors=_present(all_lag_dist, DIST_ALL_VIEW),
@@ -431,7 +466,7 @@ def write_excel(pack: StrategyPack, path: Path | str | BytesIO) -> None:
     _sheet_table(
         wb, "01 Country by city",
         "Every city versus the country",
-        "Recoverable is the local hole after national weather. From coverage / From drop size split that hole. Sorted highest recoverable first. Distributors and DSRs with AMS = 0 are not listed later in this pack.",
+        "Recoverable is the local hole after national weather. From drop size / unvisited / unbilled split that hole. Country row is first. Distributors and DSRs with AMS = 0 are hidden.",
         pack.cities, freeze="A2",
         bar_col="Recoverable (MT)", cat_col="City",
     )
@@ -515,7 +550,7 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
         _html_cover(pack, k, detailed=detailed),
         _html_section(
             "1. The country — every city",
-            "Recoverable is the local hole after national weather, highest first. From coverage / From drop size split that hole. Strike % = billed shops ÷ universe.",
+            "Recoverable is the local hole after national weather, highest first. From drop size / unvisited / unbilled split that hole. Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first.",
             pack.cities,
         ),
         _html_section(
@@ -596,7 +631,7 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
   th {{ background: var(--ink); color: white; text-align: left; padding: 6px 8px; font-weight: 600; }}
   td {{ border-bottom: 1px solid var(--line); padding: 5px 8px; vertical-align: top; }}
   tr.lagging td {{ background: #fef2f2; }}
-  tr.ahead td {{ background: #f0fdf4; }}
+  tr.country td {{ background: #e2e8f0; font-weight: 600; }}
   .note {{ font-size: 12px; color: var(--muted); margin: 0 0 8px; }}
   dl.glossary {{ font-size: 12px; line-height: 1.4; }}
   dl.glossary dt {{ font-weight: 700; margin-top: 8px; }}
@@ -622,14 +657,18 @@ def _grain(units: pd.DataFrame, grain: str) -> pd.DataFrame:
     if out.empty:
         return out
     out["recoverable_mt"] = pd.to_numeric(out.get("isolated_mt"), errors="coerce").fillna(0).clip(upper=0).abs()
-    out["from_coverage_mt"] = pd.to_numeric(out.get("coverage_effect_mt"), errors="coerce")
-    out["from_drop_size_mt"] = pd.to_numeric(out.get("velocity_effect_mt"), errors="coerce")
+    drop = pd.to_numeric(out.get("from_drop_size_mt"), errors="coerce")
+    if drop.isna().all():
+        drop = pd.to_numeric(out.get("velocity_effect_mt"), errors="coerce")
+    out["from_drop_size_mt"] = drop
+    out["from_unvisited_mt"] = pd.to_numeric(out.get("from_unvisited_mt"), errors="coerce")
+    out["from_unbilled_mt"] = pd.to_numeric(out.get("from_unbilled_mt"), errors="coerce")
     sit = out["situation"] if "situation" in out.columns else pd.Series("", index=out.index)
     out["situation_label"] = sit.map(SITUATION_LABEL).fillna(sit)
-    diag = out["diagnosis"] if "diagnosis" in out.columns else pd.Series("", index=out.index)
-    out["driver_label"] = diag.map(DRIVER_LABEL).fillna(diag.astype(str).str.replace("_", " "))
     strike = pd.to_numeric(out.get("strike_rate"), errors="coerce")
     out["strike_pct"] = strike * 100
+    visit = pd.to_numeric(out.get("visit_rate"), errors="coerce")
+    out["visit_pct"] = visit * 100
     return out
 
 
@@ -695,6 +734,83 @@ def _present(df: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
         data[label] = df[src] if src in df.columns else pd.NA
     out = pd.DataFrame(data)[cols]
     return out.reset_index(drop=True)
+
+
+def _present_with_national(nat: pd.DataFrame, cities: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
+    city_tbl = _present(cities, view)
+    if nat is None or nat.empty:
+        return city_tbl
+    nat_tbl = _present(nat, view)
+    return pd.concat([nat_tbl, city_tbl], ignore_index=True)
+
+
+def _attach_national_ams(
+    nat: pd.DataFrame,
+    shop_month: pd.DataFrame,
+    period: str,
+    ledger: pd.DataFrame | None,
+    pace: float,
+) -> pd.DataFrame:
+    out = nat.copy()
+    if shop_month is None or shop_month.empty or not period:
+        out["ams_3m"] = pd.NA
+        out["vs_ams_mt"] = pd.NA
+        return out
+    hist = shop_month[shop_month["period"].astype(str) != str(period)].copy()
+    if ledger is not None and not ledger.empty and "status" in ledger.columns:
+        closed = set(ledger.loc[ledger["status"].astype(str) == "closed", "period"].astype(str))
+        if closed:
+            hist = hist[hist["period"].astype(str).isin(closed)]
+    if hist.empty:
+        out["ams_3m"] = pd.NA
+        out["vs_ams_mt"] = pd.NA
+        return out
+    g = hist.groupby("period")["volume_mt"].sum().sort_index().tail(3)
+    ams = float(g.mean()) if len(g) else None
+    out["ams_3m"] = ams
+    vol = pd.to_numeric(out.get("volume_mt"), errors="coerce")
+    out["vs_ams_mt"] = vol - (ams * float(pace or 1.0) if ams is not None else 0.0)
+    return out
+
+
+def _parent_stats(row: pd.Series) -> dict[str, Any]:
+    vol = pd.to_numeric(row.get("volume_mt"), errors="coerce")
+    ly = pd.to_numeric(row.get("ly_mt"), errors="coerce")
+    yoy = None
+    if pd.notna(ly) and float(ly) > 1e-9 and pd.notna(vol):
+        yoy = 100.0 * (float(vol) - float(ly)) / float(ly)
+    return {
+        "visit_rate": pd.to_numeric(row.get("visit_rate"), errors="coerce"),
+        "productivity": pd.to_numeric(row.get("productivity"), errors="coerce"),
+        "yoy_pct": yoy,
+    }
+
+
+def _attach_shop_calls(shops: pd.DataFrame, visits: pd.DataFrame | None, period: str) -> pd.DataFrame:
+    if shops is None or shops.empty:
+        return shops
+    out = shops.copy()
+    out["visits"] = 0
+    billed = pd.to_numeric(out.get("volume_mt"), errors="coerce").fillna(0) > 0
+    if visits is not None and not visits.empty and "store_id" in visits.columns:
+        v = visits.copy()
+        v["store_id"] = v["store_id"].astype(str)
+        if "period" in v.columns:
+            v = v[v["period"].astype(str) == str(period)]
+        if not v.empty:
+            g = v.groupby("store_id", as_index=False)["visits"].sum()
+            out["store_id"] = out["store_id"].astype(str)
+            out = out.merge(g, on="store_id", how="left", suffixes=("", "_v"))
+            if "visits_v" in out.columns:
+                out["visits"] = pd.to_numeric(out["visits_v"], errors="coerce").fillna(0)
+                out = out.drop(columns=["visits_v"])
+            else:
+                out["visits"] = pd.to_numeric(out.get("visits"), errors="coerce").fillna(0)
+    visited = (pd.to_numeric(out["visits"], errors="coerce").fillna(0) > 0) | billed
+    out["call_status"] = pd.Series("Unvisited", index=out.index)
+    out.loc[visited & ~billed, "call_status"] = "Visited · not billed"
+    out.loc[billed, "call_status"] = "Billed"
+    return out
 
 
 def _situation_row(situation: pd.DataFrame | None, national: dict | None, nat_row) -> dict[str, Any]:
@@ -899,8 +1015,8 @@ def _sheet_table(
     headers = list(df.columns)
     for i, name in enumerate(headers, start=1):
         width = min(max(len(str(name)) + 2, 12), 28)
-        if name in {"What to do", "Shop"}:
-            width = 32
+        if name in {"What to do", "Shop", "Remarks"}:
+            width = 48
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.auto_filter.ref = f"A{start}:{get_column_letter(len(headers))}{start + len(df)}"
     ws.freeze_panes = f"A{start + 1}"
@@ -1044,6 +1160,8 @@ def _df_html(df: pd.DataFrame) -> str:
                 klass = "lagging"
             elif sit == "Ahead":
                 klass = "ahead"
+            elif sit == "Country":
+                klass = "country"
         tds = "".join(f"<td>{html.escape(_html_cell(row[c], c))}</td>" for c in df.columns)
         body.append(f"<tr class='{klass}'>{tds}</tr>")
     return f"<table><thead><tr>{heads}</tr></thead><tbody>{''.join(body)}</tbody></table>"

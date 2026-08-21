@@ -40,13 +40,13 @@ def _save_upload(file, dest: Path) -> Path:
     return dest
 
 
-def _remember_shop(path: Path) -> None:
+def _remember(kind: str, path: Path) -> None:
     MASTER_DIR.mkdir(parents=True, exist_ok=True)
-    (MASTER_DIR / "last_shop.json").write_text(json.dumps({"path": str(path)}), encoding="utf-8")
+    (MASTER_DIR / f"last_{kind}.json").write_text(json.dumps({"path": str(path)}), encoding="utf-8")
 
 
-def _last_shop() -> Path | None:
-    marker = MASTER_DIR / "last_shop.json"
+def _last(kind: str) -> Path | None:
+    marker = MASTER_DIR / f"last_{kind}.json"
     if not marker.exists():
         return None
     try:
@@ -54,6 +54,14 @@ def _last_shop() -> Path | None:
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
     return path if path.exists() else None
+
+
+def _remember_shop(path: Path) -> None:
+    _remember("shop", path)
+
+
+def _last_shop() -> Path | None:
+    return _last("shop")
 
 
 @st.cache_data(ttl=15)
@@ -92,6 +100,10 @@ def load_all():
             data["seasonality"] = read_sql(conn, "SELECT * FROM seasonality_index")
         except Exception:
             data["seasonality"] = pd.DataFrame()
+        try:
+            data["visits"] = read_sql(conn, "SELECT * FROM shop_visits")
+        except Exception:
+            data["visits"] = pd.DataFrame()
     return data
 
 
@@ -172,52 +184,83 @@ def main():
 def _page_upload(empty: bool):
     st.title("Upload files")
     st.caption(
-        "Shop list = outlet universe. Sales file = Shop SKU Wise SSRS extract (CSV or Excel). "
-        "A new file replaces only the months it contains. July stays when you upload August."
+        "POP code is the shop. Names, DSR, distributor, and city change — the **Universe shop list** is the live book. "
+        "Sales history of POPs not on that list is ignored. Visit calls land weekly with the sales extract."
     )
     if empty:
-        st.warning("No warehouse yet. Upload the shop list once, then the sales extract (full history or current MTD).")
+        st.warning("No warehouse yet. Upload the universe list and a sales extract. Visit calls can come with the sales file.")
     else:
-        st.success("Warehouse already has history. You can upload **sales only** for the latest month.")
+        st.success("Warehouse already has history. Typical week: **sales + visit calls**. Re-upload universe when the active book changes.")
 
-    last = _last_shop()
+    last_uni = _last("universe")
+    last_shop = _last_shop()
+    last_vis = _last("visits")
     c1, c2 = st.columns(2)
     with c1:
-        shops = st.file_uploader("Shop list (xlsx / csv)", type=["xlsx", "xls", "xlsm", "csv"], key="shops")
-        if last and shops is None:
-            st.caption(f"Using saved universe: `{last.name}`")
+        universe = st.file_uploader(
+            "Universe shop list (xlsx) — live distributors, DSRs, shops",
+            type=["xlsx", "xls", "xlsm", "csv"],
+            key="universe",
+        )
+        if last_uni and universe is None:
+            st.caption(f"Using saved universe: `{last_uni.name}`")
+        shops = st.file_uploader(
+            "Legacy shop list (optional — zone / historical map)",
+            type=["xlsx", "xls", "xlsm", "csv"],
+            key="shops",
+        )
+        if last_shop and shops is None:
+            st.caption(f"Saved legacy master: `{last_shop.name}`")
     with c2:
         sales = st.file_uploader("Sales extract (xlsx / csv)", type=["xlsx", "xls", "xlsm", "csv"], key="sales")
+        visits = st.file_uploader(
+            "Shop visit calls (csv / xlsx) — MTD visits, weekly with sales",
+            type=["xlsx", "xls", "xlsm", "csv"],
+            key="visits",
+        )
+        if last_vis and visits is None:
+            st.caption(f"Last visit file: `{last_vis.name}` (re-upload each week)")
 
     st.markdown(
-        "- First time: shop list **and** the full history extract (or the Drive sample).\n"
-        "- Every later month: **sales only**. August MTD grows; closed months do not change.\n"
-        "- Re-upload the shop list only when the universe changed (new DSR, new area)."
+        "- **Universe** columns: distributor, area/city, section, DSR, POP code, POP name. Merged cells are filled down.\n"
+        "- First time: universe **and** sales. Optional legacy shop list fills **zone**.\n"
+        "- Every later week: **sales + visit calls**. Closed months stay. Re-upload universe when shops/DSRs move."
     )
-    go = st.button("Score warehouse", type="primary", disabled=sales is None)
+    go = st.button("Score warehouse", type="primary", disabled=sales is None and empty)
     if not go:
         return
-    if sales is None:
-        st.error("Sales file is required.")
-        return
-    shop_path = last
+    universe_path = last_uni
+    if universe is not None:
+        universe_path = _save_upload(universe, MASTER_DIR / universe.name)
+        _remember("universe", universe_path)
+    shop_path = last_shop
     if shops is not None:
         shop_path = _save_upload(shops, MASTER_DIR / shops.name)
         _remember_shop(shop_path)
-    elif shop_path is None:
-        st.error("No shop list on file yet. Upload it once.")
+    if empty and universe_path is None and shop_path is None:
+        st.error("Upload the universe shop list (or a legacy shop list) once.")
         return
-    sales_path = _save_upload(sales, INCOMING_DIR / sales.name)
-    with st.spinner("Parsing the extract and rebuilding city → distributor → DSR → shop scorecards. Large files take a few minutes."):
+    sales_path = _save_upload(sales, INCOMING_DIR / sales.name) if sales is not None else None
+    visits_path = None
+    if visits is not None:
+        visits_path = _save_upload(visits, INCOMING_DIR / visits.name)
+        _remember("visits", visits_path)
+    with st.spinner("Parsing files and rebuilding city → distributor → DSR → shop scorecards. Large files take a few minutes."):
         try:
-            result = run_pipeline(sales_path, shop_path=shop_path)
-        except Exception as exc:  # noqa: BLE001 — show parse errors in the UI
+            result = run_pipeline(
+                sales_path,
+                shop_path=shop_path,
+                universe_path=universe_path,
+                visits_path=visits_path,
+            )
+        except Exception as exc:  # noqa: BLE001
             st.exception(exc)
             return
     st.cache_data.clear()
     st.success(
         f"Scored {result.get('n_sales_rows')} fact rows · latest {result.get('latest_period')} · "
-        f"{result.get('n_cities', 0)} cities · {result.get('n_targets', 0)} named targets. "
+        f"{result.get('n_cities', 0)} cities · universe {result.get('n_universe') or '—'} · "
+        f"visits {result.get('n_visits') or '—'}. "
         f"Replaced months: {', '.join(result.get('replaced_periods') or []) or '—'}"
     )
     if result.get("open_mtd_period"):
@@ -354,6 +397,7 @@ def _page_strategy(data, latest, period, mtd, ledger):
         situation=sit_df,
         ledger=ledger,
         period=period,
+        visits=data.get("visits", pd.DataFrame()),
     )
     cdl, cdr = st.columns(2)
     with cdl:
@@ -394,9 +438,9 @@ def _page_strategy(data, latest, period, mtd, ledger):
 
     st.markdown("##### 1. The country — every city")
     st.caption(
-        "Start here. **Recoverable** is the local hole after national weather (highest first). "
-        "**From coverage** / **From drop size** split that hole. **AMS** is the average of the last three closed months. "
-        "Distributors and DSRs with AMS = 0 are hidden later in this report."
+        "Start here. The first row is the **country**. **Recoverable** is the local hole after national weather. "
+        "**From drop size / unvisited / unbilled** split that hole. **Remarks** compare trend, visit coverage, "
+        "productivity, and drop size to the country. Distributors and DSRs with AMS = 0 are hidden later."
     )
     left, right = st.columns((1.4, 1))
     with left:

@@ -12,6 +12,8 @@ from sndintel.config import DATA_DIR, DB_PATH, PROCESSED_DIR, ensure_dirs
 from sndintel.features import add_calendar_panel, build_features, latest_period, rebuild_shop_month
 from sndintel.ingest.shops import parse_shop_master
 from sndintel.ingest.ssrs import parse_sales_file
+from sndintel.ingest.universe import fill_zone_from_legacy, parse_universe
+from sndintel.ingest.visits import parse_visit_calls
 from sndintel.hierarchy import HierarchyPack, build_hierarchy_pack, plays_from_pack
 from sndintel.insights import compile_insights
 from sndintel.models import cluster_shops, detect_anomalies, forecast_shop_month
@@ -27,21 +29,37 @@ from sndintel.storage import (
 
 
 def run_pipeline(
-    sales_path: str | Path,
+    sales_path: Optional[str | Path] = None,
     shop_path: Optional[str | Path] = None,
+    universe_path: Optional[str | Path] = None,
+    visits_path: Optional[str | Path] = None,
     db_path: Optional[str | Path] = None,
 ) -> dict:
+    """Ingest sales (optional if warehouse already has facts), live universe, visits, then rescore."""
     ensure_dirs()
     db_path = Path(db_path or DB_PATH)
     init_db(db_path)
-    sales_path = Path(sales_path)
     started = utcnow()
+    sales_path = Path(sales_path) if sales_path else None
+    shop_path = Path(shop_path) if shop_path else None
+    universe_path = Path(universe_path) if universe_path else None
+    visits_path = Path(visits_path) if visits_path else None
 
-    sales, sales_report = parse_sales_file(sales_path)
+    sales, sales_report = (pd.DataFrame(), None)
+    if sales_path:
+        sales, sales_report = parse_sales_file(sales_path)
     shops = pd.DataFrame()
     shop_report = None
     if shop_path:
         shops, shop_report = parse_shop_master(shop_path)
+    universe = pd.DataFrame()
+    universe_report = None
+    if universe_path:
+        universe, universe_report = parse_universe(universe_path)
+    visits = pd.DataFrame()
+    visit_report = None
+    if visits_path:
+        visits, visit_report = parse_visit_calls(visits_path)
 
     touched_periods: list[str] = []
     open_period: Optional[str] = None
@@ -51,38 +69,32 @@ def run_pipeline(
         cur = conn.execute(
             """INSERT INTO pipeline_runs (started_at, status, sales_file, shop_file)
                VALUES (?, 'running', ?, ?)""",
-            (started, str(sales_path), str(shop_path) if shop_path else None),
+            (
+                started,
+                str(sales_path) if sales_path else None,
+                str(universe_path or shop_path) if (universe_path or shop_path) else None,
+            ),
         )
         run_id = int(cur.lastrowid)
 
-        if not shops.empty:
-            store_rows = shops.copy()
+        existing_stores = read_sql(conn, "SELECT * FROM stores")
+        legacy_for_zone = shops if not shops.empty else existing_stores
+        if not universe.empty:
+            universe = fill_zone_from_legacy(universe, legacy_for_zone)
+            conn.execute("UPDATE stores SET in_universe = 0")
+            store_rows = universe.copy()
             store_rows["in_universe"] = 1
+            store_rows["source"] = "universe"
             store_rows["extra_json"] = None
             store_rows["updated_at"] = utcnow()
-            upsert_dataframe(
-                conn,
-                "stores",
-                store_rows[
-                    [
-                        "store_id",
-                        "store_name",
-                        "distributor",
-                        "dsr_name",
-                        "zone",
-                        "city",
-                        "section",
-                        "category_1",
-                        "category_2",
-                        "category_3",
-                        "category_4",
-                        "in_universe",
-                        "extra_json",
-                        "updated_at",
-                    ]
-                ],
-                ["store_id"],
-            )
+            _upsert_stores(conn, store_rows)
+        elif not shops.empty:
+            store_rows = shops.copy()
+            store_rows["in_universe"] = 1
+            store_rows["source"] = "legacy_master"
+            store_rows["extra_json"] = None
+            store_rows["updated_at"] = utcnow()
+            _upsert_stores(conn, store_rows)
 
         if not sales.empty:
             discovered = (
@@ -94,44 +106,24 @@ def run_pipeline(
                     section=("section", "last"),
                 )
             )
-            existing = set(read_sql(conn, "SELECT store_id FROM stores")["store_id"])
-            new_ids = discovered[~discovered["store_id"].isin(existing)].copy()
-            if not new_ids.empty:
+            existing = set(read_sql(conn, "SELECT store_id FROM stores")["store_id"].astype(str))
+            live = read_sql(conn, "SELECT store_id FROM stores WHERE in_universe = 1")
+            has_universe = not live.empty
+            new_ids = discovered[~discovered["store_id"].astype(str).isin(existing)].copy()
+            if not new_ids.empty and not has_universe:
                 for col in ("zone", "city", "category_1", "category_2", "category_3", "category_4"):
                     new_ids[col] = None
                 new_ids["in_universe"] = 0
+                new_ids["source"] = "sales"
                 new_ids["extra_json"] = None
                 new_ids["updated_at"] = utcnow()
-                upsert_dataframe(
-                    conn,
-                    "stores",
-                    new_ids[
-                        [
-                            "store_id",
-                            "store_name",
-                            "distributor",
-                            "dsr_name",
-                            "zone",
-                            "city",
-                            "section",
-                            "category_1",
-                            "category_2",
-                            "category_3",
-                            "category_4",
-                            "in_universe",
-                            "extra_json",
-                            "updated_at",
-                        ]
-                    ],
-                    ["store_id"],
-                )
+                _upsert_stores(conn, new_ids)
 
             facts = sales.copy()
             facts["source_file"] = sales_path.name
             facts["ingested_at"] = utcnow()
             touched_periods = sorted(facts["period"].dropna().unique().tolist())
             # Snapshot replace: the extract is the new truth for every month it contains.
-            # An August-only file updates August MTD and leaves July (and older) untouched.
             if touched_periods:
                 placeholders = ", ".join("?" * len(touched_periods))
                 conn.execute(
@@ -159,7 +151,7 @@ def run_pipeline(
                 ],
                 ["store_id", "sku", "period"],
             )
-            execution = parse_execution_date(sales_report.params)
+            execution = parse_execution_date(sales_report.params if sales_report else None)
             open_period = open_mtd_period(touched_periods, execution)
             for per in touched_periods:
                 part = facts[facts["period"] == per]
@@ -218,6 +210,50 @@ def run_pipeline(
                         ),
                     )
 
+        if not visits.empty:
+            if visits["period"].isna().all() or (visits["period"].astype(str) == "None").all():
+                fallback = open_period or (max(touched_periods) if touched_periods else None)
+                if not fallback:
+                    sm_p = read_sql(conn, "SELECT MAX(period) AS p FROM shop_month")
+                    fallback = str(sm_p.iloc[0]["p"]) if not sm_p.empty and sm_p.iloc[0]["p"] else None
+                if fallback:
+                    visits["period"] = fallback
+                    if visit_report is not None:
+                        visit_report.warnings.append(f"Visit period set to {fallback} from sales/warehouse")
+            vis_periods = sorted(visits["period"].dropna().astype(str).unique().tolist())
+            if vis_periods:
+                placeholders = ", ".join("?" * len(vis_periods))
+                conn.execute(
+                    f"DELETE FROM shop_visits WHERE period IN ({placeholders})",
+                    tuple(vis_periods),
+                )
+            vis_rows = visits.copy()
+            vis_rows["source_file"] = visits_path.name if visits_path else None
+            vis_rows["ingested_at"] = utcnow()
+            upsert_dataframe(
+                conn,
+                "shop_visits",
+                vis_rows[
+                    [
+                        c
+                        for c in [
+                            "store_id",
+                            "period",
+                            "visits",
+                            "distributor",
+                            "dsr_name",
+                            "city",
+                            "section",
+                            "store_name",
+                            "source_file",
+                            "ingested_at",
+                        ]
+                        if c in vis_rows.columns
+                    ]
+                ],
+                ["store_id", "period"],
+            )
+
         scored = _rebuild_intelligence(conn, run_id)
         period = scored["latest_period"]
         facts_df = scored["_facts"]
@@ -228,22 +264,32 @@ def run_pipeline(
         pack = scored["_pack"]
 
         PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = started.replace(":", "").replace("-", "")
-        dest = PROCESSED_DIR / f"{stamp}_{sales_path.name}"
-        try:
-            Path(dest).write_bytes(Path(sales_path).read_bytes())
-        except OSError:
-            dest = None
+        dest = None
+        if sales_path is not None:
+            stamp = started.replace(":", "").replace("-", "")
+            dest = PROCESSED_DIR / f"{stamp}_{sales_path.name}"
+            try:
+                Path(dest).write_bytes(Path(sales_path).read_bytes())
+            except OSError:
+                dest = None
 
         notes = {
-            "sales_strategy": sales_report.strategy,
-            "sales_clean_rows": sales_report.n_clean_rows,
-            "sales_warnings": sales_report.warnings,
+            "sales_strategy": sales_report.strategy if sales_report else None,
+            "sales_clean_rows": sales_report.n_clean_rows if sales_report else None,
+            "sales_warnings": sales_report.warnings if sales_report else [],
             "shop_strategy": shop_report.strategy if shop_report else None,
             "shop_clean_rows": shop_report.n_clean_rows if shop_report else None,
+            "universe_strategy": universe_report.strategy if universe_report else None,
+            "universe_clean_rows": universe_report.n_clean_rows if universe_report else None,
+            "visit_strategy": visit_report.strategy if visit_report else None,
+            "visit_clean_rows": visit_report.n_clean_rows if visit_report else None,
             "replaced_periods": touched_periods,
             "open_mtd_period": open_period,
         }
+        warnings = []
+        for rep in (sales_report, shop_report, universe_report, visit_report):
+            if rep is not None:
+                warnings.extend(rep.warnings or [])
         conn.execute(
             """UPDATE pipeline_runs
                SET finished_at=?, status=?, n_sales_rows=?, n_stores=?, latest_period=?, notes=?
@@ -267,14 +313,16 @@ def run_pipeline(
         "n_stores": int(len(stores_df)),
         "n_insights": int(len(insights)) if insights is not None else 0,
         "n_anomalies": int(len(anomalies)) if anomalies is not None else 0,
-        "parser": sales_report.strategy,
+        "parser": (sales_report.strategy if sales_report else None) or (universe_report.strategy if universe_report else "rescore"),
         "processed_copy": str(dest) if dest else None,
-        "warnings": sales_report.warnings,
+        "warnings": warnings,
         "replaced_periods": touched_periods,
         "open_mtd_period": open_period,
         "n_plays": int(len(plays)) if plays is not None else 0,
         "n_cities": int(pack.national.get("n_cities") or 0) if pack is not None else 0,
         "n_targets": int(len(pack.targets)) if pack is not None and pack.targets is not None else 0,
+        "n_universe": int(universe_report.n_clean_rows) if universe_report else None,
+        "n_visits": int(visit_report.n_clean_rows) if visit_report else None,
         "data_dir": str(DATA_DIR),
     }
 
@@ -296,10 +344,57 @@ SHOP_MONTH_COLS = [
 ]
 
 
+STORE_UPSERT_COLS = [
+    "store_id",
+    "store_name",
+    "distributor",
+    "dsr_name",
+    "zone",
+    "city",
+    "section",
+    "category_1",
+    "category_2",
+    "category_3",
+    "category_4",
+    "in_universe",
+    "source",
+    "extra_json",
+    "updated_at",
+]
+
+
+def _upsert_stores(conn, store_rows: pd.DataFrame) -> None:
+    if store_rows is None or store_rows.empty:
+        return
+    work = store_rows.copy()
+    for col in STORE_UPSERT_COLS:
+        if col not in work.columns:
+            work[col] = None if col not in {"in_universe"} else 1
+    upsert_dataframe(conn, "stores", work[STORE_UPSERT_COLS], ["store_id"])
+
+
+def _active_universe(stores_df: pd.DataFrame) -> pd.DataFrame:
+    if stores_df is None or stores_df.empty:
+        return stores_df if stores_df is not None else pd.DataFrame()
+    if "in_universe" in stores_df.columns and (stores_df["in_universe"] == 1).any():
+        return stores_df[stores_df["in_universe"] == 1].copy()
+    return stores_df
+
+
 def _rebuild_intelligence(conn, run_id: int) -> dict:
     """Rebuild features, insights, and the city→shop hierarchy from warehouse facts."""
-    stores_df = read_sql(conn, "SELECT * FROM stores")
-    facts_df = read_sql(conn, "SELECT * FROM sales_facts")
+    stores_all = read_sql(conn, "SELECT * FROM stores")
+    facts_all = read_sql(conn, "SELECT * FROM sales_facts")
+    stores_df = _active_universe(stores_all)
+    facts_df = facts_all
+    if stores_df is not None and not stores_df.empty and stores_all is not None and len(stores_df) < len(stores_all):
+        ids = set(stores_df["store_id"].astype(str))
+        if not facts_all.empty:
+            facts_df = facts_all[facts_all["store_id"].astype(str).isin(ids)].copy()
+    try:
+        visits_df = read_sql(conn, "SELECT * FROM shop_visits")
+    except Exception:
+        visits_df = pd.DataFrame()
     shop_month = rebuild_shop_month(facts_df, stores_df)
     shop_month = add_calendar_panel(shop_month, stores_df)
     if not shop_month.empty:
@@ -353,6 +448,7 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
         ledger,
         facts=facts_df,
         mtd_obs=read_sql(conn, "SELECT * FROM mtd_observations"),
+        visits=visits_df,
     )
     replace_table(conn, "unit_scorecards", pack.units)
     replace_table(conn, "focus_targets", pack.targets)

@@ -97,12 +97,18 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "City" in cities.columns
     assert "AMS last 3 months (MT)" in cities.columns
     assert "Recoverable (MT)" in cities.columns
-    assert "From coverage (MT)" in cities.columns
     assert "From drop size (MT)" in cities.columns
+    assert "From unvisited shops (MT)" in cities.columns
+    assert "From unbilled shops (MT)" in cities.columns
+    assert "Remarks" in cities.columns
+    assert "Main driver" not in cities.columns
+    assert "From coverage (MT)" not in cities.columns
     assert "Extra vs country (MT)" not in cities.columns
-    rec = cities["Recoverable (MT)"].tolist()
+    assert cities.iloc[0]["City"] == "Country"
+    body = cities[cities["City"] != "Country"]
+    rec = body["Recoverable (MT)"].tolist()
     assert rec == sorted(rec, reverse=True)
-    khi = cities[cities["City"] == "Karachi"].iloc[0]
+    khi = body[body["City"] == "Karachi"].iloc[0]
     assert khi["Situation"] == "Lagging"
     assert float(khi["Recoverable (MT)"]) > 0
     # Drill-down distributors only in lagging cities → Karachi, not Lahore.
@@ -118,7 +124,8 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "Billed shops" in report.lagging_distributors.columns
     assert "Strike %" in report.lagging_distributors.columns
     assert "Universe" in report.lagging_distributors.columns
-    assert "From coverage (MT)" in report.lagging_dsrs.columns
+    assert "From drop size (MT)" in report.lagging_dsrs.columns
+    assert "Remarks" in report.lagging_dsrs.columns
     assert "Strike %" in report.lagging_dsrs.columns
     assert "Ghost DSR" not in set(report.lagging_dsrs["DSR"].astype(str))
     assert "Ghost Dist" not in set(report.all_distributors["Distributor"].astype(str))

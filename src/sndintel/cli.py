@@ -32,11 +32,15 @@ def _version(version: bool = typer.Option(False, "--version", help="Show version
 
 @app.command()
 def ingest(
-    sales: Path = typer.Argument(..., exists=True, help="SSRS Shop SKU Wise Execution Report (xlsx/csv)"),
-    shops: Optional[Path] = typer.Option(None, "--shops", exists=True, help="Outlet universe / shop master"),
+    sales: Optional[Path] = typer.Argument(None, help="SSRS Shop SKU Wise Execution Report (xlsx/csv)"),
+    shops: Optional[Path] = typer.Option(None, "--shops", exists=True, help="Legacy shop master (zone / historical map)"),
+    universe: Optional[Path] = typer.Option(None, "--universe", exists=True, help="Live universe shop list"),
+    visits: Optional[Path] = typer.Option(None, "--visits", exists=True, help="Shop visit calls (MTD)"),
 ):
-    """Clean a sales export, merge the shop list, train models, and write insights."""
-    result = run_pipeline(sales, shop_path=shops)
+    """Clean a sales export, merge the live universe and visits, and write insights."""
+    if sales is None and universe is None and visits is None and shops is None:
+        raise typer.BadParameter("Pass a sales file and/or --universe / --visits / --shops.")
+    result = run_pipeline(sales, shop_path=shops, universe_path=universe, visits_path=visits)
     console.print_json(data=result)
 
 
@@ -222,11 +226,15 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
         except Exception:
             situation = pd.DataFrame()
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
+        try:
+            visits = read_sql(conn, "SELECT * FROM shop_visits")
+        except Exception:
+            visits = pd.DataFrame()
     from sndintel.briefing import build_strategy_pack, write_excel, write_excel_detailed, write_html
     from sndintel.features import latest_period
 
     period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
-    pack = build_strategy_pack(units, shop_month, situation=situation, ledger=ledger, period=period)
+    pack = build_strategy_pack(units, shop_month, situation=situation, ledger=ledger, period=period, visits=visits)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_excel(pack, path)

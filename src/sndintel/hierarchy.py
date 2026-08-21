@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from sndintel.config import MIN_MATERIAL_MT
+from sndintel.coverage import attach_coverage_split, build_coverage_book
 from sndintel.features import latest_period
 from sndintel.io_utils import shift_period
 from sndintel.isolate import (
@@ -92,6 +93,15 @@ UNIT_COLUMNS = [
     "seasonal_typical_mt",
     "situation",
     "metrics_json",
+    "visited",
+    "visit_rate",
+    "productivity",
+    "from_unvisited_mt",
+    "from_unbilled_mt",
+    "from_drop_size_mt",
+    "visits",
+    "opportunity_mt",
+    "has_visit_file",
 ]
 
 TARGET_COLUMNS = [
@@ -137,6 +147,7 @@ def build_hierarchy_pack(
     ledger: pd.DataFrame | None = None,
     facts: pd.DataFrame | None = None,
     mtd_obs: pd.DataFrame | None = None,
+    visits: pd.DataFrame | None = None,
 ) -> HierarchyPack:
     period = latest_period(shop_month)
     if not period or shop_month is None or shop_month.empty:
@@ -264,6 +275,8 @@ def build_hierarchy_pack(
         sort=False,
     )
     units["period"] = period
+    book = build_coverage_book(stores, sm, visits, period, pace=pace, ledger=ledger)
+    units = attach_coverage_split(units, book)
     units = _fit_unit_columns(units)
 
     targets = _focus_targets(

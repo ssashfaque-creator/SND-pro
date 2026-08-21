@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS stores (
     category_3 TEXT,
     category_4 TEXT,
     in_universe INTEGER DEFAULT 1,
+    source TEXT,
     extra_json TEXT,
     updated_at TEXT
 );
@@ -66,6 +67,22 @@ CREATE INDEX IF NOT EXISTS idx_sales_period ON sales_facts(period);
 CREATE INDEX IF NOT EXISTS idx_sales_store ON sales_facts(store_id);
 CREATE INDEX IF NOT EXISTS idx_sales_section ON sales_facts(section);
 CREATE INDEX IF NOT EXISTS idx_sales_sku ON sales_facts(sku);
+
+CREATE TABLE IF NOT EXISTS shop_visits (
+    store_id TEXT NOT NULL,
+    period TEXT NOT NULL,
+    visits INTEGER NOT NULL DEFAULT 0,
+    distributor TEXT,
+    dsr_name TEXT,
+    city TEXT,
+    section TEXT,
+    store_name TEXT,
+    source_file TEXT,
+    ingested_at TEXT,
+    PRIMARY KEY (store_id, period)
+);
+
+CREATE INDEX IF NOT EXISTS idx_visits_period ON shop_visits(period);
 
 CREATE TABLE IF NOT EXISTS shop_month (
     store_id TEXT NOT NULL,
@@ -397,8 +414,18 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("seasonal_index", "REAL"),
             ("seasonal_typical_mt", "REAL"),
             ("situation", "TEXT"),
+            ("visited", "INTEGER"),
+            ("visit_rate", "REAL"),
+            ("productivity", "REAL"),
+            ("from_unvisited_mt", "REAL"),
+            ("from_unbilled_mt", "REAL"),
+            ("from_drop_size_mt", "REAL"),
+            ("visits", "REAL"),
+            ("opportunity_mt", "REAL"),
+            ("has_visit_file", "INTEGER"),
         ):
             _ensure_column(conn, "unit_scorecards", col, ddl)
+        _ensure_column(conn, "stores", "source", "TEXT")
         for col, ddl in (
             ("competitive_mt", "REAL"),
             ("isolated_mt", "REAL"),
