@@ -1235,25 +1235,8 @@ def _sheet_cover(wb: Workbook, pack: StrategyPack, detailed: bool = False) -> Wo
     ws.merge_cells("A11:H12")
     ws["A11"].alignment = Alignment(wrap_text=True, vertical="top")
 
-    k = pack.kpis
-    labels = [
-        ("Billed (MT)", k.get("billed_mt"), "0"),
-        ("Expected (MT)", k.get("expected_mt"), "0"),
-        ("Gap vs expected (MT)", k.get("gap_mt"), "+0;-0;0"),
-        ("Extra hole after weather (MT)", k.get("extra_hole_mt"), "+0;-0;0"),
-        ("Lagging cities", k.get("n_lagging_cities"), "0"),
-    ]
-    for i, (lab, val, fmt) in enumerate(labels, start=1):
-        cell_l = ws.cell(14, i, lab)
-        cell_l.fill = _fill(WASH)
-        cell_l.font = Font(size=9, color=SLATE, bold=True)
-        cell_v = ws.cell(15, i, val if val is not None else "—")
-        cell_v.font = Font(size=14, bold=True, color=NAVY)
-        if isinstance(val, (int, float)):
-            cell_v.number_format = fmt
-
-    ws["A17"] = "How to read this pack"
-    ws["A17"].font = Font(bold=True, size=12)
+    ws["A14"] = "How to read this pack"
+    ws["A14"].font = Font(bold=True, size=12)
     if detailed:
         steps = [
             "01 City detail — every city, highest recoverable first. From coverage / From drop size split the hole.",
@@ -1272,19 +1255,19 @@ def _sheet_cover(wb: Workbook, pack: StrategyPack, detailed: bool = False) -> Wo
             "06 All lagging shops — every door with recoverable greater than 0.25 MT. Shallower doors are one remainder line.",
         ]
     for i, line in enumerate(steps):
-        ws.cell(18 + i, 1, line)
-        ws.merge_cells(start_row=18 + i, start_column=1, end_row=18 + i, end_column=8)
-        ws.cell(18 + i, 1).alignment = Alignment(wrap_text=True)
+        ws.cell(15 + i, 1, line)
+        ws.merge_cells(start_row=15 + i, start_column=1, end_row=15 + i, end_column=8)
+        ws.cell(15 + i, 1).alignment = Alignment(wrap_text=True)
 
-    ws["A25"] = "Glossary"
-    ws["A25"].font = Font(bold=True, size=12)
-    ws["A26"] = "Term"
-    ws["B26"] = "Meaning"
-    ws["A26"].font = Font(bold=True, color=WHITE)
-    ws["B26"].font = Font(bold=True, color=WHITE)
-    ws["A26"].fill = _fill(NAVY)
-    ws["B26"].fill = _fill(NAVY)
-    for i, (term, meaning) in enumerate(GLOSSARY, start=27):
+    ws["A22"] = "Glossary"
+    ws["A22"].font = Font(bold=True, size=12)
+    ws["A23"] = "Term"
+    ws["B23"] = "Meaning"
+    ws["A23"].font = Font(bold=True, color=WHITE)
+    ws["B23"].font = Font(bold=True, color=WHITE)
+    ws["A23"].fill = _fill(NAVY)
+    ws["B23"].fill = _fill(NAVY)
+    for i, (term, meaning) in enumerate(GLOSSARY, start=24):
         ws.cell(i, 1, term).font = Font(bold=True)
         ws.cell(i, 2, meaning)
         ws.merge_cells(start_row=i, start_column=2, end_row=i, end_column=8)
@@ -1428,21 +1411,7 @@ def _row_situation(df: pd.DataFrame, idx: int) -> str:
 
 
 def _html_cover(pack: StrategyPack, k: dict[str, Any], detailed: bool = False) -> str:
-    def fmt(val, spec="{:.1f}"):
-        if val is None or (isinstance(val, float) and pd.isna(val)):
-            return "—"
-        if isinstance(val, (int, float)):
-            return spec.format(val)
-        return str(val)
-
-    kpis = [
-        ("Billed", fmt(k.get("billed_mt"), "{:.0f}") + " MT"),
-        ("Expected", fmt(k.get("expected_mt"), "{:.0f}") + " MT"),
-        ("Gap vs expected", fmt(k.get("gap_mt"), "{:+.0f}") + " MT"),
-        ("Extra hole after weather", fmt(k.get("extra_hole_mt"), "{:+.0f}") + " MT"),
-        ("Lagging cities", str(k.get("n_lagging_cities") or 0)),
-    ]
-    kpi_html = "".join(f'<div class="kpi"><span>{html.escape(a)}</span><b>{html.escape(b)}</b></div>' for a, b in kpis)
+    del k
     if detailed:
         steps = [
             "City detail — every city, highest recoverable first.",
@@ -1468,7 +1437,6 @@ def _html_cover(pack: StrategyPack, k: dict[str, Any], detailed: bool = False) -
   <p class="lead">{html.escape(pack.weather or "")}</p>
   <p class="lead"><b>The problem.</b> {html.escape(pack.problem or "")}</p>
   <p class="lead"><b>Do this week.</b> {html.escape(pack.action or "")}</p>
-  <div class="kpis">{kpi_html}</div>
   <p class="note">How to read this pack</p>
   <ol class="note">{ol}</ol>
 </section>

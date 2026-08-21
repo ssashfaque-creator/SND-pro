@@ -116,12 +116,6 @@ def load_all():
     return data
 
 
-def metric_or_dash(val, fmt="{:.1f}", suffix=""):
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return "—"
-    return fmt.format(val) + suffix
-
-
 def _inject_css():
     st.markdown(
         """
@@ -280,18 +274,7 @@ def _page_upload(empty: bool):
     st.rerun()
 
 
-def _kpi_row(latest, mtd):
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Volume (MTD)" if mtd["open"] else "Volume", metric_or_dash(latest["volume_mt"], "{:.1f}", " MT"))
-    mom_val = latest["comparable_mom_pct"] if mtd["open"] and "comparable_mom_pct" in latest.index else latest["mom_pct"]
-    c2.metric("MoM (run-rate)" if mtd["open"] else "MoM", metric_or_dash(mom_val, "{:+.1f}", "%"))
-    yoy_val = latest["run_rate_yoy_pct"] if mtd["open"] and "run_rate_yoy_pct" in latest.index else latest["yoy_pct"]
-    c3.metric("YoY (run-rate)" if mtd["open"] else "YoY", metric_or_dash(yoy_val, "{:+.1f}", "%"))
-    c4.metric("Strike rate", metric_or_dash(latest["strike_rate"] * 100, "{:.0f}", "%"))
-    c5.metric("Drop size", metric_or_dash(latest["drop_size"], "{:.2f}", " MT"))
-
-
-def _page_strategy(data, latest, period, mtd, ledger):
+def _page_strategy(data, _latest, period, mtd, ledger):
     st.title("Briefing")
     st.caption(
         f"**{mtd['label'] or period}** · expected is the typical same calendar month from every month "
@@ -328,22 +311,6 @@ def _page_strategy(data, latest, period, mtd, ledger):
     weather = sit["weather"] if sit is not None else ""
     problem = sit["problem"] if sit is not None else ""
     action = sit["action_summary"] if sit is not None else ""
-    extra = float(nat["isolated_mt"]) if nat is not None and "isolated_mt" in nat.index else 0.0
-    n_hist = 0
-    n_same = 0
-    intra_src = ""
-    if sit is not None:
-        try:
-            import json as _json
-
-            meta = _json.loads(sit["metrics_json"]) if sit.get("metrics_json") else {}
-            extra = float(meta.get("extra_hole_mt") or extra)
-            n_hist = int(meta.get("n_history_periods") or 0)
-            n_same = int(meta.get("n_same_month") or 0)
-            intra_src = str(meta.get("intra_month_source") or "")
-        except Exception:
-            pass
-
     weather_dir = "declining"
     if nat is not None and float(nat.get("gap_mt") or 0) > 1:
         weather_dir = "growing"
@@ -360,48 +327,6 @@ def _page_strategy(data, latest, period, mtd, ledger):
         f"</div>",
         unsafe_allow_html=True,
     )
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    if nat is not None:
-        c1.metric("Billed", metric_or_dash(nat["volume_mt"], "{:.0f}", " MT"))
-        hist_help = (
-            f"Typical same calendar month from {n_hist} months in the warehouse"
-            if n_hist
-            else "Typical same calendar month from warehouse history"
-        )
-        if n_same:
-            hist_help += f" ({n_same} prior {period[5:7] if period else 'same'} months, not last year alone)"
-        c2.metric(
-            "Seasonal expected",
-            metric_or_dash(nat["expected_mt"], "{:.0f}", " MT"),
-            help=hist_help,
-        )
-        c3.metric("Gap vs expected", metric_or_dash(nat["gap_mt"], "{:+.0f}", " MT"))
-        extra_val = extra if extra else (
-            float(cities.loc[cities["situation"] == "lagging", "isolated_mt"].sum())
-            if "situation" in cities.columns
-            else 0.0
-        )
-        c4.metric("Extra hole after weather", metric_or_dash(extra_val, "{:+.0f}", " MT"))
-        n_lag = int((cities["situation"] == "lagging").sum()) if "situation" in cities.columns else 0
-        c5.metric("Exception cities", str(n_lag))
-    else:
-        _kpi_row(latest, mtd)
-
-    if n_hist:
-        pace_note = ""
-        if intra_src == "elapsed_days":
-            pace_note = (
-                " Open month is elapsed calendar days of that typical month — "
-                "month-end totals cannot teach day-of-month loading."
-            )
-        elif intra_src == "learned_mtd_cuts":
-            pace_note = " Open month is paced from mid-month MTD cuts already in the warehouse."
-        st.caption(
-            f"Seasonality fitted on **{n_hist} months** already in the warehouse"
-            + (f", including **{n_same} prior same calendar months**." if n_same else ".")
-            + pace_note
-        )
 
     pack = build_strategy_pack(
         units,
@@ -593,7 +518,7 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
     )
 
 
-def _page_report(data, latest, period, mtd, ledger):
+def _page_report(data, _latest, period, mtd, ledger):
     st.title("Report")
     st.caption(
         f"**{mtd['label'] or period}** · Pick a report, then a city / distributor / DSR if needed, then PDF or Excel. "

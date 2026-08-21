@@ -196,22 +196,6 @@ def _styles() -> dict[str, ParagraphStyle]:
             leading=11,
             spaceAfter=2,
         ),
-        "kpi_lab": ParagraphStyle(
-            "kpi_lab",
-            parent=base["Normal"],
-            fontName="Helvetica",
-            fontSize=7,
-            textColor=SLATE,
-            alignment=TA_LEFT,
-        ),
-        "kpi_val": ParagraphStyle(
-            "kpi_val",
-            parent=base["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=12,
-            textColor=NAVY,
-            alignment=TA_LEFT,
-        ),
         "th": ParagraphStyle(
             "th",
             parent=base["Normal"],
@@ -260,18 +244,7 @@ def _styles() -> dict[str, ParagraphStyle]:
     }
 
 
-def _fmt_kpi(val: Any, signed: bool = False) -> str:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return "—"
-    try:
-        n = int(round(float(val)))
-    except (TypeError, ValueError):
-        return str(val)
-    return f"{n:+,}" if signed else f"{n:,}"
-
-
 def _cover_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle], detailed: bool = False) -> list[Any]:
-    k = pack.kpis or {}
     kicker = "DETAILED PACK" if detailed else "STRATEGY PACK"
     if pack.scope and pack.scope != "national":
         kicker = f"{pack.scope.upper()} PACK"
@@ -282,37 +255,9 @@ def _cover_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle], deta
         Paragraph(xml_escape(pack.weather or ""), styles["body"]),
         Paragraph(f"<b>The problem.</b> {xml_escape(pack.problem or '')}", styles["body"]),
         Paragraph(f"<b>Do this week.</b> {xml_escape(pack.action or '')}", styles["body"]),
-        Spacer(1, 8),
+        Spacer(1, 10),
+        Paragraph("How to read this pack", styles["headline"]),
     ]
-    kpi_rows = [
-        ("Billed (MT)", _fmt_kpi(k.get("billed_mt"))),
-        ("Expected (MT)", _fmt_kpi(k.get("expected_mt"))),
-        ("Gap vs expected", _fmt_kpi(k.get("gap_mt"), signed=True)),
-        ("Extra hole after weather", _fmt_kpi(k.get("extra_hole_mt"), signed=True)),
-        ("Lagging cities", str(k.get("n_lagging_cities") or 0)),
-    ]
-    kpi_data = [
-        [Paragraph(xml_escape(a), styles["kpi_lab"]) for a, _ in kpi_rows],
-        [Paragraph(xml_escape(b), styles["kpi_val"]) for _, b in kpi_rows],
-    ]
-    kpi_table = Table(kpi_data, colWidths=[36 * mm] * 5)
-    kpi_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, -1), WASH),
-                ("BOX", (0, 0), (-1, -1), 0.4, LINE),
-                ("INNERGRID", (0, 0), (-1, -1), 0.3, LINE),
-                ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-                ("TOPPADDING", (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
-    story.append(kpi_table)
-    story.append(Spacer(1, 10))
-    story.append(Paragraph("How to read this pack", styles["headline"]))
     if pack.scope == "city":
         steps = [
             "City scorecard versus the country. Recoverable is the local hole after national weather.",
