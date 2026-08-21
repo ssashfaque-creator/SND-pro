@@ -12,6 +12,8 @@ def rebuild_shop_month(sales: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFram
     if sales.empty:
         return pd.DataFrame()
     facts = sales.copy()
+    facts["store_id"] = facts["store_id"].astype(str).str.strip()
+    facts["period"] = facts["period"].astype(str).str.strip()
     agg = (
         facts.groupby(["store_id", "period"], as_index=False)
         .agg(
@@ -92,7 +94,10 @@ def add_calendar_panel(shop_month: pd.DataFrame, stores: pd.DataFrame) -> pd.Dat
                 attr = attr.drop(columns=[other])
     else:
         attr = from_sales
-    return merged.merge(attr, on="store_id", how="left")
+    out = merged.merge(attr, on="store_id", how="left")
+    if not out.empty:
+        out = out.drop_duplicates(["store_id", "period"], keep="first")
+    return out
 
 
 def build_features(shop_month: pd.DataFrame, sales: pd.DataFrame) -> pd.DataFrame:

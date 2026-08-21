@@ -20,6 +20,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from sndintel.io_utils import prior_periods
+
 
 def _finite(value: Any, default: float = 1.0) -> float:
     try:
@@ -74,8 +76,8 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
     nat["month"] = nat["period"].astype(str).str.slice(5, 7).astype(int)
     nat_idx = _iterative_month_index(nat)
     n_same = int((nat["month"] == month).sum())
-    recent_ps = _tail_periods(nat, 3)
-    longer_ps = _tail_periods(nat, 6)
+    recent_ps = prior_periods(period, 3)
+    longer_ps = prior_periods(period, 6)
     expected_nat, _, _, _ = _recent_level(nat, recent_ps, longer_ps)
     nat_metrics = _period_volume_and_shops(hist, [])
     expected_drop_nat = _expected_drop_size(nat_metrics, recent_ps, longer_ps)
@@ -252,14 +254,21 @@ def _recent_level(
         recent_periods = _tail_periods(per, n_recent)
     if not longer_periods:
         longer_periods = _tail_periods(per, n_longer)
-    recent = per[per["period"].isin(list(recent_periods or []))]
+    recent_list = list(recent_periods or [])
+    if recent_list:
+        recent = per.set_index("period")["volume_mt"].reindex(recent_list).fillna(0.0)
+        ams = float(recent.mean())
+    else:
+        recent = per.iloc[0:0]
+        ams = 0.0
     longer = per[per["period"].isin(list(longer_periods or []))]
     n = int(per["period"].nunique())
-    if recent.empty:
+    if recent_list and float(recent.abs().sum()) <= 1e-12 and longer.empty:
         return 0.0, 0.0, 0.0, n
-    ams = float(recent["volume_mt"].mean())
+    if not recent_list:
+        return 0.0, 0.0, 0.0, n
     longer_m = float(longer["volume_mt"].median()) if not longer.empty else ams
-    expected = _blend(ams, longer_m, int(len(recent)))
+    expected = _blend(ams, longer_m, int(len(recent_list)))
     return expected, ams, longer_m, n
 
 
@@ -399,8 +408,8 @@ def expected_for_keys(
     if grouped.empty:
         return empty
     grouped["month"] = grouped["period"].astype(str).str.slice(5, 7).astype(int)
-    recent_ps = _tail_periods(grouped, 3)
-    longer_ps = _tail_periods(grouped, 6)
+    recent_ps = prior_periods(period, 3)
+    longer_ps = prior_periods(period, 6)
     rows = []
     for key_vals, g in grouped.groupby(keys, dropna=False):
         if not isinstance(key_vals, tuple):
@@ -553,13 +562,20 @@ def fit_shop_expected(
             city_full[str(r["city"])] = float(r.get("expected_full_mt") or 0.0)
 
     hist = hist.copy()
-    recent_ps = set(_tail_periods(hist, 3))
-    longer_ps = set(_tail_periods(hist, 6))
+    recent_list = prior_periods(period, 3)
+    recent_ps = set(recent_list)
+    longer_ps = set(prior_periods(period, 6))
     n_per = hist.groupby("store_id")["period"].nunique().rename("n_periods")
     in_recent = hist[hist["period"].astype(str).isin(recent_ps)]
     in_longer = hist[hist["period"].astype(str).isin(longer_ps)]
-    ams = in_recent.groupby("store_id")["volume_mt"].mean().rename("ams")
-    n_recent = in_recent.groupby("store_id")["period"].nunique().rename("n_recent")
+    if in_recent.empty:
+        ams = pd.DataFrame(columns=["store_id", "ams"])
+        n_recent = pd.DataFrame(columns=["store_id", "n_recent"])
+    else:
+        pt = in_recent.pivot_table(index="store_id", columns="period", values="volume_mt", aggfunc="sum")
+        pt = pt.reindex(columns=recent_list, fill_value=0).fillna(0.0)
+        ams = pt.mean(axis=1).rename("ams").reset_index()
+        n_recent = (pt.reindex(columns=recent_list).fillna(0.0) > 1e-12).sum(axis=1).rename("n_recent").reset_index()
     longer = in_longer.groupby("store_id")["volume_mt"].median().rename("longer_mt")
     cities = sm.groupby("store_id")["city"].last()
     from sndintel.io_utils import shift_period
@@ -572,8 +588,8 @@ def fit_shop_expected(
     )
     ids = pd.Index(sorted(set(hist["store_id"].astype(str))))
     out = pd.DataFrame({"store_id": ids})
-    out = out.merge(ams.reset_index(), on="store_id", how="left")
-    out = out.merge(n_recent.reset_index(), on="store_id", how="left")
+    out = out.merge(ams, on="store_id", how="left")
+    out = out.merge(n_recent, on="store_id", how="left")
     out = out.merge(n_per.reset_index(), on="store_id", how="left")
     out = out.merge(longer.reset_index(), on="store_id", how="left")
     if ly_s is not None and not ly_s.empty:

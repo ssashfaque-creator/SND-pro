@@ -156,3 +156,14 @@ def shift_period(period: str, months: int) -> str:
         month += 12
         year -= 1
     return period_key(year, month)
+
+
+def prior_periods(period: str, n: int = 3) -> list[str]:
+    """n calendar months immediately before ``period``, oldest first.
+
+    Scoring 2026-08 with n=3 → 2026-05, 2026-06, 2026-07. Does not skip a
+    missing May and pull in 2025-07 to fill the window.
+    """
+    if not period or n <= 0:
+        return []
+    return [shift_period(str(period), -i) for i in range(int(n), 0, -1)]

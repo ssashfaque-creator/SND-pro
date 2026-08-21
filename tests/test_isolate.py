@@ -151,7 +151,7 @@ def test_hierarchy_isolates_shop_inside_a_city():
         ("K2", "Diamond Super", 11.0, 23.0),
         ("K3", "Kifaya KDA", 12.0, 24.0),
     ]:
-        for period, vol in [("2026-08", now), ("2025-08", ly)]:
+        for period, vol in [("2026-05", ly), ("2026-06", ly), ("2026-07", ly), ("2026-08", now), ("2025-08", ly)]:
             rows.append(
                 {
                     "store_id": sid,

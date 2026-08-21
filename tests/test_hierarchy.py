@@ -73,6 +73,28 @@ def _stores(rows: list[dict], extra_ids: list[tuple[str, str]] | None = None) ->
     return pd.DataFrame(recs)
 
 
+def _seed_ams_window(rows: list[dict]) -> list[dict]:
+    """Copy last-year volume into May–Jul so AMS is the three months before August."""
+    by_store = {r["store_id"]: r for r in rows if r["period"] == "2025-08"}
+    existing = {(r["store_id"], r["period"]) for r in rows}
+    extra = []
+    for sid, base in by_store.items():
+        vol = float(base["volume_mt"])
+        for per in ("2026-05", "2026-06", "2026-07"):
+            if (sid, per) not in existing:
+                extra.append(
+                    {
+                        **base,
+                        "period": per,
+                        "year": 2026,
+                        "month": int(per[5:7]),
+                        "volume_mt": vol,
+                        "billed": 1 if vol > 0 else 0,
+                    }
+                )
+    return rows + extra
+
+
 def test_drop_size_city_names_continuing_shops():
     """Same doors, smaller drops → drop_size, and the named shop/DSR/dist are the targets."""
     rows = []
@@ -83,7 +105,7 @@ def test_drop_size_city_names_continuing_shops():
     ]:
         rows.append(_row(sid, "2026-08", now, "Karachi", "Eva Foods", "Amir Surveyor", "Nazimabad", name))
         rows.append(_row(sid, "2025-08", ly, "Karachi", "Eva Foods", "Amir Surveyor", "Nazimabad", name))
-    sm = pd.DataFrame(rows)
+    sm = pd.DataFrame(_seed_ams_window(rows))
     stores = _stores(rows)
     pack = build_hierarchy_pack(sm, stores, ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
     cities = pack.units[pack.units["grain"] == "city"]
@@ -134,7 +156,7 @@ def test_coverage_city_names_quiet_material_doors():
                 zone="Central",
             )
         )
-    sm = pd.DataFrame(rows)
+    sm = pd.DataFrame(_seed_ams_window(rows))
     pack = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
     mul = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Multan")].iloc[0]
     assert mul["diagnosis"] == "coverage"
@@ -167,7 +189,7 @@ def test_national_hole_is_sum_of_city_holes():
     rows.append(_row("L1", "2026-08", 8.0, "Lahore", "Lahore Dist", "Lahore DSR", "B", "Shop L", zone="Central"))
     rows.append(_row("L1", "2025-08", 12.0, "Lahore", "Lahore Dist", "Lahore DSR", "B", "Shop L", zone="Central"))
     pack = build_hierarchy_pack(
-        pd.DataFrame(rows),
+        pd.DataFrame(_seed_ams_window(rows)),
         _stores(rows),
         ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]),
     )
@@ -199,7 +221,7 @@ def test_distributor_and_dsr_universe_come_from_shop_master():
     )
     stores = pd.concat([stores, extra], ignore_index=True)
     pack = build_hierarchy_pack(
-        pd.DataFrame(rows),
+        pd.DataFrame(_seed_ams_window(rows)),
         stores,
         ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]),
     )
@@ -226,7 +248,7 @@ def test_open_mtd_prorates_expected():
             }
         ]
     )
-    pack = build_hierarchy_pack(pd.DataFrame(rows), _stores(rows), ledger=ledger)
+    pack = build_hierarchy_pack(pd.DataFrame(_seed_ams_window(rows)), _stores(rows), ledger=ledger)
     khi = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Karachi")].iloc[0]
     expected = 31.0 * (10 / 31)
     assert abs(float(khi["expected_mt"]) - expected) < 0.05

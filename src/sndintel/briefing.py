@@ -26,7 +26,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibling_z_frame
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
-from sndintel.io_utils import shift_period
+from sndintel.io_utils import prior_periods, shift_period
 from sndintel.season import fit_seasonality, fit_shop_expected, reconcile_expected
 
 
@@ -47,10 +47,10 @@ DRIVER_LABEL = {
 
 GLOSSARY = [
     ("Billed this period", "Secondary volume in the month being scored (MTD if the month is still open)."),
-    ("AMS last 3 months", "Average monthly secondary volume over the last three *closed* months. A typical recent month, not last year."),
-    ("vs AMS", "This period minus AMS × fraction of the month elapsed. Negative = behind the recent run-rate. On day 20 that is billed − AMS × (20 ÷ days in month), not billed − AMS."),
+    ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. If the month is still open, the printed AMS is that run-rate × the fraction of the month elapsed, same clock as billed and Expected."),
+    ("vs AMS", "Billed this period minus the printed AMS. Negative = behind the recent run-rate. On an open MTD that is already billed − AMS × (elapsed days ÷ days in month), because AMS is paced in the table."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month). Zero means no August last year — it does not mean Expected should be zero."),
-    ("Expected this month", "Recent run-rate: mean of the last three closed months (same window as AMS), blended with the last-six-month median, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
+    ("Expected this month", "Recent run-rate: mean of the three calendar months immediately before this period (same window as AMS), blended with the last-six-month median, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
     ("Gap", "The hole versus this unit’s own Expected, as a positive number — volume that comes back if the unit billed its recent run-rate. Country Gap is the country miss versus Expected. Zero means billed at or above Expected, not that AMS is irrelevant."),
     ("From drop size (MT)", "Share of the gap explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than Expected. The three From columns add to Gap when the unit is behind."),
     ("From unvisited shops (MT)", "Share of the gap from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of Expected."),
@@ -71,7 +71,7 @@ GLOSSARY = [
 CALCULATION_NOTES = [
     (
         "Expected this month",
-        "Mean of the last three closed months (same window as AMS), blended with the last-six-month median. Calendar-month seasonality is not used: an empty August last year does not zero out a city that has been billing 40 MT/month recently. The same recipe runs at country, city, distributor, DSR, and shop. Children’s Expecteds are then scaled so they add to the parent Expected. If the month is still open, Expected is that full-month run-rate × the intra-month fraction (elapsed days, or learned MTD cuts when those exist).",
+        "Mean of the three calendar months immediately before this period (same window as AMS, missing months as 0), blended with the last-six-month median. Calendar-month seasonality is not used: an empty August last year does not zero out a city that has been billing 40 MT/month recently. The same recipe runs at country, city, distributor, DSR, and shop. Children’s Expecteds are then scaled so they add to the parent Expected. If the month is still open, Expected is that full-month run-rate × the intra-month fraction (elapsed days, or learned MTD cuts when those exist).",
     ),
     (
         "Gap",
@@ -87,7 +87,7 @@ CALCULATION_NOTES = [
     ),
     (
         "vs AMS",
-        "Billed minus (AMS of the last three closed months × fraction of the month elapsed). Negative = behind the recent run-rate. This is not billed minus the full-month AMS.",
+        "Billed minus the printed AMS. When MTD is open, AMS in the table is already the last-three-month run-rate × elapsed fraction, so this is billed minus that to-date number.",
     ),
     (
         "Visit % and Strike %",
@@ -95,7 +95,7 @@ CALCULATION_NOTES = [
     ),
     (
         "Open MTD",
-        "Billed is month-to-date. Expected and AMS comparisons are paced. Last year is the full closed same month.",
+        "Billed is month-to-date. AMS and Expected in the tables are paced to the same elapsed fraction. Last year is the full closed same month.",
     ),
     (
         "Rounding and lists",
@@ -821,6 +821,26 @@ def _append_remainder(
     return pd.concat([table, extra], ignore_index=True)
 
 
+def _collapse_store_period(shop_month: pd.DataFrame) -> pd.DataFrame:
+    """One row per store-period. Identical copies are dropped, not summed."""
+    if shop_month is None or shop_month.empty or "store_id" not in shop_month.columns:
+        return shop_month
+    hist = shop_month.copy()
+    hist["volume_mt"] = pd.to_numeric(hist.get("volume_mt"), errors="coerce").fillna(0.0)
+    nunique = hist.groupby(["store_id", "period"])["volume_mt"].transform("nunique")
+    count = hist.groupby(["store_id", "period"])["volume_mt"].transform("size")
+    copies = (count > 1) & (nunique <= 1)
+    hist = pd.concat(
+        [hist.loc[~copies], hist.loc[copies].drop_duplicates(["store_id", "period"])],
+        ignore_index=True,
+    )
+    extra = [c for c in hist.columns if c not in {"store_id", "period", "volume_mt"}]
+    agg = {"volume_mt": "sum"}
+    for c in extra:
+        agg[c] = "last"
+    return hist.groupby(["store_id", "period"], as_index=False).agg(agg)
+
+
 def ams_last_n(
     shop_month: pd.DataFrame,
     period: str,
@@ -828,28 +848,41 @@ def ams_last_n(
     n: int = 3,
     ledger: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Mean volume of the last n closed months, excluding the period being scored."""
+    """Mean monthly volume of the n calendar months immediately before ``period``.
+
+    Scoring 2026-08 is (May + June + July) / 3. A missing month counts as 0, so
+    the divisor stays n — we do not skip a hole and pull in last year. Duplicate
+    store-period rows are collapsed before summing. ``ledger`` is unused; the
+    window is calendar months, not "last n closed periods that exist".
+    """
+    del ledger
     cols = keys + ["ams_3m"]
-    if shop_month is None or shop_month.empty or not period:
+    window = prior_periods(period, n)
+    if shop_month is None or shop_month.empty or not period or not window:
         return pd.DataFrame(columns=cols)
-    hist = shop_month[shop_month["period"].astype(str) != str(period)].copy()
-    if hist.empty:
-        return pd.DataFrame(columns=cols)
-    if ledger is not None and not ledger.empty and "status" in ledger.columns:
-        closed = set(ledger.loc[ledger["status"].astype(str) == "closed", "period"].astype(str))
-        if closed:
-            hist = hist[hist["period"].astype(str).isin(closed)]
-    if hist.empty:
-        return pd.DataFrame(columns=cols)
+    hist = shop_month.copy()
+    hist["period"] = hist["period"].astype(str)
+    if "store_id" in hist.columns:
+        hist["store_id"] = hist["store_id"].astype(str).str.strip()
+        hist = _collapse_store_period(hist)
+    hist = hist[hist["period"].isin(window)]
     for k in keys:
         if k not in hist.columns:
             hist[k] = "(unmapped)"
         hist[k] = hist[k].fillna("(unmapped)").replace("", "(unmapped)")
-    periods = sorted(hist["period"].astype(str).unique())[-n:]
-    hist = hist[hist["period"].astype(str).isin(periods)]
+    if not keys:
+        if hist.empty:
+            return pd.DataFrame({"ams_3m": [0.0]})
+        g = hist.groupby("period", as_index=False)["volume_mt"].sum()
+        series = g.set_index("period")["volume_mt"].reindex(window).fillna(0.0)
+        return pd.DataFrame({"ams_3m": [float(series.mean())]})
+    if hist.empty:
+        return pd.DataFrame(columns=cols)
     g = hist.groupby(keys + ["period"], as_index=False)["volume_mt"].sum()
-    out = g.groupby(keys, as_index=False)["volume_mt"].mean().rename(columns={"volume_mt": "ams_3m"})
-    return out
+    pt = g.pivot_table(index=keys, columns="period", values="volume_mt", aggfunc="sum")
+    pt = pt.reindex(columns=window, fill_value=0).fillna(0.0)
+    out = pt.mean(axis=1).rename("ams_3m").reset_index()
+    return out[cols]
 
 
 def excel_bytes(pack: StrategyPack) -> bytes:
@@ -1215,9 +1248,12 @@ def _attach_ams(
     left["_row"] = range(len(left))
     merged = left.merge(right, on=keys, how="left")
     merged = merged.sort_values("_row").drop(columns=["_row"])
-    ams_v = pd.to_numeric(merged["ams_3m"], errors="coerce")
+    ams_v = pd.to_numeric(merged["ams_3m"], errors="coerce").fillna(0.0)
     vol = pd.to_numeric(merged.get("volume_mt"), errors="coerce")
-    merged["vs_ams_mt"] = vol - ams_v * float(pace or 1.0)
+    # Pack AMS sits next to billed: pace it when MTD is open so a day-15
+    # extract does not show a full-month run-rate next to half a month of billed.
+    merged["ams_3m"] = ams_v * float(pace or 1.0)
+    merged["vs_ams_mt"] = vol - merged["ams_3m"]
     return merged
 
 
@@ -1327,24 +1363,15 @@ def _attach_national_ams(
     pace: float,
 ) -> pd.DataFrame:
     out = nat.copy()
-    if shop_month is None or shop_month.empty or not period:
+    ams = ams_last_n(shop_month, period, [], n=3, ledger=ledger)
+    if ams.empty or "ams_3m" not in ams.columns:
         out["ams_3m"] = pd.NA
         out["vs_ams_mt"] = pd.NA
         return out
-    hist = shop_month[shop_month["period"].astype(str) != str(period)].copy()
-    if ledger is not None and not ledger.empty and "status" in ledger.columns:
-        closed = set(ledger.loc[ledger["status"].astype(str) == "closed", "period"].astype(str))
-        if closed:
-            hist = hist[hist["period"].astype(str).isin(closed)]
-    if hist.empty:
-        out["ams_3m"] = pd.NA
-        out["vs_ams_mt"] = pd.NA
-        return out
-    g = hist.groupby("period")["volume_mt"].sum().sort_index().tail(3)
-    ams = float(g.mean()) if len(g) else None
-    out["ams_3m"] = ams
+    full = float(pd.to_numeric(ams["ams_3m"], errors="coerce").iloc[0])
+    out["ams_3m"] = full * float(pace or 1.0)
     vol = pd.to_numeric(out.get("volume_mt"), errors="coerce")
-    out["vs_ams_mt"] = vol - (ams * float(pace or 1.0) if ams is not None else 0.0)
+    out["vs_ams_mt"] = vol - out["ams_3m"]
     return out
 
 

@@ -89,6 +89,60 @@ def test_ams_is_mean_of_last_three_closed_months():
     assert abs(float(ams.iloc[0]["ams_3m"]) - 20.0) < 1e-9
 
 
+def test_ams_does_not_pull_last_year_into_a_gapped_window():
+    """A missing May must not be filled with July last year — that inflated AMS."""
+    rows = []
+    rows.append(_row("K1", "2025-07", 90.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows.append(_row("K1", "2026-06", 10.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows.append(_row("K1", "2026-07", 20.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows.append(_row("K1", "2026-08", 5.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    sm = pd.DataFrame(rows)
+    ams = ams_last_n(sm, "2026-08", ["city"])
+    # (0 + 10 + 20) / 3 — May is missing, not 2025-07.
+    assert abs(float(ams.iloc[0]["ams_3m"]) - 10.0) < 1e-9
+
+
+def test_ams_identical_shop_month_copies_are_not_summed():
+    rows = []
+    for per, vol in [("2026-05", 10.0), ("2026-06", 10.0), ("2026-07", 10.0), ("2026-08", 5.0)]:
+        rows.append(_row("K1", per, vol, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+        rows.append(_row("K1", per, vol, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    sm = pd.DataFrame(rows)
+    ams = ams_last_n(sm, "2026-08", ["city"])
+    assert abs(float(ams.iloc[0]["ams_3m"]) - 10.0) < 1e-9
+
+
+def test_pack_ams_is_paced_when_mtd_is_open():
+    """Day 15 MTD: printed AMS is half of the full-month last-3 mean, next to billed."""
+    rows = []
+    rows.append(_row("K1", "2026-08", 15.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows.append(_row("K1", "2025-08", 31.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows = _with_recent_ams(rows, volume_by_store={"K1": 31.0})
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(
+        sm,
+        _stores(rows),
+        ledger=pd.DataFrame(
+            [{"period": "2026-08", "status": "mtd_open", "as_of_day": 15, "days_in_month": 31}]
+        ),
+    )
+    report = build_strategy_pack(
+        pack_h.units,
+        sm,
+        period="2026-08",
+        ledger=pd.DataFrame(
+            [{"period": "2026-08", "status": "mtd_open", "as_of_day": 15, "days_in_month": 31}]
+        ),
+    )
+    country = report.cities[report.cities["City"] == "Country"].iloc[0]
+    ams = float(country["AMS last 3 months (MT)"])
+    billed = float(country["Billed this period (MT)"])
+    assert abs(ams - 15.0) < 1.0, ams  # 31 × 15/31
+    assert abs(billed - 15.0) < 1.0
+    vs = float(country["vs AMS (MT)"])
+    assert abs(vs - (billed - ams)) < 1.5
+
+
 def test_pack_layers_cities_then_those_dists_then_all_dists():
     """Karachi and Local Dist both miss their own Expected. Ghost Dist has AMS = 0 so it is hidden."""
     rows = []
