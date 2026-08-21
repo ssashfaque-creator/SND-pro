@@ -53,7 +53,7 @@ GLOSSARY = [
     ("From drop size (MT)", "Share of recoverable explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than fair share. The three From columns add to Recoverable when the unit is behind."),
     ("From unvisited shops (MT)", "Share of recoverable from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of fair share."),
     ("From unbilled shops (MT)", "Share of recoverable from doors that were visited (or, if no visit file, simply not billed) but did not buy. Positive = hole; negative = ahead of fair share."),
-    ("Remarks", "Four bullets: trend vs AMS and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; drop size vs AMS/LY on billed doors."),
+    ("Remarks", "Four bullets: trend vs AMS and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; this unit’s drop size and the national average (MT per billed shop)."),
     ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
     ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
     ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
@@ -1108,10 +1108,15 @@ def _parent_stats(row: pd.Series) -> dict[str, Any]:
     yoy = None
     if pd.notna(ly) and float(ly) > 1e-9 and pd.notna(vol):
         yoy = 100.0 * (float(vol) - float(ly)) / float(ly)
+    billed = pd.to_numeric(row.get("billed"), errors="coerce")
+    drop = pd.to_numeric(row.get("drop_size_mt"), errors="coerce")
+    if (drop is None or pd.isna(drop)) and pd.notna(vol) and pd.notna(billed) and float(billed) > 0:
+        drop = float(vol) / float(billed)
     return {
         "visit_rate": pd.to_numeric(row.get("visit_rate"), errors="coerce"),
         "productivity": pd.to_numeric(row.get("productivity"), errors="coerce"),
         "yoy_pct": yoy,
+        "drop_size_mt": float(drop) if drop is not None and pd.notna(drop) else None,
     }
 
 

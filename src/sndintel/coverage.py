@@ -401,17 +401,19 @@ def _productivity_bit(r: pd.Series, parent: dict[str, Any], z) -> str:
 
 
 def _drop_bit(r: pd.Series, parent: dict[str, Any], z) -> str:
-    drop = _num(r.get("from_drop_size_raw_mt"))
+    del z
+    drop = _num(r.get("drop_size_mt"))
     if drop is None:
-        drop = _num(r.get("from_drop_size_mt"))
-    billed = _num(r.get("billed"))
-    vol = _num(r.get("volume_mt"))
+        billed = _num(r.get("billed"))
+        vol = _num(r.get("volume_mt"))
+        if billed and billed > 0 and vol is not None:
+            drop = vol / billed
     if drop is None:
         return ""
-    per = (vol / billed) if billed and billed > 0 and vol is not None else None
-    tag = _z_tag(z)
-    extra = f"; {per:.2f} MT/billed door" if per is not None else ""
-    return f"Drop size: {drop:+.0f} MT vs AMS/LY on billed doors{extra}{tag}."
+    nat = _num(parent.get("drop_size_mt"))
+    if nat is None:
+        return f"Drop size: {drop:.2f} MT per billed shop (national average)."
+    return f"Drop size: {drop:.2f} MT per billed shop; national average {nat:.2f}."
 
 
 def _z_tag(z) -> str:
