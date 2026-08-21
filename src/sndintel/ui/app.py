@@ -545,8 +545,10 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         "Excel is the working file (filters, one sheet per layer). "
         "PDF is the board pack — whole numbers, remarks as bullets in the last column. "
         "For a city / distributor / DSR pack, use **Report**. "
-        "National summary names the top 10 lagging distributors by Gap, the top 10 lagging DSRs "
-        "from those distributors, and the top 50 lagging shops (after the 0.25 MT floor). "
+        "National summary names the top 10 lagging distributors, the top 10 lagging DSRs "
+        "from those distributors, and the top 50 lagging shops — ranked by how serious the miss "
+        "is versus that unit’s own Expected given its size, not the biggest Gap tons "
+        "(after the 0.25 MT shop floor). "
         "Detailed pack = every city, every distributor and DSR with AMS > 0, and every shop with gap > 0.25 MT."
     )
 
@@ -624,7 +626,7 @@ def _page_strategy(data, _latest, period, mtd, ledger):
 
     st.markdown("##### 3. Those distributors — top 50 shops")
     st.caption(
-        (pack.shop_note or "Top 50 shops by Gap under those distributors.")
+        (pack.shop_note or "Top 50 most serious shops under those distributors.")
         + " **Gap** is the volume you get back if the door billed its own Expected."
     )
     if pack.city_distributor_shops.empty:
@@ -634,16 +636,16 @@ def _page_strategy(data, _latest, period, mtd, ledger):
 
     st.markdown("##### 4. Top 10 lagging distributors (all cities)")
     st.caption(
-        "Same ten names as section 2 — national rank by Gap, including pockets inside cities that are on expected."
+        "Same ten names as section 2 — national rank by how serious the miss is versus own Expected, including pockets inside cities that are on expected."
     )
     _strategy_table(pack.lagging_distributors)
 
     st.markdown("##### 5. Top 10 lagging DSRs from those distributors")
-    st.caption("DSRs whose shops sit under the top 10 distributors, then the ten biggest Gaps. Ride-with this list.")
+    st.caption("DSRs whose shops sit under the top 10 distributors, then the ten most serious misses versus their own Expected. Ride-with this list.")
     _strategy_table(pack.lagging_dsrs)
 
     st.markdown("##### 6. Top 50 lagging shops")
-    st.caption(pack.shop_note or "Top 50 doors by Gap after the 0.25 MT floor. The rest of the hole is the remainder line.")
+    st.caption(pack.shop_note or "Top 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.")
     _strategy_table(pack.lagging_shops, height=420)
 
     with st.expander("How to read the columns", expanded=False):

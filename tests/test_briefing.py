@@ -375,7 +375,7 @@ def test_keep_top_holes_caps_and_remainder():
 
 
 def test_summary_pack_hides_tiny_lagging_distributors_as_remainder():
-    """More than 10 lagging dists: summary names the top 10 by Gap; the rest are remainder."""
+    """More than 10 lagging dists: summary names the top 10; the rest are remainder."""
     rows = []
     rows.append(_row("BIG", "2026-08", 10.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     rows.append(_row("BIG", "2025-08", 80.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
@@ -425,7 +425,7 @@ def test_summary_dsrs_are_top_10_from_those_distributors():
 
 
 def test_summary_excludes_dsr_from_distributor_outside_top_10():
-    """A large DSR hole under an 11th distributor must not outrank smaller DSRs from the top 10."""
+    """A DSR under a mild-miss 11th distributor must not enter the ride-with ten."""
     rows = []
     volume_by_store = {}
     for d in range(10):
@@ -436,9 +436,9 @@ def test_summary_excludes_dsr_from_distributor_outside_top_10():
             volume_by_store[sid] = 20.0
             rows.append(_row(sid, "2026-08", 5.0, "Karachi", dist, dsr, name=sid))
             rows.append(_row(sid, "2025-08", 20.0, "Karachi", dist, dsr, name=sid))
-    volume_by_store["WHALE"] = 40.0
-    rows.append(_row("WHALE", "2026-08", 0.0, "Lahore", "Thin Dist", "Whale Rep", name="Whale Shop"))
-    rows.append(_row("WHALE", "2025-08", 40.0, "Lahore", "Thin Dist", "Whale Rep", name="Whale Shop"))
+    volume_by_store["MILD"] = 40.0
+    rows.append(_row("MILD", "2026-08", 36.0, "Lahore", "Thin Dist", "Mild Rep", name="Mild Shop"))
+    rows.append(_row("MILD", "2025-08", 40.0, "Lahore", "Thin Dist", "Mild Rep", name="Mild Shop"))
     rows = _with_recent_ams(rows, volume_by_store=volume_by_store)
     sm = pd.DataFrame(rows)
     pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
@@ -447,12 +447,12 @@ def test_summary_excludes_dsr_from_distributor_outside_top_10():
     assert all(str(x).startswith("Fat Dist") for x in dist_named)
     assert "Thin Dist" not in dist_named
     dsr_named = [x for x in report.lagging_dsrs["DSR"].astype(str) if not str(x).startswith("Not listed")]
-    assert "Whale Rep" not in dsr_named
+    assert "Mild Rep" not in dsr_named
     assert all(str(x).startswith("Fat Rep") for x in dsr_named)
-    assert "Whale Rep" in set(report.all_dsrs["DSR"].astype(str))
+    assert "Mild Rep" in set(report.all_dsrs["DSR"].astype(str))
 
 
-def test_summary_shops_are_top_50_by_gap():
+def test_summary_shops_are_top_50_most_serious():
     """National and those-distributor shop lists name at most 50 doors; detailed still has everyone above 0.25 MT."""
     rows = []
     volume_by_store = {}
@@ -475,4 +475,44 @@ def test_summary_shops_are_top_50_by_gap():
     assert len(drill) == SUMMARY_SHOP_N
     detailed = [x for x in report.all_shops["Shop"].astype(str) if not str(x).startswith("Not listed")]
     assert len(detailed) == 60
+
+
+def test_keep_top_holes_ranks_by_seriousness_not_gap_tons():
+    df = pd.DataFrame(
+        {
+            "grain_id": ["whale", "crisis", "micro"],
+            "recoverable_mt": [20.0, 12.0, 0.4],
+            "_seriousness": [20.0 / (200.0 ** 0.5), 12.0 / (15.0 ** 0.5), 0.4 / (0.4 ** 0.5)],
+        }
+    )
+    kept, meta = keep_top_holes(df, 2, rank_col="_seriousness")
+    assert list(kept["grain_id"]) == ["crisis", "whale"]
+    assert abs(meta["hidden_mt"] - 0.4) < 1e-9
+
+
+def test_summary_ranks_collapsed_mid_size_ahead_of_large_modest_miss():
+    """A 15 MT book at ~80% miss outranks 200 MT books that are only 10% light."""
+    rows = []
+    volume_by_store = {}
+    for i in range(10):
+        sid = f"W{i}"
+        volume_by_store[sid] = 200.0
+        rows.append(_row(sid, "2026-08", 180.0, "Karachi", f"Whale Dist {i}", f"Whale Rep {i}", name=sid))
+        rows.append(_row(sid, "2025-08", 200.0, "Karachi", f"Whale Dist {i}", f"Whale Rep {i}", name=sid))
+    volume_by_store["CRISIS"] = 15.0
+    rows.append(_row("CRISIS", "2026-08", 3.0, "Lahore", "Crisis Dist", "Crisis Rep", name="Crisis Shop"))
+    rows.append(_row("CRISIS", "2025-08", 15.0, "Lahore", "Crisis Dist", "Crisis Rep", name="Crisis Shop"))
+    rows = _with_recent_ams(rows, volume_by_store=volume_by_store)
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
+    report = build_strategy_pack(pack_h.units, sm, period="2026-08")
+    dist_named = [x for x in report.lagging_distributors["Distributor"].astype(str) if not str(x).startswith("Not listed")]
+    assert dist_named[0] == "Crisis Dist"
+    assert len(dist_named) == SUMMARY_DIST_N
+    assert "Crisis Dist" in dist_named
+    assert sum(1 for x in dist_named if str(x).startswith("Whale Dist")) == 9
+    dsr_named = [x for x in report.lagging_dsrs["DSR"].astype(str) if not str(x).startswith("Not listed")]
+    assert dsr_named[0] == "Crisis Rep"
+    shop_named = [x for x in report.lagging_shops["Shop"].astype(str) if not str(x).startswith("Not listed")]
+    assert shop_named[0] == "Crisis Shop"
 
