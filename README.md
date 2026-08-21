@@ -130,9 +130,9 @@ pip install -e .
 snd-intel app
 ```
 
-Open the app → **Upload files** → universe shop list (if not already saved) + **Outlet Date Wise** sales. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open. Then **Warehouse** → pick a distributor + month and compare shop MT to that name on the SND portal.
+Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates) and leave **Replace all billed sales** ticked so Shop SKU Wise rows go away. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
 
-If billed looks wrong, **re-upload the daily sales file** — rebuild cannot invent days that were never ingested.
+Warehouse → **Clear billed sales only** also wipes billed rows and keeps shop lists. Do not upload the same POP+day in two files — those volumes are added.
 
 ## How a new file is applied
 

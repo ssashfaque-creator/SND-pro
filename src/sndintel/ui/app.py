@@ -26,7 +26,7 @@ from sndintel.briefing import (
     pdf_bytes_detailed,
 )
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
-from sndintel.ingest.pipeline import rescore_warehouse, run_pipeline
+from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
 from sndintel.storage import connect, init_db, read_sql
 
@@ -73,6 +73,15 @@ def _remember_shop(path: Path) -> None:
 
 def _last_shop() -> Path | None:
     return _last("shop")
+
+
+def _warehouse_has_stores() -> bool:
+    try:
+        with connect() as conn:
+            rows = read_sql(conn, "SELECT 1 AS x FROM stores LIMIT 1")
+        return rows is not None and not rows.empty
+    except Exception:
+        return False
 
 
 def _exec_row(data, period: str):
@@ -219,13 +228,14 @@ def _page_upload(empty: bool):
         "Sales history of POPs not on that list is ignored. Visit calls land weekly with the sales extract."
     )
     if empty:
-        st.warning("No warehouse yet. Upload the universe list and a sales extract. Visit calls can come with the sales file.")
+        st.warning("No billed months yet. Universe can stay as it is — upload one or more Outlet Date Wise files.")
     else:
-        st.success("Warehouse already has history. Typical week: **sales + visit calls**. Re-upload universe when the active book changes.")
+        st.success("Shop lists already in the warehouse. Upload sales to replace billed rows (universe stays unless you re-upload it).")
 
     last_uni = _last("universe")
     last_shop = _last_shop()
     last_vis = _last("visits")
+    has_stores = _warehouse_has_stores()
     c1, c2 = st.columns(2)
     with c1:
         universe = st.file_uploader(
@@ -235,6 +245,8 @@ def _page_upload(empty: bool):
         )
         if last_uni and universe is None:
             st.caption(f"Using saved universe: `{last_uni.name}`")
+        elif has_stores and universe is None:
+            st.caption("Universe already in the warehouse — no need to re-upload.")
         shops = st.file_uploader(
             "Legacy shop list (optional — zone / historical map)",
             type=["xlsx", "xls", "xlsm", "csv"],
@@ -243,10 +255,12 @@ def _page_upload(empty: bool):
         if last_shop and shops is None:
             st.caption(f"Saved legacy master: `{last_shop.name}`")
     with c2:
-        sales = st.file_uploader(
-            "Sales extract — Outlet Date Wise or Shop SKU Wise (xlsx / csv)",
+        sales_files = st.file_uploader(
+            "Sales extracts — one or more Outlet Date Wise / Shop SKU Wise files",
             type=["xlsx", "xls", "xlsm", "csv"],
             key="sales",
+            accept_multiple_files=True,
+            help="Split a large daily file by shops or by date range and drop every part here in one go.",
         )
         visits = st.file_uploader(
             "Shop visit calls (csv / xlsx) — MTD visits, weekly with sales",
@@ -257,10 +271,15 @@ def _page_upload(empty: bool):
             st.caption(f"Last visit file: `{last_vis.name}` (re-upload each week)")
 
     st.markdown(
-        "- **Universe** columns: distributor, area/city, section, DSR, POP code, POP name. Merged cells are filled down.\n"
-        "- **Sales:** Outlet Date Wise (daily tons by POP) is summed to months and mapped to distributor/DSR from the universe. Shop SKU Wise still works.\n"
-        "- First time: universe **and** sales. Optional legacy shop list fills **zone** and historical POPs.\n"
-        "- Every later week: **sales + visit calls**. Closed months stay. Re-upload universe when shops/DSRs move."
+        "- **Universe** can stay in the warehouse. Re-upload only when shops/DSRs move.\n"
+        "- **Sales:** drop several Outlet Date Wise files together (shop split or date split). Same POP + month is added across files. Do not upload the same rows twice.\n"
+        "- Shop SKU Wise still parses if that is what you have.\n"
+        "- Every later week: **sales + visit calls**. Closed months stay unless you tick replace-all below."
+    )
+    replace_sales = st.checkbox(
+        "Replace all billed sales (keep universe and visits)",
+        value=True,
+        help="On: wipe previous billed rows, then load these files. Use this when switching from Shop SKU Wise to Outlet Date Wise, or when the split set is the full history. Off: only months present in these files are replaced (August-only MTD refresh keeps July).",
     )
 
     st.divider()
@@ -346,21 +365,32 @@ def _page_upload(empty: bool):
             except Exception as exc:  # noqa: BLE001
                 st.exception(exc)
 
-    go = st.button("Score warehouse", type="primary", disabled=sales is None and empty)
+    go = st.button("Score warehouse", type="primary", disabled=not sales_files and empty)
     if not go:
         return
-    universe_path = last_uni
+    universe_path = None
     if universe is not None:
         universe_path = _save_upload(universe, MASTER_DIR / universe.name)
         _remember("universe", universe_path)
-    shop_path = last_shop
+    elif not has_stores:
+        universe_path = last_uni
+    shop_path = None
     if shops is not None:
         shop_path = _save_upload(shops, MASTER_DIR / shops.name)
         _remember_shop(shop_path)
-    if empty and universe_path is None and shop_path is None:
-        st.error("Upload the universe shop list (or a legacy shop list) once.")
+    elif not has_stores:
+        shop_path = last_shop
+    if empty and universe_path is None and shop_path is None and not has_stores:
+        st.error("Upload the universe shop list once, or keep the one already in the warehouse.")
         return
-    sales_path = _save_upload(sales, INCOMING_DIR / sales.name) if sales is not None else None
+    sales_paths = []
+    if sales_files:
+        for i, uploaded in enumerate(sales_files):
+            dest = INCOMING_DIR / f"{i:02d}_{uploaded.name}"
+            sales_paths.append(_save_upload(uploaded, dest))
+    if empty and not sales_paths:
+        st.error("Drop one or more sales files (Outlet Date Wise can be split).")
+        return
     visits_path = None
     if visits is not None:
         visits_path = _save_upload(visits, INCOMING_DIR / visits.name)
@@ -368,20 +398,23 @@ def _page_upload(empty: bool):
     with st.spinner("Parsing files and rebuilding city → distributor → DSR → shop scorecards. Large files take a few minutes."):
         try:
             result = run_pipeline(
-                sales_path,
+                sales_paths=sales_paths or None,
                 shop_path=shop_path,
                 universe_path=universe_path,
                 visits_path=visits_path,
+                replace_sales=bool(replace_sales and sales_paths),
             )
         except Exception as exc:  # noqa: BLE001
             st.exception(exc)
             return
     st.cache_data.clear()
     st.success(
-        f"Scored {result.get('n_sales_rows')} fact rows · latest {result.get('latest_period')} · "
+        f"Scored {result.get('n_sales_rows')} fact rows · {result.get('n_sales_files') or 0} sales file(s) · "
+        f"latest {result.get('latest_period')} · "
         f"{result.get('n_cities', 0)} cities · universe {result.get('n_universe') or '—'} · "
         f"visits {result.get('n_visits') or '—'}. "
-        f"Replaced months: {', '.join(result.get('replaced_periods') or []) or '—'}"
+        f"{'Replaced all billed sales. ' if result.get('replace_sales') else ''}"
+        f"Months: {', '.join(result.get('replaced_periods') or []) or '—'}"
     )
     if result.get("open_mtd_period"):
         st.info(f"Open MTD: {result['open_mtd_period']}")
@@ -987,6 +1020,23 @@ def _page_warehouse(data):
         show = season[season["grain"].isin(["national", "city"])].copy()
         st.dataframe(show.sort_values(["grain", "grain_id", "month"]), use_container_width=True, hide_index=True)
     st.caption("Updating the app does not wipe this warehouse. Use Strategy → Rebuild scorecards if the briefing looks stale.")
+    st.subheader("Replace billed sales")
+    st.caption(
+        "Clears billed rows and month scorecards. **Universe, legacy shops, and visit calls stay.** "
+        "Then go to Upload files and drop the Outlet Date Wise parts in one go."
+    )
+    if st.button("Clear billed sales only", type="secondary"):
+        try:
+            cleared = clear_billed_sales()
+        except Exception as exc:  # noqa: BLE001
+            st.exception(exc)
+        else:
+            st.cache_data.clear()
+            st.success(
+                f"Billed sales cleared. Universe shops still in the warehouse: {cleared.get('n_stores')}. "
+                "Upload the new daily files next."
+            )
+            st.rerun()
     sm = data.get("shop_month", pd.DataFrame())
     if sm is not None and not sm.empty:
         from sndintel.reconcile import distributor_shop_sales, match_distributors, period_totals

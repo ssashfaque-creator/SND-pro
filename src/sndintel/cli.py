@@ -32,15 +32,26 @@ def _version(version: bool = typer.Option(False, "--version", help="Show version
 
 @app.command()
 def ingest(
-    sales: Optional[Path] = typer.Argument(None, help="SSRS Shop SKU Wise Execution Report (xlsx/csv)"),
+    sales: Optional[list[Path]] = typer.Argument(None, help="One or more Outlet Date Wise / Shop SKU Wise files"),
     shops: Optional[Path] = typer.Option(None, "--shops", exists=True, help="Legacy shop master (zone / historical map)"),
     universe: Optional[Path] = typer.Option(None, "--universe", exists=True, help="Live universe shop list"),
     visits: Optional[Path] = typer.Option(None, "--visits", exists=True, help="Shop visit calls (MTD)"),
+    replace_sales: bool = typer.Option(
+        False,
+        "--replace-sales",
+        help="Wipe previous billed sales; keep universe and visits",
+    ),
 ):
     """Clean a sales export, merge the live universe and visits, and write insights."""
-    if sales is None and universe is None and visits is None and shops is None:
-        raise typer.BadParameter("Pass a sales file and/or --universe / --visits / --shops.")
-    result = run_pipeline(sales, shop_path=shops, universe_path=universe, visits_path=visits)
+    if not sales and universe is None and visits is None and shops is None:
+        raise typer.BadParameter("Pass one or more sales files and/or --universe / --visits / --shops.")
+    result = run_pipeline(
+        sales_paths=sales,
+        shop_path=shops,
+        universe_path=universe,
+        visits_path=visits,
+        replace_sales=replace_sales,
+    )
     console.print_json(data=result)
 
 
@@ -204,6 +215,15 @@ def where_cmd():
     """Print where the warehouse is stored (survives app updates)."""
     console.print(f"data_dir  {DATA_DIR}")
     console.print(f"warehouse {DB_PATH}")
+
+
+@app.command("clear-sales")
+def clear_sales_cmd():
+    """Delete billed sales and month scorecards. Keeps universe shops and visit calls."""
+    from sndintel.ingest.pipeline import clear_billed_sales
+
+    result = clear_billed_sales()
+    console.print_json(data=result)
 
 
 @app.command("check-sales")

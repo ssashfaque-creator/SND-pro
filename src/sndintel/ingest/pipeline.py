@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import os
@@ -13,7 +14,7 @@ from sndintel.config import DATA_DIR, DB_PATH, PROCESSED_DIR, ensure_dirs
 from sndintel.features import add_calendar_panel, build_features, latest_period, rebuild_shop_month
 from sndintel.ingest.daily import overlay_store_attrs
 from sndintel.ingest.shops import parse_shop_master
-from sndintel.ingest.ssrs import collapse_sales_facts, parse_sales_file
+from sndintel.ingest.ssrs import ParseReport, collapse_sales_facts, parse_sales_file
 from sndintel.ingest.universe import fill_zone_from_legacy, parse_universe
 from sndintel.ingest.visits import parse_visit_calls
 from sndintel.hierarchy import HierarchyPack, build_hierarchy_pack, plays_from_pack
@@ -30,26 +31,160 @@ from sndintel.storage import (
 )
 
 
+def _normalize_sales_paths(
+    sales_path: Optional[str | Path],
+    sales_paths: Optional[list[str | Path]],
+) -> list[Path]:
+    paths: list[Path] = []
+    if sales_paths:
+        paths.extend(Path(p) for p in sales_paths if p)
+    elif sales_path:
+        paths.append(Path(sales_path))
+    seen: set[str] = set()
+    out: list[Path] = []
+    for path in paths:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _sales_label(paths: list[Path]) -> str:
+    if not paths:
+        return ""
+    if len(paths) == 1:
+        return paths[0].name
+    return f"{paths[0].name} + {len(paths) - 1} more"
+
+
+def _parse_sales_paths(paths: list[Path]) -> tuple[pd.DataFrame, ParseReport | None]:
+    frames: list[pd.DataFrame] = []
+    reports: list[ParseReport] = []
+    for path in paths:
+        df, report = parse_sales_file(path)
+        frames.append(df)
+        reports.append(report)
+    return combine_sales_frames(frames), merge_sales_reports(reports)
+
+
+def combine_sales_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Collapse copies inside each file, then add the same POP+SKU+month across files."""
+    parts = [collapse_sales_facts(frame.copy()) for frame in frames if frame is not None and not frame.empty]
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    key = [c for c in ("store_id", "sku", "period") if c in out.columns]
+    if len(key) < 3:
+        return collapse_sales_facts(out)
+    extra = [c for c in out.columns if c not in key]
+    agg = {c: "last" for c in extra}
+    if "volume_mt" in agg:
+        agg["volume_mt"] = "sum"
+    grouped = out.groupby(key, as_index=False, sort=False).agg(agg)
+    grouped = grouped.loc[pd.to_numeric(grouped["volume_mt"], errors="coerce").fillna(0) > 0].copy()
+    return grouped.reset_index(drop=True)
+
+
+def merge_sales_reports(reports: list[ParseReport]) -> ParseReport | None:
+    reports = [r for r in reports if r is not None]
+    if not reports:
+        return None
+    if len(reports) == 1:
+        return reports[0]
+    best = reports[0]
+    best_dt = parse_execution_date(best.params) or datetime.min
+    for report in reports[1:]:
+        dt = parse_execution_date(report.params)
+        if dt and dt > best_dt:
+            best_dt = dt
+            best = report
+    strategies = {r.strategy for r in reports}
+    merged = ParseReport(
+        strategy=next(iter(strategies)) if len(strategies) == 1 else "combined",
+        source_file="; ".join(Path(r.source_file).name for r in reports),
+        n_raw_rows=sum(int(r.n_raw_rows or 0) for r in reports),
+        n_clean_rows=sum(int(r.n_clean_rows or 0) for r in reports),
+        header_row=best.header_row,
+        data_start_row=best.data_start_row,
+        column_map=dict(best.column_map or {}),
+        warnings=[w for r in reports for w in (r.warnings or [])],
+        params=dict(best.params or {}),
+    )
+    merged.params["n_files"] = str(len(reports))
+    return merged
+
+
+def _clear_billed_sales(conn) -> None:
+    """Drop billed facts and month ledger. Stores and visits stay."""
+    conn.execute("DELETE FROM sales_facts")
+    conn.execute("DELETE FROM period_ledger")
+    conn.execute("DELETE FROM mtd_observations")
+
+
+def clear_billed_sales(db_path: Optional[str | Path] = None) -> dict:
+    """Wipe billed sales only so a new Outlet Date Wise set can replace Shop SKU Wise."""
+    ensure_dirs()
+    db_path = Path(db_path or DB_PATH)
+    init_db(db_path)
+    with connect(db_path) as conn:
+        stores = read_sql(conn, "SELECT COUNT(*) AS n FROM stores")
+        visits = read_sql(conn, "SELECT COUNT(*) AS n FROM shop_visits")
+        _clear_billed_sales(conn)
+        for table in (
+            "shop_month",
+            "features_shop_month",
+            "forecasts",
+            "anomalies",
+            "shop_segments",
+            "insights",
+            "strategy_plays",
+            "unit_scorecards",
+            "seasonality_index",
+            "focus_targets",
+            "situation_brief",
+            "exec_summary",
+            "kpi_snapshots",
+        ):
+            conn.execute(f"DELETE FROM {table}")
+    return {
+        "cleared": "sales",
+        "n_stores": int(stores.iloc[0]["n"]) if stores is not None and not stores.empty else 0,
+        "n_visits": int(visits.iloc[0]["n"]) if visits is not None and not visits.empty else 0,
+        "db_path": str(db_path),
+    }
+
+
 def run_pipeline(
     sales_path: Optional[str | Path] = None,
     shop_path: Optional[str | Path] = None,
     universe_path: Optional[str | Path] = None,
     visits_path: Optional[str | Path] = None,
     db_path: Optional[str | Path] = None,
+    sales_paths: Optional[list[str | Path]] = None,
+    replace_sales: bool = False,
 ) -> dict:
-    """Ingest sales (optional if warehouse already has facts), live universe, visits, then rescore."""
+    """Ingest sales (optional if warehouse already has facts), live universe, visits, then rescore.
+
+    ``sales_paths`` accepts several Outlet Date Wise (or Shop SKU Wise) files in
+    one go — split by shops or by date range. Volumes for the same POP + month
+    are added across files. ``replace_sales`` wipes previous billed rows and the
+    month ledger; stores (universe) and visit calls stay.
+    """
     ensure_dirs()
     db_path = Path(db_path or DB_PATH)
     init_db(db_path)
     started = utcnow()
-    sales_path = Path(sales_path) if sales_path else None
     shop_path = Path(shop_path) if shop_path else None
     universe_path = Path(universe_path) if universe_path else None
     visits_path = Path(visits_path) if visits_path else None
+    file_paths = _normalize_sales_paths(sales_path, sales_paths)
+    sales_path = file_paths[0] if file_paths else None
 
     sales, sales_report = (pd.DataFrame(), None)
-    if sales_path:
-        sales, sales_report = parse_sales_file(sales_path)
+    if file_paths:
+        sales, sales_report = _parse_sales_paths(file_paths)
     shops = pd.DataFrame()
     shop_report = None
     if shop_path:
@@ -73,7 +208,7 @@ def run_pipeline(
                VALUES (?, 'running', ?, ?)""",
             (
                 started,
-                str(sales_path) if sales_path else None,
+                _sales_label(file_paths) if file_paths else None,
                 str(universe_path or shop_path) if (universe_path or shop_path) else None,
             ),
         )
@@ -129,11 +264,14 @@ def run_pipeline(
                 _upsert_stores(conn, new_ids)
 
             facts = collapse_sales_facts(sales.copy())
-            facts["source_file"] = sales_path.name
+            label = _sales_label(file_paths)
+            facts["source_file"] = label
             facts["ingested_at"] = utcnow()
             touched_periods = sorted(facts["period"].dropna().unique().tolist())
-            # Snapshot replace: the extract is the new truth for every month it contains.
-            if touched_periods:
+            if replace_sales:
+                _clear_billed_sales(conn)
+            elif touched_periods:
+                # Snapshot replace: the extract is the new truth for every month it contains.
                 placeholders = ", ".join("?" * len(touched_periods))
                 conn.execute(
                     f"DELETE FROM sales_facts WHERE period IN ({placeholders})",
@@ -189,7 +327,7 @@ def run_pipeline(
                     (
                         per,
                         status,
-                        sales_path.name,
+                        label,
                         execution.strftime("%Y-%m-%d") if execution else None,
                         utcnow(),
                         int(len(part)),
@@ -214,7 +352,7 @@ def run_pipeline(
                             int(as_of),
                             int(days),
                             float(part["volume_mt"].sum()),
-                            sales_path.name,
+                            label,
                             utcnow(),
                         ),
                     )
@@ -294,6 +432,8 @@ def run_pipeline(
             "visit_clean_rows": visit_report.n_clean_rows if visit_report else None,
             "replaced_periods": touched_periods,
             "open_mtd_period": open_period,
+            "replace_sales": replace_sales,
+            "n_sales_files": len(file_paths),
         }
         warnings = []
         for rep in (sales_report, shop_report, universe_report, visit_report):
@@ -327,6 +467,8 @@ def run_pipeline(
         "warnings": warnings,
         "replaced_periods": touched_periods,
         "open_mtd_period": open_period,
+        "replace_sales": replace_sales,
+        "n_sales_files": len(file_paths),
         "n_plays": int(len(plays)) if plays is not None else 0,
         "n_cities": int(pack.national.get("n_cities") or 0) if pack is not None else 0,
         "n_targets": int(len(pack.targets)) if pack is not None and pack.targets is not None else 0,
