@@ -128,9 +128,9 @@ pip install -e .
 snd-intel app
 ```
 
-Open the app → **Strategy** → **Rebuild scorecards from warehouse**. AMS is DSS L3M: (June + July + August) ÷ 3 when scoring August — August is MTD if the month is still open. That is the Month Wise Average “Last 3 Months” column, not May+June+July. Then open **Warehouse** and pick a distributor + month to check billed shops against Shop SKU Wise.
+Open the app → **Strategy** → **Rebuild scorecards from warehouse**. Then open **Warehouse** and pick **Agha Traders (Quetta)** + **2026-07**: the shop list and MT total should match that distributor’s July total on Shop SKU Wise (about 14.51 MT), not ~2×. Country 2026-07 should be near the extract Grand Total (~996 MT) and 2026-08 near the MTD Grand Total (~375 MT).
 
-If billed or AMS still looks wrong after this update, **re-upload the sales extract** that has May–August (or last 3 months + this month). Rebuild cannot invent months that were never ingested.
+If billed is still double after this update, **re-upload the sales extract** — an older warehouse row can still hold the inflated number.
 
 ## How a new file is applied
 

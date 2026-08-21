@@ -80,26 +80,26 @@ def _stores(rows):
     )
 
 
-def test_ams_is_dss_l3m_including_this_month():
-    """Scoring August: AMS is (June + July + August) / 3, same as DSS L3M."""
+def test_ams_is_mean_of_last_three_closed_months():
     rows = []
     for per, vol in [("2026-05", 10.0), ("2026-06", 20.0), ("2026-07", 30.0), ("2026-08", 5.0)]:
         rows.append(_row("K1", per, vol, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     sm = pd.DataFrame(rows)
     ams = ams_last_n(sm, "2026-08", ["city"])
-    assert abs(float(ams.iloc[0]["ams_3m"]) - (20.0 + 30.0 + 5.0) / 3.0) < 1e-9
+    assert abs(float(ams.iloc[0]["ams_3m"]) - 20.0) < 1e-9
 
 
 def test_ams_does_not_pull_last_year_into_a_gapped_window():
-    """A missing June must not be filled with July last year."""
+    """A missing May must not be filled with July last year — that inflated AMS."""
     rows = []
     rows.append(_row("K1", "2025-07", 90.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows.append(_row("K1", "2026-06", 10.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     rows.append(_row("K1", "2026-07", 20.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     rows.append(_row("K1", "2026-08", 5.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     sm = pd.DataFrame(rows)
     ams = ams_last_n(sm, "2026-08", ["city"])
-    # (June 0 + July 20 + August 5) / 3 — not 2025-07.
-    assert abs(float(ams.iloc[0]["ams_3m"]) - 25.0 / 3.0) < 1e-9
+    # (0 + 10 + 20) / 3 — May is missing, not 2025-07.
+    assert abs(float(ams.iloc[0]["ams_3m"]) - 10.0) < 1e-9
 
 
 def test_ams_identical_shop_month_copies_are_not_summed():
@@ -109,21 +109,11 @@ def test_ams_identical_shop_month_copies_are_not_summed():
         rows.append(_row("K1", per, vol, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     sm = pd.DataFrame(rows)
     ams = ams_last_n(sm, "2026-08", ["city"])
-    assert abs(float(ams.iloc[0]["ams_3m"]) - (10.0 + 10.0 + 5.0) / 3.0) < 1e-9
+    assert abs(float(ams.iloc[0]["ams_3m"]) - 10.0) < 1e-9
 
 
-def test_ams_matches_verified_dss_sm_traders():
-    """S.M Traders L3M on the August DSS report is (Jun + Jul + Aug MTD) / 3 ≈ 54.12."""
-    rows = []
-    for per, vol in [("2026-06", 75.25), ("2026-07", 64.13), ("2026-08", 22.98)]:
-        rows.append(_row("S1", per, vol, "Karachi", "S.M Traders (F.B Area)", "Imad", name="Safeer"))
-    sm = pd.DataFrame(rows)
-    ams = ams_last_n(sm, "2026-08", ["distributor"])
-    assert abs(float(ams.iloc[0]["ams_3m"]) - 54.12) < 0.02
-
-
-def test_pack_ams_is_dss_l3m_when_mtd_is_open():
-    """Day 15 MTD: AMS is (Jun + Jul + Aug MTD) / 3; vs AMS is billed minus that AMS."""
+def test_pack_ams_stays_full_month_when_mtd_is_open():
+    """Day 15 MTD: printed AMS is the full-month last-3 mean; vs AMS applies 15/31."""
     rows = []
     rows.append(_row("K1", "2026-08", 15.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     rows.append(_row("K1", "2025-08", 31.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
@@ -147,10 +137,10 @@ def test_pack_ams_is_dss_l3m_when_mtd_is_open():
     country = report.cities[report.cities["City"] == "Country"].iloc[0]
     ams = float(country["AMS last 3 months (MT)"])
     billed = float(country["Billed this period (MT)"])
-    assert abs(ams - (31.0 + 31.0 + 15.0) / 3.0) < 1.5, ams
+    assert abs(ams - 31.0) < 1.0, ams
     assert abs(billed - 15.0) < 1.0
     vs = float(country["vs AMS (MT)"])
-    assert abs(vs - (billed - ams)) < 1.5
+    assert abs(vs - (billed - 31.0 * (15.0 / 31.0))) < 1.5
 
 
 def test_pack_layers_cities_then_those_dists_then_all_dists():
@@ -165,7 +155,7 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     rows.append(_row("L1", "2025-08", 100.0, "Lahore", "Holding Dist", "Lahore Ace", name="Big L"))
     rows.append(_row("L2", "2026-08", 10.0, "Lahore", "Local Dist", "Lahore Weak", name="Small L"))
     rows.append(_row("L2", "2025-08", 100.0, "Lahore", "Local Dist", "Lahore Weak", name="Small L"))
-    rows.append(_row("G1", "2026-08", 0.0, "Karachi", "Ghost Dist", "Ghost DSR", name="Ghost Shop"))
+    rows.append(_row("G1", "2026-08", 1.0, "Karachi", "Ghost Dist", "Ghost DSR", name="Ghost Shop"))
     rows.append(_row("G1", "2025-08", 40.0, "Karachi", "Ghost Dist", "Ghost DSR", name="Ghost Shop"))
     rows = _with_recent_ams(rows, volume_by_store={"K1": 8.0, "K2": 18.0, "L1": 95.0, "L2": 80.0})
     sm = pd.DataFrame(rows)
@@ -209,7 +199,7 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "vs expected" in remarks.lower()
     assert "national average" in remarks.lower()
     # Full lagging-distributor list includes Local Dist (behind its own Expected).
-    # Ghost Dist has no volume in June–August, so AMS is 0 and it stays hidden.
+    # Ghost Dist has no volume in the AMS window, so Expected is 0 and it stays hidden.
     names = set(report.lagging_distributors["Distributor"].astype(str))
     assert "Local Dist" in names
     assert "Eva Foods" in names

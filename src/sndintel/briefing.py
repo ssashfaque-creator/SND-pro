@@ -26,7 +26,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibling_z_frame
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
-from sndintel.io_utils import prior_periods, shift_period, trailing_periods
+from sndintel.io_utils import prior_periods, shift_period
 from sndintel.season import fit_seasonality, fit_shop_expected, reconcile_expected
 
 
@@ -47,10 +47,10 @@ DRIVER_LABEL = {
 
 GLOSSARY = [
     ("Billed this period", "Secondary volume in the month being scored (MTD if the month is still open)."),
-    ("AMS last 3 months", "DSS Month Wise Average L3M: this month plus the two months before it — (June + July + August) ÷ 3 when scoring August. A month with no volume counts as 0. When August is still open, August in that average is MTD, same as the SND portal."),
-    ("vs AMS", "Billed this period minus AMS. Negative = behind the last-three-month average. On an open MTD that is billed − (June + July + August MTD) ÷ 3, not billed − a full-month run-rate × elapsed days."),
+    ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. This is always a full-month run-rate, even when billed is MTD."),
+    ("vs AMS", "This period minus AMS × fraction of the month elapsed. Negative = behind the recent run-rate. On day 20 that is billed − AMS × (20 ÷ days in month), not billed − AMS. The AMS column itself stays the full-month number."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month). Zero means no August last year — it does not mean Expected should be zero."),
-    ("Expected this month", "Recent run-rate: mean of the three *closed* calendar months immediately before this period (May + June + July when scoring August), blended with the last-six-month median, paced if MTD is open. Not the same window as AMS, which includes this month. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
+    ("Expected this month", "Recent run-rate: mean of the three calendar months immediately before this period (same window as AMS), blended with the last-six-month median, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
     ("Gap", "The hole versus this unit’s own Expected, as a positive number — volume that comes back if the unit billed its recent run-rate. Country Gap is the country miss versus Expected. Zero means billed at or above Expected, not that AMS is irrelevant."),
     ("From drop size (MT)", "Share of the gap explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than Expected. The three From columns add to Gap when the unit is behind."),
     ("From unvisited shops (MT)", "Share of the gap from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of Expected."),
@@ -71,7 +71,7 @@ GLOSSARY = [
 CALCULATION_NOTES = [
     (
         "Expected this month",
-        "Mean of the three closed calendar months immediately before this period (May + June + July when scoring August; missing months as 0), blended with the last-six-month median. This is not DSS L3M — Expected does not include this month’s billed. Calendar-month seasonality is not used. The same recipe runs at country, city, distributor, DSR, and shop. Children’s Expecteds are then scaled so they add to the parent Expected. If the month is still open, Expected is that full-month run-rate × the intra-month fraction (elapsed days, or learned MTD cuts when those exist).",
+        "Mean of the three calendar months immediately before this period (same window as AMS, missing months as 0), blended with the last-six-month median. Calendar-month seasonality is not used: an empty August last year does not zero out a city that has been billing 40 MT/month recently. The same recipe runs at country, city, distributor, DSR, and shop. Children’s Expecteds are then scaled so they add to the parent Expected. If the month is still open, Expected is that full-month run-rate × the intra-month fraction (elapsed days, or learned MTD cuts when those exist).",
     ),
     (
         "Gap",
@@ -87,7 +87,7 @@ CALCULATION_NOTES = [
     ),
     (
         "vs AMS",
-        "Billed minus AMS. AMS is DSS L3M: this month plus the two before it. When MTD is open, this month in AMS is already MTD, so we do not also multiply AMS by the elapsed fraction.",
+        "Billed minus (AMS of the last three calendar months × fraction of the month elapsed). Negative = behind the recent run-rate. AMS in the table is always the full-month run-rate.",
     ),
     (
         "Visit % and Strike %",
@@ -95,7 +95,7 @@ CALCULATION_NOTES = [
     ),
     (
         "Open MTD",
-        "Billed is month-to-date. Expected is paced from the last three *closed* months. AMS is DSS L3M (this month + two before); August in that average is MTD. Last year is the full closed same month.",
+        "Billed is month-to-date. Expected is paced. AMS in the table is still the full-month last-three-month run-rate; vs AMS applies the elapsed fraction. Last year is the full closed same month.",
     ),
     (
         "Rounding and lists",
@@ -847,19 +847,17 @@ def ams_last_n(
     keys: list[str],
     n: int = 3,
     ledger: pd.DataFrame | None = None,
-    include_current: bool = True,
 ) -> pd.DataFrame:
-    """Mean monthly volume of n calendar months ending at ``period``.
+    """Mean monthly volume of the n calendar months immediately before ``period``.
 
-    Scoring 2026-08 is (June + July + August) / 3 — the same L3M as DSS
-    Month Wise Average when the portal month is August. A missing month
-    counts as 0. Duplicate store-period rows are collapsed before summing.
-    Pass ``include_current=False`` for Expected/opportunity, which uses the
-    three closed months *before* this period. ``ledger`` is unused.
+    Scoring 2026-08 is (May + June + July) / 3. A missing month counts as 0, so
+    the divisor stays n — we do not skip a hole and pull in last year. Duplicate
+    store-period rows are collapsed before summing. ``ledger`` is unused; the
+    window is calendar months, not "last n closed periods that exist".
     """
     del ledger
     cols = keys + ["ams_3m"]
-    window = trailing_periods(period, n) if include_current else prior_periods(period, n)
+    window = prior_periods(period, n)
     if shop_month is None or shop_month.empty or not period or not window:
         return pd.DataFrame(columns=cols)
     hist = shop_month.copy()
@@ -1252,7 +1250,7 @@ def _attach_ams(
     merged = merged.sort_values("_row").drop(columns=["_row"])
     ams_v = pd.to_numeric(merged["ams_3m"], errors="coerce")
     vol = pd.to_numeric(merged.get("volume_mt"), errors="coerce")
-    merged["vs_ams_mt"] = vol - ams_v
+    merged["vs_ams_mt"] = vol - ams_v * float(pace or 1.0)
     return merged
 
 
@@ -1370,7 +1368,7 @@ def _attach_national_ams(
     full = float(pd.to_numeric(ams["ams_3m"], errors="coerce").iloc[0])
     out["ams_3m"] = full
     vol = pd.to_numeric(out.get("volume_mt"), errors="coerce")
-    out["vs_ams_mt"] = vol - (full if pd.notna(full) else 0.0)
+    out["vs_ams_mt"] = vol - (full * float(pace or 1.0) if pd.notna(full) else 0.0)
     return out
 
 

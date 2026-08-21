@@ -390,8 +390,8 @@ def _page_upload(empty: bool):
 def _page_strategy(data, _latest, period, mtd, ledger):
     st.title("Briefing")
     st.caption(
-        f"**{mtd['label'] or period}** · AMS is DSS L3M (this month + two before). "
-        "Expected is the last three *closed* months, paced if MTD is open."
+        f"**{mtd['label'] or period}** · expected is the recent run-rate (last three closed months), "
+        "paced if the month is still open. An empty August last year does not zero Expected."
     )
     if mtd["open"]:
         st.info(banner_text(ledger, period))
