@@ -269,6 +269,7 @@ CREATE TABLE IF NOT EXISTS unit_scorecards (
     mom_gap_mt REAL,
     seasonal_index REAL,
     seasonal_typical_mt REAL,
+    expected_drop_size_mt REAL,
     situation TEXT,
     metrics_json TEXT,
     PRIMARY KEY (period, grain, grain_id, parent_id)
@@ -424,6 +425,7 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("mom_gap_mt", "REAL"),
             ("seasonal_index", "REAL"),
             ("seasonal_typical_mt", "REAL"),
+            ("expected_drop_size_mt", "REAL"),
             ("situation", "TEXT"),
             ("visited", "INTEGER"),
             ("visit_rate", "REAL"),

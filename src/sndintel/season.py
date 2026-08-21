@@ -48,6 +48,7 @@ class SeasonFit:
     n_same_month: int
     national_index: dict[int, float] = field(default_factory=dict)
     expected_full_national: float = 0.0
+    expected_drop_national: float = float("nan")
     table: pd.DataFrame = field(default_factory=pd.DataFrame)
     city_expected: pd.DataFrame = field(default_factory=pd.DataFrame)
     source: str = "history"
@@ -76,9 +77,12 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
     recent_ps = _tail_periods(nat, 3)
     longer_ps = _tail_periods(nat, 6)
     expected_nat, _, _, _ = _recent_level(nat, recent_ps, longer_ps)
+    nat_metrics = _period_volume_and_shops(hist, [])
+    expected_drop_nat = _expected_drop_size(nat_metrics, recent_ps, longer_ps)
 
     city_period = hist.groupby(["city", "period"], as_index=False)["volume_mt"].sum()
     city_period["month"] = city_period["period"].astype(str).str.slice(5, 7).astype(int)
+    city_metrics = _period_volume_and_shops(hist, ["city"])
     city_idx_rows = []
     city_exp_rows = []
     for city, g in city_period.groupby("city"):
@@ -96,6 +100,12 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
         same = g[g["month"] == month]
         n_s = int(len(same))
         expected, ams, trend, _ = _recent_level(g, recent_ps, longer_ps)
+        gm = (
+            city_metrics[city_metrics["city"].astype(str) == str(city)]
+            if city_metrics is not None and not city_metrics.empty
+            else g
+        )
+        drop_e = _expected_drop_size(gm, recent_ps, longer_ps)
         city_exp_rows.append(
             {
                 "city": city,
@@ -104,6 +114,7 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
                 "trend_mt": trend if pd.notna(trend) else None,
                 "n_same_month": n_s,
                 "seasonal_index": 1.0,
+                "expected_drop_size_mt": drop_e if pd.notna(drop_e) else None,
             }
         )
         for m, val in mixed.items():
@@ -152,6 +163,7 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
         n_same_month=n_same,
         national_index=nat_idx,
         expected_full_national=float(expected_nat) if pd.notna(expected_nat) else 0.0,
+        expected_drop_national=float(expected_drop_nat) if pd.notna(expected_drop_nat) else float("nan"),
         table=table,
         city_expected=city_expected,
         source=source,
@@ -251,6 +263,69 @@ def _recent_level(
     return expected, ams, longer_m, n
 
 
+def _period_volume_and_shops(frame: pd.DataFrame, keys: list[str] | None = None) -> pd.DataFrame:
+    """One row per key×period: volume, billed shops, drop size."""
+    keys = [k for k in (keys or []) if k]
+    cols = keys + ["period", "volume_mt", "billed_shops", "drop_size_mt"]
+    if frame is None or frame.empty or "period" not in frame.columns or "volume_mt" not in frame.columns:
+        return pd.DataFrame(columns=cols)
+    df = frame.copy()
+    df["period"] = df["period"].astype(str)
+    for k in keys:
+        if k not in df.columns:
+            df[k] = "(unmapped)"
+        df[k] = df[k].fillna("(unmapped)").replace("", "(unmapped)").astype(str)
+    group_cols = keys + ["period"]
+    vol = df.groupby(group_cols, as_index=False)["volume_mt"].sum()
+    if "store_id" in df.columns:
+        billed = df.loc[pd.to_numeric(df["volume_mt"], errors="coerce").fillna(0) > 0].copy()
+        if billed.empty:
+            shops = vol[group_cols].copy()
+            shops["billed_shops"] = 0.0
+        else:
+            billed["store_id"] = billed["store_id"].astype(str)
+            shops = (
+                billed.groupby(group_cols, as_index=False)["store_id"]
+                .nunique()
+                .rename(columns={"store_id": "billed_shops"})
+            )
+    else:
+        billed_col = pd.to_numeric(df.get("billed"), errors="coerce") if "billed" in df.columns else None
+        if billed_col is not None and billed_col.notna().any():
+            tmp = df.copy()
+            tmp["_b"] = billed_col.fillna(0)
+            shops = tmp.groupby(group_cols, as_index=False)["_b"].sum().rename(columns={"_b": "billed_shops"})
+        else:
+            shops = vol[group_cols].copy()
+            shops["billed_shops"] = np.where(vol["volume_mt"] > 0, 1.0, 0.0)
+    out = vol.merge(shops, on=group_cols, how="left")
+    out["billed_shops"] = pd.to_numeric(out["billed_shops"], errors="coerce").fillna(0.0)
+    out["drop_size_mt"] = np.where(out["billed_shops"] > 1e-9, out["volume_mt"] / out["billed_shops"], np.nan)
+    return out
+
+
+def _expected_drop_size(
+    panel: pd.DataFrame,
+    recent_periods: list[str] | None = None,
+    longer_periods: list[str] | None = None,
+) -> float:
+    """Expected MT per billed shop: Expected volume ÷ Expected billed shops.
+
+    Same window and blend as Expected sales. Not paced, and not this month's shop count.
+    """
+    if panel is None or panel.empty or "period" not in panel.columns or "volume_mt" not in panel.columns:
+        return float("nan")
+    if "billed_shops" not in panel.columns:
+        return float("nan")
+    vol = panel[["period", "volume_mt"]].copy()
+    shops = panel[["period", "billed_shops"]].rename(columns={"billed_shops": "volume_mt"})
+    exp_vol, _, _, _ = _recent_level(vol, recent_periods, longer_periods)
+    exp_shops, _, _, _ = _recent_level(shops, recent_periods, longer_periods)
+    if pd.isna(exp_vol) or pd.isna(exp_shops) or float(exp_shops) <= 1e-9:
+        return float("nan")
+    return float(exp_vol) / float(exp_shops)
+
+
 def _blend(typical: float, trend: float, n_same: int) -> float:
     t_ok = pd.notna(typical) and typical > 0
     r_ok = pd.notna(trend) and trend > 0
@@ -304,6 +379,7 @@ def expected_for_keys(
         "n_same_month",
         "n_periods",
         "credibility",
+        "expected_drop_size_mt",
     ]
     empty = pd.DataFrame(columns=cols)
     if shop_month is None or shop_month.empty or not period or not keys:
@@ -319,7 +395,9 @@ def expected_for_keys(
     hist = sm[sm["period"].astype(str) != str(period)]
     if hist.empty:
         return empty
-    grouped = hist.groupby(keys + ["period"], as_index=False)["volume_mt"].sum()
+    grouped = _period_volume_and_shops(hist, keys)
+    if grouped.empty:
+        return empty
     grouped["month"] = grouped["period"].astype(str).str.slice(5, 7).astype(int)
     recent_ps = _tail_periods(grouped, 3)
     longer_ps = _tail_periods(grouped, 6)
@@ -331,6 +409,7 @@ def expected_for_keys(
         n_g = int(g["period"].nunique())
         n_s = int((g["month"] == month).sum())
         expected, ams, trend, _ = _recent_level(g, recent_ps, longer_ps)
+        drop_e = _expected_drop_size(g, recent_ps, longer_ps)
         rec.update(
             {
                 "expected_full_mt": float(expected) if pd.notna(expected) else 0.0,
@@ -340,6 +419,7 @@ def expected_for_keys(
                 "n_same_month": n_s,
                 "n_periods": n_g,
                 "credibility": n_g / (n_g + 4.0) if n_g else 0.0,
+                "expected_drop_size_mt": drop_e if pd.notna(drop_e) else None,
             }
         )
         rows.append(rec)
@@ -376,15 +456,20 @@ def apply_child_expected(
         out["seasonal_typical_mt"] = ly
         out["expected_mt"] = ly * frac
         out["gap_mt"] = pd.to_numeric(out.get("volume_mt"), errors="coerce").fillna(0.0) - out["expected_mt"]
+        out["expected_drop_size_mt"] = np.nan
         return out
-    keep = keys + ["expected_full_mt", "seasonal_index", "typical_mt", "credibility"]
+    keep = keys + ["expected_full_mt", "seasonal_index", "typical_mt", "credibility", "expected_drop_size_mt"]
     learned = learned[[c for c in keep if c in learned.columns]].copy()
     for k in keys:
         if k in out.columns:
             out[k] = out[k].fillna("(unmapped)").replace("", "(unmapped)").astype(str)
         if k in learned.columns:
             learned[k] = learned[k].astype(str)
-    drop_learned = [c for c in ["expected_full_mt", "seasonal_index", "typical_mt", "credibility"] if c in out.columns]
+    drop_learned = [
+        c
+        for c in ["expected_full_mt", "seasonal_index", "typical_mt", "credibility", "expected_drop_size_mt"]
+        if c in out.columns
+    ]
     if drop_learned:
         out = out.drop(columns=drop_learned)
     out = out.merge(learned, on=keys, how="left")
@@ -540,10 +625,17 @@ def apply_city_expected(city_units: pd.DataFrame, fit: SeasonFit, intra_frac: fl
         return city_units
     out = city_units.copy()
     lookup = {}
+    drop_lookup: dict[str, float] = {}
     if fit.city_expected is not None and not fit.city_expected.empty:
         lookup = {str(k): v for k, v in fit.city_expected.set_index("city")["expected_full_mt"].to_dict().items()}
+        if "expected_drop_size_mt" in fit.city_expected.columns:
+            drop_lookup = {
+                str(k): v
+                for k, v in fit.city_expected.set_index("city")["expected_drop_size_mt"].to_dict().items()
+            }
     full = []
     idx = []
+    drops = []
     for _, r in out.iterrows():
         city = str(r.get("grain_id") or r.get("city") or "")
         # 0 is a valid Expected (no volume in the AMS window). Only a missing
@@ -558,6 +650,11 @@ def apply_city_expected(city_units: pd.DataFrame, fit: SeasonFit, intra_frac: fl
         else:
             exp = float(r.get("ly_mt") or 0)
         full.append(float(exp) if pd.notna(exp) else 0.0)
+        raw_drop = drop_lookup.get(city)
+        try:
+            drops.append(float(raw_drop) if raw_drop is not None and pd.notna(raw_drop) else float("nan"))
+        except (TypeError, ValueError):
+            drops.append(float("nan"))
         si = fit.national_index.get(fit.month, 1.0)
         if fit.city_expected is not None and not fit.city_expected.empty:
             hit = fit.city_expected[fit.city_expected["city"] == city]
@@ -566,6 +663,7 @@ def apply_city_expected(city_units: pd.DataFrame, fit: SeasonFit, intra_frac: fl
         idx.append(si)
     out["seasonal_typical_mt"] = full
     out["seasonal_index"] = idx
+    out["expected_drop_size_mt"] = drops
     frac = float(intra_frac or 1.0)
     out["expected_mt"] = out["seasonal_typical_mt"] * frac
     out["gap_mt"] = out["volume_mt"].fillna(0) - out["expected_mt"]

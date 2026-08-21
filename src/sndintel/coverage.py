@@ -17,8 +17,9 @@ Never-billed whitespace has opportunity 0 (no MT to recover) but still sits in
 visit % and strike %. If the visit file is missing for the period, unvisited is
 left at 0 and every missed door is booked as unbilled — we will not invent calls.
 
-Remarks compare visit rate, billed/visited (productivity), and drop size to the
-parent using the same robust-z used for isolation.
+Remarks compare visit rate, billed/visited (productivity), and drop size.
+Expected drop is Expected volume ÷ Expected billed shops (same last-3 / last-6
+run-rate as Expected sales). National average is this period's country drop.
 """
 
 from __future__ import annotations
@@ -439,10 +440,7 @@ def _drop_bit(r: pd.Series, parent: dict[str, Any], z) -> str:
         drop = vol / billed
     if drop is None:
         return ""
-    exp = _num(r.get("expected_mt"))
-    exp_drop = None
-    if exp is not None and billed and billed > 0:
-        exp_drop = exp / billed
+    exp_drop = _num(r.get("expected_drop_size_mt"))
     nat = _num(parent.get("drop_size_mt"))
     if exp_drop is not None and nat is not None:
         return (

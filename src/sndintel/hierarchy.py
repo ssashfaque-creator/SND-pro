@@ -101,6 +101,7 @@ UNIT_COLUMNS = [
     "mom_gap_mt",
     "seasonal_index",
     "seasonal_typical_mt",
+    "expected_drop_size_mt",
     "situation",
     "metrics_json",
     "visited",
@@ -276,6 +277,7 @@ def build_hierarchy_pack(
         nat_row["expected_mt"] = nat_expected
         nat_row["seasonal_typical_mt"] = season.expected_full_national
         nat_row["seasonal_index"] = season.national_index.get(season.month, 1.0)
+        nat_row["expected_drop_size_mt"] = season.expected_drop_national
         nat_row["gap_mt"] = nat_row["volume_mt"].fillna(0) - nat_row["expected_mt"]
         nat_row = apply_coverage_velocity(nat_row)
         nat_row = apply_expected_gap(nat_row, 1.0)

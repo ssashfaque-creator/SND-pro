@@ -321,3 +321,45 @@ def test_city_with_only_old_august_does_not_steal_expected_from_live_cities():
     assert float(ghost["expected_mt"]) < 5.0
     assert float(khi["expected_mt"]) > 30.0
 
+
+def test_expected_drop_size_matches_expected_sales_recipe_not_current_shops():
+    """Expected drop = Expected volume ÷ Expected billed shops (same last-3 blend).
+
+    Not paced Expected ÷ this month's billed shops. 20 doors at 2.2 MT in May–Jul
+    (44 MT, drop 2.2). August MTD: 10 doors at 1.8 MT (18 MT, drop 1.8).
+    Paced Expected ≈ 28, so 28/10 = 2.8 would be the old (wrong) remark.
+    """
+    from sndintel.briefing import build_strategy_pack
+
+    rows = []
+    for per in ("2026-05", "2026-06", "2026-07"):
+        for i in range(20):
+            rows.append(_shop_month(f"L{i}", per, 2.2, "Larkana"))
+    for i in range(10):
+        rows.append(_shop_month(f"L{i}", "2026-08", 1.8, "Larkana"))
+    sm = pd.DataFrame(rows)
+    stores = sm.drop_duplicates("store_id")[
+        ["store_id", "store_name", "distributor", "dsr_name", "zone", "city", "section"]
+    ]
+    ledger = pd.DataFrame(
+        [
+            {"period": "2026-05", "status": "closed"},
+            {"period": "2026-06", "status": "closed"},
+            {"period": "2026-07", "status": "closed"},
+            {"period": "2026-08", "status": "mtd_open", "as_of_day": 20, "days_in_month": 31},
+        ]
+    )
+    pack = build_hierarchy_pack(sm, stores, ledger=ledger)
+    city = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Larkana")].iloc[0]
+    billed = float(city["billed"])
+    expected = float(city["expected_mt"])
+    drop_e = float(city["expected_drop_size_mt"])
+    assert billed == 10
+    assert abs(drop_e - 2.2) < 0.15
+    # Old remark used paced Expected ÷ current billed shops (~2.8) or full Expected ÷ current shops (~4.4).
+    assert abs(drop_e - (expected / billed)) > 0.3
+    report = build_strategy_pack(pack.units, sm, period="2026-08", ledger=ledger)
+    row = report.cities[report.cities["City"] == "Larkana"].iloc[0]
+    remarks = str(row["Remarks"])
+    assert "vs expected 2.20" in remarks or "vs expected 2.2" in remarks
+

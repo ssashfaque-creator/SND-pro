@@ -58,7 +58,7 @@ How the pack is built (use these definitions; do not redefine them in the prose)
 - Lagging = behind this unit's own Expected by a material amount (Gap > 0). Ahead = billed above Expected. On expected = billed in line with the recent run-rate.
 - Gap = the hole versus this unit's own Expected as a positive number. Country Gap is the country miss versus Expected.
 - From drop / unvisited / unbilled add to Gap. Positive = part of the hole. Negative = billed more than Expected.
-- Drop size (MT) = billed MT ÷ billed shops. Remarks compare drop size vs expected drop (Expected ÷ billed shops) vs the national average. It is not From drop size.
+- Drop size (MT) = billed MT ÷ billed shops. Remarks compare drop size vs expected drop vs the national average. Expected drop = Expected volume ÷ Expected billed shops (same last-3 / last-6 run-rate as Expected sales; not paced; not this month’s shop count). It is not From drop size.
 - Visit % = visited ÷ universe (a billed shop counts as visited). Strike % = billed ÷ universe.
 - AMS = 0 distributors/DSRs are already hidden. Shop lists already drop doors with Gap ≤ 0.25 MT; the remainder line is the tail.
 - Last-year = 0 can produce a huge YoY %. That is an artifact, not a win.

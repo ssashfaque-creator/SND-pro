@@ -54,7 +54,7 @@ GLOSSARY = [
     ("From unvisited shops (MT)", "Share of the gap from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of Expected."),
     ("From unbilled shops (MT)", "Share of the gap from doors that were visited (or, if no visit file, simply not billed) but did not buy. Positive = hole; negative = ahead of Expected."),
     ("Drop size (MT)", "Average billed volume per billed shop this period (billed MT ÷ billed shops). Not the same as From drop size, which is that driver’s share of Gap."),
-    ("Remarks", "Four bullets: trend vs AMS, vs Expected, and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; drop size vs expected drop (Expected ÷ billed shops) vs national average."),
+    ("Remarks", "Four bullets: trend vs AMS, vs Expected, and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; drop size vs expected drop vs national average. Expected drop is Expected volume ÷ Expected billed shops — same last-3 / last-6 run-rate as Expected sales, not this month’s shop count and not paced."),
     ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
     ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
     ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
@@ -77,7 +77,7 @@ CALCULATION_NOTES = [
     ),
     (
         "Drop size (MT) versus From drop size",
-        "Drop size is billed MT ÷ billed shops this period (two decimals). From drop size is that driver’s share of Gap, not the average drop.",
+        "Drop size is billed MT ÷ billed shops this period (two decimals). Expected drop is Expected volume ÷ Expected billed shops, using the same last-three-month / last-six-month recipe as Expected sales — not paced Expected ÷ this month’s billed shops. From drop size is that driver’s share of Gap, not the average drop.",
     ),
     (
         "vs AMS",
