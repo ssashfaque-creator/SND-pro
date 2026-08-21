@@ -112,8 +112,8 @@ def test_ams_identical_shop_month_copies_are_not_summed():
     assert abs(float(ams.iloc[0]["ams_3m"]) - 10.0) < 1e-9
 
 
-def test_pack_ams_is_paced_when_mtd_is_open():
-    """Day 15 MTD: printed AMS is half of the full-month last-3 mean, next to billed."""
+def test_pack_ams_stays_full_month_when_mtd_is_open():
+    """Day 15 MTD: printed AMS is the full-month last-3 mean; vs AMS applies 15/31."""
     rows = []
     rows.append(_row("K1", "2026-08", 15.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
     rows.append(_row("K1", "2025-08", 31.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
@@ -137,10 +137,10 @@ def test_pack_ams_is_paced_when_mtd_is_open():
     country = report.cities[report.cities["City"] == "Country"].iloc[0]
     ams = float(country["AMS last 3 months (MT)"])
     billed = float(country["Billed this period (MT)"])
-    assert abs(ams - 15.0) < 1.0, ams  # 31 × 15/31
+    assert abs(ams - 31.0) < 1.0, ams
     assert abs(billed - 15.0) < 1.0
     vs = float(country["vs AMS (MT)"])
-    assert abs(vs - (billed - ams)) < 1.5
+    assert abs(vs - (billed - 31.0 * (15.0 / 31.0))) < 1.5
 
 
 def test_pack_layers_cities_then_those_dists_then_all_dists():

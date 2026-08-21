@@ -776,7 +776,10 @@ def _page_report(data, _latest, period, mtd, ledger):
 
 def _rescore_button():
     st.divider()
-    st.caption("Code updates do not wipe the warehouse. Rebuild scorecards from facts already on disk — no re-upload.")
+    st.caption(
+        "Code updates do not wipe the warehouse. Rebuild scorecards from facts already on disk. "
+        "If billed is double your extract, re-upload the sales file — duplicate lines used to be summed into one row."
+    )
     if st.button("Rebuild scorecards from warehouse"):
         with st.spinner("Rebuilding city → distributor → DSR → shop scorecards from the warehouse."):
             try:

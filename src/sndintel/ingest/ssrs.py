@@ -211,20 +211,28 @@ def _hierarchy_total_columns(raw: pd.DataFrame) -> set[int]:
 
     SSRS names year-group measures ``val_TotalC_*``; those contain the word
     'total' but they ARE the MTD for 2025/2026/etc. when ``uval_MTD`` is empty.
+
+    Only the header band is inspected. A data SKU named ``Hameed GS Total``
+    must not hide the whole SKU column (that used to drop every product line).
     """
     skip: set[int] = set()
-    scan = raw.head(8)
+    header_end = min(6, len(raw))
+    for idx, row in raw.head(16).iterrows():
+        if any(looks_like_store_id(v) for v in row.tolist()):
+            header_end = int(idx)
+            break
+    scan = raw.iloc[: max(header_end, 1)]
     for col in raw.columns:
         values = [cell_str(v) for v in scan[col].tolist()]
-        headerish = " ".join(values[:6])
+        headerish = " ".join(values)
         key = norm_key(headerish).replace(" ", "_")
         if key.startswith("uval_") or "val_totalc" in key:
             continue
         if key.startswith("txt_total"):
             skip.add(int(col))
             continue
-        if any(looks_like_total(v) for v in values[:6]):
-            joined = " ".join(values[:6]).lower()
+        if any(looks_like_total(v) for v in values):
+            joined = " ".join(values).lower()
             if "grand total" in joined or joined.strip().endswith("total") or " total" in joined:
                 skip.add(int(col))
     return skip
@@ -399,6 +407,75 @@ def _resolve_mtd(df: pd.DataFrame, yg_cols: list[str]) -> pd.Series:
     return resolved
 
 
+def collapse_sales_facts(df: pd.DataFrame) -> pd.DataFrame:
+    """One fact per shop + SKU + month. Duplicate lines are copies, not extra volume.
+
+    Shop SKU Wise MTD is already a month total. Summing identical (or near-identical)
+    lines writes one warehouse row at 2×, so billed and AMS both look double versus
+    the user's extract. Rebuild cannot un-sum that; this collapse must run at parse
+    time and again when reading the warehouse.
+    """
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    out["store_id"] = out["store_id"].astype(str).str.strip()
+    if "sku" in out.columns:
+        out["sku"] = out["sku"].map(lambda v: " ".join(cell_str(v).split()))
+        out = out.loc[~out["sku"].map(looks_like_total) & out["sku"].ne("")].copy()
+    if "period" in out.columns:
+        out["period"] = out["period"].astype(str).str.strip()
+    out["volume_mt"] = pd.to_numeric(out.get("volume_mt"), errors="coerce")
+    out = out.loc[out["volume_mt"].notna() & (out["volume_mt"] > 0)].copy()
+    if out.empty:
+        return out
+
+    dup_cols = [c for c in ("store_id", "sku", "period", "volume_mt") if c in out.columns]
+    out = out.drop_duplicates(dup_cols, keep="first")
+
+    if "_prefer_mtd" in out.columns:
+        out["_prefer_mtd"] = out["_prefer_mtd"].fillna(False).astype(bool)
+        out = out.sort_values("_prefer_mtd", ascending=False, kind="mergesort")
+
+    key = [c for c in ("store_id", "sku", "period") if c in out.columns]
+    extra = [c for c in out.columns if c not in key]
+    grouped = out.groupby(key, as_index=False, sort=False).agg({c: "first" for c in extra})
+    grouped = _drop_embedded_shop_totals(grouped)
+    if "_prefer_mtd" in grouped.columns:
+        grouped = grouped.drop(columns=["_prefer_mtd"])
+    return grouped.reset_index(drop=True)
+
+
+def _drop_embedded_shop_totals(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop a SKU whose volume is the sum of the other SKUs at that shop-month.
+
+    SSRS sometimes repeats the shop total as an extra product line. Do not drop
+    when only two SKUs have the same volume — that would wipe both real lines.
+    """
+    if df is None or df.empty:
+        return df
+    if not {"store_id", "period", "volume_mt"}.issubset(df.columns):
+        return df
+    if len(df) < 3:
+        return df
+    work = df.reset_index(drop=True)
+    drop: list[int] = []
+    for _, part in work.groupby(["store_id", "period"], sort=False):
+        if len(part) < 3:
+            continue
+        vols = pd.to_numeric(part["volume_mt"], errors="coerce").fillna(0.0)
+        total = float(vols.sum())
+        matches = [
+            int(idx)
+            for idx, val in vols.items()
+            if (total - float(val)) > 1e-9 and abs(float(val) - (total - float(val))) <= 1e-6
+        ]
+        if len(matches) == 1:
+            drop.append(matches[0])
+    if not drop:
+        return work
+    return work.drop(index=drop).reset_index(drop=True)
+
+
 def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
     df = mapped.copy()
     if "calendar" in df.columns:
@@ -427,12 +504,16 @@ def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
     df["year"] = df.get("year", pd.Series([None] * len(df))).map(parse_year)
     df["month"] = df.get("month", pd.Series([None] * len(df))).map(parse_month)
     yg_cols = [c for c in df.columns if str(c).startswith("volume_yg_")]
+    had_mtd = (
+        df["volume_mt"].map(parse_volume) if "volume_mt" in df.columns else pd.Series([None] * len(df), index=df.index)
+    )
     if "volume_mt" not in df.columns:
         report.warnings.append("No uval_MTD column detected; using year-group measures")
         df["volume_mt"] = None
     df["volume_mt"] = _resolve_mtd(df, yg_cols)
     if yg_cols:
         report.warnings.append(f"Resolved MTD from {len(yg_cols)} SSRS year-group measure column(s)")
+    df["_prefer_mtd"] = had_mtd.notna()
 
     # Drop repeating header labels and SSRS total rows.
     def _is_junk(row) -> bool:
@@ -442,6 +523,8 @@ def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
         if not sid or looks_like_total(sid) or looks_like_total(row.get("store_name")):
             return True
         if looks_like_total(row.get("distributor")) or looks_like_total(row.get("dsr_name")):
+            return True
+        if looks_like_total(row.get("sku")):
             return True
         if dist in LABEL_VALUES or sku in LABEL_VALUES:
             return True
@@ -461,16 +544,11 @@ def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
     df["volume_mt"] = df["volume_mt"].fillna(0.0).astype(float)
     df["store_id"] = df["store_id"].astype(str).str.strip()
     df = df[df["volume_mt"] > 0]
-    grouped = (
-        df.groupby(["store_id", "sku", "period"], as_index=False)
-        .agg(
-            distributor=("distributor", "last"),
-            dsr_name=("dsr_name", "last"),
-            section=("section", "last"),
-            store_name=("store_name", "last"),
-            year=("year", "last"),
-            month=("month", "last"),
-            volume_mt=("volume_mt", "sum"),
+    n_before = len(df)
+    grouped = collapse_sales_facts(df)
+    n_dropped = n_before - len(grouped)
+    if n_dropped > 0:
+        report.warnings.append(
+            f"Dropped {n_dropped} duplicate or shop-total sales lines (same shop/SKU/month was in the file twice)"
         )
-    )
     return grouped[SALES_COLUMNS].reset_index(drop=True)

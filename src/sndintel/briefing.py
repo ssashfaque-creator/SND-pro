@@ -47,8 +47,8 @@ DRIVER_LABEL = {
 
 GLOSSARY = [
     ("Billed this period", "Secondary volume in the month being scored (MTD if the month is still open)."),
-    ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. If the month is still open, the printed AMS is that run-rate × the fraction of the month elapsed, same clock as billed and Expected."),
-    ("vs AMS", "Billed this period minus the printed AMS. Negative = behind the recent run-rate. On an open MTD that is already billed − AMS × (elapsed days ÷ days in month), because AMS is paced in the table."),
+    ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. This is always a full-month run-rate, even when billed is MTD."),
+    ("vs AMS", "This period minus AMS × fraction of the month elapsed. Negative = behind the recent run-rate. On day 20 that is billed − AMS × (20 ÷ days in month), not billed − AMS. The AMS column itself stays the full-month number."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month). Zero means no August last year — it does not mean Expected should be zero."),
     ("Expected this month", "Recent run-rate: mean of the three calendar months immediately before this period (same window as AMS), blended with the last-six-month median, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
     ("Gap", "The hole versus this unit’s own Expected, as a positive number — volume that comes back if the unit billed its recent run-rate. Country Gap is the country miss versus Expected. Zero means billed at or above Expected, not that AMS is irrelevant."),
@@ -87,7 +87,7 @@ CALCULATION_NOTES = [
     ),
     (
         "vs AMS",
-        "Billed minus the printed AMS. When MTD is open, AMS in the table is already the last-three-month run-rate × elapsed fraction, so this is billed minus that to-date number.",
+        "Billed minus (AMS of the last three calendar months × fraction of the month elapsed). Negative = behind the recent run-rate. AMS in the table is always the full-month run-rate.",
     ),
     (
         "Visit % and Strike %",
@@ -95,7 +95,7 @@ CALCULATION_NOTES = [
     ),
     (
         "Open MTD",
-        "Billed is month-to-date. AMS and Expected in the tables are paced to the same elapsed fraction. Last year is the full closed same month.",
+        "Billed is month-to-date. Expected is paced. AMS in the table is still the full-month last-three-month run-rate; vs AMS applies the elapsed fraction. Last year is the full closed same month.",
     ),
     (
         "Rounding and lists",
@@ -1248,12 +1248,9 @@ def _attach_ams(
     left["_row"] = range(len(left))
     merged = left.merge(right, on=keys, how="left")
     merged = merged.sort_values("_row").drop(columns=["_row"])
-    ams_v = pd.to_numeric(merged["ams_3m"], errors="coerce").fillna(0.0)
+    ams_v = pd.to_numeric(merged["ams_3m"], errors="coerce")
     vol = pd.to_numeric(merged.get("volume_mt"), errors="coerce")
-    # Pack AMS sits next to billed: pace it when MTD is open so a day-15
-    # extract does not show a full-month run-rate next to half a month of billed.
-    merged["ams_3m"] = ams_v * float(pace or 1.0)
-    merged["vs_ams_mt"] = vol - merged["ams_3m"]
+    merged["vs_ams_mt"] = vol - ams_v * float(pace or 1.0)
     return merged
 
 
@@ -1369,9 +1366,9 @@ def _attach_national_ams(
         out["vs_ams_mt"] = pd.NA
         return out
     full = float(pd.to_numeric(ams["ams_3m"], errors="coerce").iloc[0])
-    out["ams_3m"] = full * float(pace or 1.0)
+    out["ams_3m"] = full
     vol = pd.to_numeric(out.get("volume_mt"), errors="coerce")
-    out["vs_ams_mt"] = vol - out["ams_3m"]
+    out["vs_ams_mt"] = vol - (full * float(pace or 1.0) if pd.notna(full) else 0.0)
     return out
 
 

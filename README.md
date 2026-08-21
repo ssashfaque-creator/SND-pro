@@ -128,7 +128,7 @@ pip install -e .
 snd-intel app
 ```
 
-Open the app → **Strategy** → **Rebuild scorecards from warehouse**. That rebuilds city / distributor / DSR / shop names from months already stored. You do **not** re-upload July or August.
+Open the app → **Strategy** → **Rebuild scorecards from warehouse**. That rebuilds city / distributor / DSR / shop names from months already stored. You do **not** re-upload July or August for a normal code update. If billed is **double** the numbers on your Shop SKU Wise list, re-upload the sales extract after this update — the old parser summed duplicate lines into one warehouse row, and rebuild cannot un-sum that.
 
 ## How a new file is applied
 

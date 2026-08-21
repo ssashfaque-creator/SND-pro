@@ -12,7 +12,7 @@ import pandas as pd
 from sndintel.config import DATA_DIR, DB_PATH, PROCESSED_DIR, ensure_dirs
 from sndintel.features import add_calendar_panel, build_features, latest_period, rebuild_shop_month
 from sndintel.ingest.shops import parse_shop_master
-from sndintel.ingest.ssrs import parse_sales_file
+from sndintel.ingest.ssrs import collapse_sales_facts, parse_sales_file
 from sndintel.ingest.universe import fill_zone_from_legacy, parse_universe
 from sndintel.ingest.visits import parse_visit_calls
 from sndintel.hierarchy import HierarchyPack, build_hierarchy_pack, plays_from_pack
@@ -120,7 +120,7 @@ def run_pipeline(
                 new_ids["updated_at"] = utcnow()
                 _upsert_stores(conn, new_ids)
 
-            facts = sales.copy()
+            facts = collapse_sales_facts(sales.copy())
             facts["source_file"] = sales_path.name
             facts["ingested_at"] = utcnow()
             touched_periods = sorted(facts["period"].dropna().unique().tolist())
@@ -331,6 +331,22 @@ def run_pipeline(
     }
 
 
+SALES_FACT_COLS = [
+    "store_id",
+    "sku",
+    "period",
+    "year",
+    "month",
+    "volume_mt",
+    "distributor",
+    "dsr_name",
+    "section",
+    "store_name",
+    "source_file",
+    "ingested_at",
+]
+
+
 SHOP_MONTH_COLS = [
     "store_id",
     "period",
@@ -389,6 +405,23 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
     """Rebuild features, insights, and the city→shop hierarchy from warehouse facts."""
     stores_all = read_sql(conn, "SELECT * FROM stores")
     facts_all = read_sql(conn, "SELECT * FROM sales_facts")
+    if facts_all is not None and not facts_all.empty:
+        n_before = len(facts_all)
+        vol_before = float(pd.to_numeric(facts_all["volume_mt"], errors="coerce").fillna(0).sum())
+        cleaned = collapse_sales_facts(facts_all)
+        vol_after = (
+            float(pd.to_numeric(cleaned["volume_mt"], errors="coerce").fillna(0).sum())
+            if cleaned is not None and not cleaned.empty
+            else 0.0
+        )
+        if len(cleaned) != n_before or abs(vol_after - vol_before) > 1e-6:
+            # Duplicate SKU lines were stored as separate keys (whitespace, copies).
+            # Persist the collapsed facts so SKU mix and billed are not still 2×.
+            conn.execute("DELETE FROM sales_facts")
+            cols = [c for c in SALES_FACT_COLS if c in cleaned.columns]
+            if cols and not cleaned.empty:
+                upsert_dataframe(conn, "sales_facts", cleaned[cols], ["store_id", "sku", "period"])
+        facts_all = cleaned
     stores_df = _active_universe(stores_all)
     facts_df = facts_all
     if stores_df is not None and not stores_df.empty and stores_all is not None and len(stores_df) < len(stores_all):
