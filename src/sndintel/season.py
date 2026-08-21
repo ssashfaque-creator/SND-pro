@@ -3,7 +3,8 @@
 A city that never billed in August (LY = 0) can still be running 40 MT/month
 in May–July. Multiplying destationalized trend by an August index of ~0
 produces a 4 MT Expected against a 44 MT AMS — a false “ahead”. Expected
-therefore uses the last three closed months (same window as AMS), blended
+therefore uses the last three closed months before this period (May–July
+when scoring August — not DSS L3M, which includes this month), blended
 with the last-six-month median, then paced if MTD is open. Children still
 add to the parent Expected.
 

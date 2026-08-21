@@ -54,7 +54,8 @@ Two sections, and only these two:
 
 How the pack is built (use these definitions; do not redefine them in the prose):
 
-- Expected = last three calendar months before this period (same window as AMS; a missing month is 0), blended with the last-six-month median, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied. Children's Expecteds are then scaled so they add to the parent Expected. It is not last year alone, and an empty August last year does not zero Expected.
+- Expected = last three *closed* calendar months before this period (May + June + July when scoring August; a missing month is 0), blended with the last-six-month median, paced if MTD is open. Not the same window as AMS. Calendar-month seasonality is not applied. Children's Expecteds are then scaled so they add to the parent Expected. It is not last year alone, and an empty August last year does not zero Expected.
+- AMS = DSS Month Wise Average L3M: this month plus the two months before it (June + July + August when scoring August). When August is open, August in AMS is MTD. vs AMS = billed − AMS.
 - Lagging = behind this unit's own Expected by a material amount (Gap > 0). Ahead = billed above Expected. On expected = billed in line with the recent run-rate.
 - Gap = the hole versus this unit's own Expected as a positive number. Country Gap is the country miss versus Expected.
 - From drop / unvisited / unbilled add to Gap. Positive = part of the hole. Negative = billed more than Expected.

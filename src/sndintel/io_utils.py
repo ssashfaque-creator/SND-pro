@@ -167,3 +167,15 @@ def prior_periods(period: str, n: int = 3) -> list[str]:
     if not period or n <= 0:
         return []
     return [shift_period(str(period), -i) for i in range(int(n), 0, -1)]
+
+
+def trailing_periods(period: str, n: int = 3) -> list[str]:
+    """n calendar months ending at ``period``, oldest first.
+
+    Scoring 2026-08 with n=3 → 2026-06, 2026-07, 2026-08. Matches DSS
+    Month Wise Average L3M (this month + the two before it). A missing
+    month stays in the window as 0.
+    """
+    if not period or n <= 0:
+        return []
+    return [shift_period(str(period), -i) for i in range(int(n) - 1, -1, -1)]

@@ -81,7 +81,7 @@ def build_coverage_book(
     )
     from sndintel.briefing import ams_last_n
 
-    ams = ams_last_n(sm, period, ["store_id"], ledger=ledger) if not sm.empty else pd.DataFrame(columns=["store_id", "ams_3m"])
+    ams = ams_last_n(sm, period, ["store_id"], ledger=ledger, include_current=False) if not sm.empty else pd.DataFrame(columns=["store_id", "ams_3m"])
     vis = pd.DataFrame(columns=["store_id", "visits"])
     has_visit_file = False
     if visits is not None and not visits.empty and "store_id" in visits.columns:
