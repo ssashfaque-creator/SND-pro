@@ -128,7 +128,9 @@ pip install -e .
 snd-intel app
 ```
 
-Open the app → **Strategy** → **Rebuild scorecards from warehouse**. That rebuilds city / distributor / DSR / shop names from months already stored. You do **not** re-upload July or August for a normal code update. If billed is **double** the numbers on your Shop SKU Wise list, re-upload the sales extract after this update — the old parser summed duplicate lines into one warehouse row, and rebuild cannot un-sum that.
+Open the app → **Strategy** → **Rebuild scorecards from warehouse**. Then open **Warehouse** and pick **Agha Traders (Quetta)** + **2026-07**: the shop list and MT total should match that distributor’s July total on Shop SKU Wise (about 14.51 MT), not ~2×. Country 2026-07 should be near the extract Grand Total (~996 MT) and 2026-08 near the MTD Grand Total (~375 MT).
+
+If billed is still double after this update, **re-upload the sales extract** — an older warehouse row can still hold the inflated number.
 
 ## How a new file is applied
 

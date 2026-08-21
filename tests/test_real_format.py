@@ -86,11 +86,24 @@ def test_staggered_stores_are_not_prefilled_as_zeros(tmp_path):
     assert abs(float(old["lag_12"]) - 0.05) < 1e-9
 
 
-def _ssrs_line(store_id, store_name, sku, year, month, volume, *, dist="Agha Traders", dsr="ASHRAF KHAN", section="Alamdar Road"):
+def _ssrs_line(
+    store_id,
+    store_name,
+    sku,
+    year,
+    month,
+    volume,
+    *,
+    dist="Agha Traders",
+    dsr="ASHRAF KHAN",
+    section="Alamdar Road",
+    yg=None,
+):
     mtd = "" if volume is None else str(volume)
+    year_group = mtd if yg is None else str(yg)
     return (
         f"DISTRIBUTOR NAME,DSR NAME,{dist},{dsr},{section},{store_id},{store_name},"
-        f"{sku},{year},{month},{mtd},{year} Total,{mtd},,{store_name} Total,{mtd}"
+        f"{sku},{year},{month},{mtd},{year} Total,{year_group},,{store_name} Total,{mtd}"
     )
 
 
@@ -239,3 +252,61 @@ def test_rescore_collapses_duplicate_sku_keys_in_warehouse(tmp_path):
     assert abs(float(facts["volume_mt"].sum()) - 0.04) < 1e-9
     july = shop_month[shop_month["period"].astype(str) == "2026-07"]
     assert abs(float(july["volume_mt"].sum()) - 0.04) < 1e-9
+
+
+def test_empty_mtd_month_is_not_filled_from_year_group(tmp_path):
+    """July+August extract: year-group repeats July on the August row. August MTD stays empty."""
+    lines = [
+        _ssrs_line("T0001601401000016136", "Hameed GS", "Maan Banaspati Pouch 1X5Kg", 2026, "July", 0.01),
+        _ssrs_line("T0001601401000016136", "Hameed GS", "Maan Banaspati Pouch 1X5Kg", 2026, "August", None, yg=0.01),
+    ]
+    csv_path = _ssrs_csv(tmp_path / "jul_aug.csv", lines)
+    df, _ = parse_sales_file(csv_path)
+    jul = df[(df["store_id"] == "T0001601401000016136") & (df["period"] == "2026-07")]
+    aug = df[(df["store_id"] == "T0001601401000016136") & (df["period"] == "2026-08")]
+    assert abs(float(jul["volume_mt"].sum()) - 0.01) < 1e-9
+    assert aug.empty or float(aug["volume_mt"].sum()) < 1e-9
+
+
+def test_distributor_shop_sales_lists_every_billed_shop():
+    from sndintel.reconcile import distributor_shop_sales, period_totals
+
+    sm = pd.DataFrame(
+        [
+            {
+                "store_id": "T1",
+                "store_name": "Hameed GS",
+                "distributor": "Agha Traders (Quetta)",
+                "dsr_name": "ASHRAF KHAN",
+                "section": "Alamdar Road",
+                "period": "2026-07",
+                "sku_count": 3,
+                "volume_mt": 0.03,
+            },
+            {
+                "store_id": "T2",
+                "store_name": "Asif Sugar Dealer",
+                "distributor": "Agha Traders (Quetta)",
+                "dsr_name": "ASHRAF KHAN",
+                "section": "Alamdar Road",
+                "period": "2026-07",
+                "sku_count": 2,
+                "volume_mt": 0.14,
+            },
+            {
+                "store_id": "T3",
+                "store_name": "Other City Mart",
+                "distributor": "Coastal Foods",
+                "dsr_name": "BILAL",
+                "section": "Korangi",
+                "period": "2026-07",
+                "sku_count": 1,
+                "volume_mt": 1.00,
+            },
+        ]
+    )
+    agha = distributor_shop_sales(sm, "Agha", "2026-07")
+    assert list(agha["store_name"]) == ["Asif Sugar Dealer", "Hameed GS"]
+    assert abs(float(agha["volume_mt"].sum()) - 0.17) < 1e-9
+    nat = period_totals(sm)
+    assert abs(float(nat.loc[nat["period"] == "2026-07", "volume_mt"].iloc[0]) - 1.17) < 1e-9

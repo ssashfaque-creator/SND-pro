@@ -383,6 +383,12 @@ def _resolve_mtd(df: pd.DataFrame, yg_cols: list[str]) -> pd.Series:
     'first filled measure' would leak last year into this year. Map each
     year-group column to a calendar year (match against rows where MTD is
     present; otherwise newest year → first group) and only backfill that year.
+
+    Year-groups are a year matrix: the same value is repeated on every month
+    row (often July+August combined). Copying them onto empty MTD months is
+    what made August billed look ~2× the extract. Only backfill when that
+    shop+SKU+year appears in a single month — then the year-group *is* the
+    month, as in a one-month export.
     """
     mtd = df["volume_mt"].map(parse_volume) if "volume_mt" in df.columns else pd.Series([None] * len(df), index=df.index)
     if not yg_cols:
@@ -400,9 +406,13 @@ def _resolve_mtd(df: pd.DataFrame, yg_cols: list[str]) -> pd.Series:
         if best != year_to_col.get(y0):
             ordered = [best] + [c for c in yg_cols if c != best]
             year_to_col = {y: ordered[i] for i, y in enumerate(uniq) if i < len(ordered)}
+    single_month = pd.Series(True, index=df.index)
+    if {"store_id", "sku", "year", "month"}.issubset(df.columns):
+        keys = df["store_id"].map(cell_str) + "\0" + df["sku"].map(cell_str) + "\0" + df["year"].astype(str)
+        single_month = df.groupby(keys, sort=False)["month"].transform("nunique").fillna(1).le(1)
     resolved = mtd.copy()
     for y, col in year_to_col.items():
-        pick = (years == y) & resolved.isna()
+        pick = (years == y) & resolved.isna() & single_month
         resolved = resolved.where(~pick, yg[col])
     return resolved
 

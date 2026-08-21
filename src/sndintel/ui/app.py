@@ -982,6 +982,56 @@ def _page_warehouse(data):
         show = season[season["grain"].isin(["national", "city"])].copy()
         st.dataframe(show.sort_values(["grain", "grain_id", "month"]), use_container_width=True, hide_index=True)
     st.caption("Updating the app does not wipe this warehouse. Use Strategy → Rebuild scorecards if the briefing looks stale.")
+    sm = data.get("shop_month", pd.DataFrame())
+    if sm is not None and not sm.empty:
+        from sndintel.reconcile import distributor_shop_sales, match_distributors, period_totals
+
+        st.subheader("Check billed vs your extract")
+        st.caption(
+            "Pick a distributor and a **closed** month (July). Sum the shops and compare to that "
+            "distributor’s total on Shop SKU Wise for the same year and month. "
+            "Country totals below should match the extract’s Grand Total for that month — not ~2×."
+        )
+        nat = period_totals(sm)
+        if not nat.empty:
+            st.dataframe(
+                nat.rename(columns={"period": "Month", "shops": "Billed shops", "volume_mt": "Billed (MT)"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+        names = match_distributors(sm)
+        periods = sorted(sm["period"].astype(str).unique().tolist())
+        if names and periods:
+            c1, c2 = st.columns(2)
+            with c1:
+                dist = st.selectbox("Distributor", names, key="check_dist")
+            with c2:
+                default_i = periods.index("2026-07") if "2026-07" in periods else max(0, len(periods) - 2)
+                per = st.selectbox("Month", periods, index=default_i, key="check_period")
+            shops = distributor_shop_sales(sm, dist, per)
+            total = float(shops["volume_mt"].sum()) if not shops.empty else 0.0
+            st.markdown(
+                f"**{dist}** · **{per}** · **{len(shops)} shops** · **{total:.2f} MT**. "
+                "This is what the scorecards use. It should match your list."
+            )
+            if not shops.empty:
+                show = shops.rename(
+                    columns={
+                        "store_name": "Shop",
+                        "store_id": "POP",
+                        "dsr_name": "DSR",
+                        "section": "Section",
+                        "sku_count": "SKUs",
+                        "volume_mt": "Billed (MT)",
+                    }
+                )
+                st.dataframe(show, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download this shop list (CSV)",
+                    show.to_csv(index=False).encode("utf-8"),
+                    file_name=f"shops_{per}_{dist[:40]}.csv",
+                    mime="text/csv",
+                )
     runs = data["runs"]
     if not runs.empty:
         st.subheader("Recent runs")

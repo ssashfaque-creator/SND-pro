@@ -206,6 +206,54 @@ def where_cmd():
     console.print(f"warehouse {DB_PATH}")
 
 
+@app.command("check-sales")
+def check_sales(
+    distributor: str = typer.Option(..., "--distributor", "-d", help="Distributor name (substring is ok)"),
+    period: str = typer.Option(..., "--period", "-p", help="Calendar month, e.g. 2026-07"),
+):
+    """Shop-wise billed MT for one distributor and month — compare to Shop SKU Wise."""
+    init_db()
+    from sndintel.reconcile import distributor_shop_sales, period_totals
+
+    with connect() as conn:
+        shop_month = read_sql(conn, "SELECT * FROM shop_month")
+    if shop_month.empty:
+        console.print("Warehouse has no shop-month facts. Ingest a sales extract first.")
+        raise typer.Exit(1)
+    totals = period_totals(shop_month)
+    if not totals.empty:
+        table = Table(title="Every month in the warehouse (compare to Grand Total on the extract)")
+        table.add_column("Period")
+        table.add_column("Shops", justify="right")
+        table.add_column("Billed MT", justify="right")
+        for _, row in totals.iterrows():
+            table.add_row(str(row["period"]), str(int(row["shops"])), f"{float(row['volume_mt']):.2f}")
+        console.print(table)
+    shops = distributor_shop_sales(shop_month, distributor, period)
+    if shops.empty:
+        console.print(f"No billed shops for [bold]{distributor}[/] in {period}.")
+        raise typer.Exit(1)
+    shown = shops.head(50)
+    table = Table(title=f"{distributor} · {period} · {len(shops)} billed shops · {float(shops['volume_mt'].sum()):.2f} MT")
+    table.add_column("Shop")
+    table.add_column("POP")
+    table.add_column("DSR")
+    table.add_column("MT", justify="right")
+    for _, row in shown.iterrows():
+        table.add_row(
+            str(row.get("store_name") or ""),
+            str(row.get("store_id") or ""),
+            str(row.get("dsr_name") or ""),
+            f"{float(row['volume_mt']):.2f}",
+        )
+    console.print(table)
+    if len(shops) > 50:
+        console.print(f"Showing 50 of {len(shops)}. Full list is in the app Warehouse page.")
+    console.print(
+        "That MT total should match the distributor total on the Shop SKU Wise line for this year and month."
+    )
+
+
 @app.command("serve-api")
 def serve_api(port: int = 8080):
     """Serve the JSON API so a later ReAct agent can query insights deterministically."""
