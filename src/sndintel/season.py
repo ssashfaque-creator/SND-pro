@@ -404,9 +404,10 @@ def reconcile_expected(
         if target is not None and target > 1e-9 and total > 1e-9:
             g[exp_col] = series * (target / total)
             g["seasonal_typical_mt"] = g[exp_col] / frac
-            vol = pd.to_numeric(g.get("volume_mt"), errors="coerce").fillna(0.0)
-            g["gap_mt"] = vol - g[exp_col]
-            g["gap_pct"] = np.where(g[exp_col] > 1e-9, g["gap_mt"] / g[exp_col] * 100, np.nan)
+            if "volume_mt" in g.columns:
+                vol = pd.to_numeric(g["volume_mt"], errors="coerce").fillna(0.0)
+                g["gap_mt"] = vol - g[exp_col]
+                g["gap_pct"] = np.where(g[exp_col] > 1e-9, g["gap_mt"] / g[exp_col] * 100, np.nan)
         parts.append(g)
     return pd.concat(parts, ignore_index=True) if parts else children
 

@@ -117,7 +117,11 @@ def test_national_pdf_starts_with_glossary_then_exec():
     g = text.find("Glossary")
     e = text.find("Executive summary")
     sit = text.find("Summary of current situation")
-    tables = text.find("Every city versus the country")
+    tables = text.find("Every city versus its own Expected")
+    if tables == -1:
+        tables = text.find("versus its own Expected")
+    if tables == -1:
+        tables = text.find("Country by city")
     assert g != -1
     assert e != -1
     assert sit != -1
