@@ -5,7 +5,7 @@ from __future__ import annotations
 from io import BytesIO
 
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from sndintel.briefing import (
     SUMMARY_DIST_N,
@@ -257,6 +257,28 @@ def test_excel_and_html_are_readable_packs():
     assert pdf.startswith(b"%PDF")
     pdf_d = pdf_bytes(report, detailed=True)
     assert pdf_d.startswith(b"%PDF")
+
+
+def test_excel_export_treats_pandas_na_as_blank():
+    """Detailed pack used to crash: openpyxl cannot store pd.NA."""
+    from sndintel.briefing import _excel_value, _sheet_table
+
+    assert _excel_value(pd.NA) is None
+    assert _excel_value(float("nan")) is None
+    wb = Workbook()
+    df = pd.DataFrame(
+        {
+            "Shop": ["A"],
+            "Gap (MT)": [pd.NA],
+            "AMS last 3 months (MT)": [pd.NA],
+            "Remarks": [pd.NA],
+        }
+    )
+    _sheet_table(wb, "NA sheet", "Heading", "Note", df)
+    ws = wb["NA sheet"]
+    assert ws.cell(5, 1).value == "A"
+    assert ws.cell(5, 2).value is None
+    assert ws.cell(5, 3).value is None
 
 
 def test_from_columns_sum_to_recoverable_and_are_positive_when_behind():

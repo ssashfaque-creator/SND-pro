@@ -1667,7 +1667,9 @@ def _sheet_table(
         ws.column_dimensions["A"].width = 40
         return ws
     start = 4
-    for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), start=start):
+    work = df.copy()
+    work = work.astype(object).where(pd.notna(work), None)
+    for r_idx, row in enumerate(dataframe_to_rows(work, index=False, header=True), start=start):
         for c_idx, value in enumerate(row, start=1):
             cell = ws.cell(r_idx, c_idx, _excel_value(value))
             cell.border = THIN
@@ -1724,8 +1726,14 @@ def _sheet_table(
 
 
 def _excel_value(value: Any) -> Any:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    """openpyxl cannot store pandas NA / NaT / NaN — those become blank cells."""
+    if value is None:
         return None
+    try:
+        if value is pd.NA or pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
     if hasattr(value, "item") and not isinstance(value, (bytes, str)):
         try:
             return _excel_value(value.item())
