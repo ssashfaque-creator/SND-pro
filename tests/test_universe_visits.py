@@ -171,6 +171,8 @@ def test_country_row_and_remarks_on_city_table():
     assert "Main driver" not in report.cities.columns
     remarks = " ".join(report.cities["Remarks"].dropna().astype(str))
     assert "Trend:" in remarks
+    assert "• Trend:" in str(report.cities.iloc[0]["Remarks"])
+    assert list(report.cities.columns)[-1] == "Remarks"
     assert "Coverage:" in remarks or "visit" in remarks.lower()
     assert "From unvisited shops (MT)" in report.lagging_distributors.columns or report.lagging_distributors.empty or "From unvisited shops (MT)" in report.all_distributors.columns
 

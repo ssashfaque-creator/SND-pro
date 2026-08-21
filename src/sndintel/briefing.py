@@ -1,8 +1,7 @@
 """One strategy pack: country → lagging cities → people → doors, plus full lagging lists.
 
 Built for a sales head to print or filter. Column names are in English; jargon lives
-in the glossary, not the headers. Excel is the working file. HTML is the print-to-PDF
-board pack (open it, File → Print → Save as PDF).
+in the glossary, not the headers. Excel is the working file. PDF is the board pack.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.worksheet import Worksheet
 
-from sndintel.coverage import attach_remarks, sibling_z_frame
+from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibling_z_frame
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
 from sndintel.io_utils import shift_period
@@ -50,10 +49,10 @@ GLOSSARY = [
     ("Expected this month", "Warehouse-learned typical same calendar month (every August on file, not last year alone), paced if MTD is open."),
     ("Fair share of country / city", "This unit’s last-year mix × what the parent billed now. The volume it would have if it only moved with its parent."),
     ("Recoverable", "The extra hole versus the parent, as a positive number — volume that comes back if this unit merely matched its parent."),
-    ("From drop size (MT)", "On billed doors: this period’s volume minus that door’s AMS (or last year), paced if MTD is open. Negative = smaller drops."),
-    ("From unvisited shops (MT)", "Minus the AMS/LY opportunity of universe doors that were not called this period (visit count 0 and not billed)."),
-    ("From unbilled shops (MT)", "Minus the AMS/LY opportunity of doors that were visited (or, if no visit file, simply not billed) but did not buy."),
-    ("Remarks", "Trend vs AMS and YoY; visit coverage vs country (robust z); productivity (billed ÷ visited) vs country; drop size."),
+    ("From drop size (MT)", "Share of recoverable explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than fair share. The three From columns add to Recoverable when the unit is behind."),
+    ("From unvisited shops (MT)", "Share of recoverable from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of fair share."),
+    ("From unbilled shops (MT)", "Share of recoverable from doors that were visited (or, if no visit file, simply not billed) but did not buy. Positive = hole; negative = ahead of fair share."),
+    ("Remarks", "Four bullets: trend vs AMS and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; drop size vs AMS/LY on billed doors."),
     ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
     ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
     ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
@@ -80,13 +79,13 @@ CITY_VIEW = [
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
     ("from_unbilled_mt", "From unbilled shops (MT)"),
-    ("remarks", "Remarks"),
     ("situation_label", "Situation"),
     ("billed", "Billed shops"),
     ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
     ("visit_pct", "Visit %"),
+    ("remarks", "Remarks"),
 ]
 
 DIST_IN_CITY_VIEW = [
@@ -101,13 +100,13 @@ DIST_IN_CITY_VIEW = [
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
     ("from_unbilled_mt", "From unbilled shops (MT)"),
-    ("remarks", "Remarks"),
     ("situation_label", "Situation"),
     ("billed", "Billed shops"),
     ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
     ("visit_pct", "Visit %"),
+    ("remarks", "Remarks"),
 ]
 
 DIST_ALL_VIEW = [
@@ -123,13 +122,13 @@ DIST_ALL_VIEW = [
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
     ("from_unbilled_mt", "From unbilled shops (MT)"),
-    ("remarks", "Remarks"),
     ("situation_label", "Situation"),
     ("billed", "Billed shops"),
     ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
     ("visit_pct", "Visit %"),
+    ("remarks", "Remarks"),
 ]
 
 DSR_VIEW = [
@@ -144,13 +143,13 @@ DSR_VIEW = [
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
     ("from_unbilled_mt", "From unbilled shops (MT)"),
-    ("remarks", "Remarks"),
     ("situation_label", "Situation"),
     ("billed", "Billed shops"),
     ("visited", "Visited shops"),
     ("universe", "Universe"),
     ("strike_pct", "Strike %"),
     ("visit_pct", "Visit %"),
+    ("remarks", "Remarks"),
 ]
 
 SHOP_VIEW = [
@@ -190,6 +189,8 @@ class StrategyPack:
     all_distributors: pd.DataFrame = field(default_factory=pd.DataFrame)
     all_dsrs: pd.DataFrame = field(default_factory=pd.DataFrame)
     all_shops: pd.DataFrame = field(default_factory=pd.DataFrame)
+    scope: str = "national"
+    scope_label: str = ""
 
 
 def build_strategy_pack(
@@ -249,11 +250,15 @@ def build_strategy_pack(
         extra = kpis.get("extra_hole_mt")
         if extra is not None:
             nat_grain["recoverable_mt"] = abs(float(extra or 0))
+        nat_grain = allocate_recoverable_drivers(nat_grain)
         nat_parent = _parent_stats(nat_grain.iloc[0])
         nat_grain = attach_remarks(nat_grain, {}, None)
     else:
         nat_parent = {}
 
+    cities = allocate_recoverable_drivers(cities)
+    dists = allocate_recoverable_drivers(dists)
+    dsrs = allocate_recoverable_drivers(dsrs)
     cities = attach_remarks(cities, nat_parent, sibling_z_frame(cities))
     dists = attach_remarks(dists, nat_parent, sibling_z_frame(dists))
     dsrs = attach_remarks(dsrs, nat_parent, sibling_z_frame(dsrs))
@@ -306,7 +311,7 @@ def build_strategy_pack(
     shop_note = (
         f"Every shop with recoverable greater than {hole_floor:.2f} MT. "
         f"{int(lag_meta.get('n_hidden') or 0)} shallower doors totalling "
-        f"{float(lag_meta.get('hidden_mt') or 0):.1f} MT recoverable are one remainder line."
+        f"{float(lag_meta.get('hidden_mt') or 0):.0f} MT recoverable are one remainder line."
     )
 
     return StrategyPack(
@@ -329,7 +334,170 @@ def build_strategy_pack(
         all_distributors=_present(dists, DIST_ALL_VIEW),
         all_dsrs=_present(dsrs, DSR_VIEW),
         all_shops=_present_shops(all_shops, all_shop_meta),
+        scope="national",
+        scope_label="Country",
     )
+
+
+def list_report_entities(pack: StrategyPack, report_type: str) -> list[str]:
+    """Searchable options for the Report page second dropdown."""
+    kind = (report_type or "national").strip().lower()
+    if kind == "city":
+        if pack.cities is None or pack.cities.empty or "City" not in pack.cities.columns:
+            return []
+        return sorted(
+            {str(x) for x in pack.cities["City"].dropna().astype(str) if str(x) not in {"", "Country"}}
+        )
+    if kind == "distributor":
+        src = pack.all_distributors if pack.all_distributors is not None and not pack.all_distributors.empty else pack.lagging_distributors
+        if src is None or src.empty:
+            return []
+        city_col = "City" if "City" in src.columns else None
+        name_col = "Distributor" if "Distributor" in src.columns else None
+        if not name_col:
+            return []
+        out = []
+        for _, r in src.iterrows():
+            name = str(r[name_col])
+            city = str(r[city_col]) if city_col else ""
+            out.append(f"{city} · {name}" if city and city != "nan" else name)
+        return sorted(set(out))
+    if kind == "dsr":
+        src = pack.all_dsrs if pack.all_dsrs is not None and not pack.all_dsrs.empty else pack.lagging_dsrs
+        if src is None or src.empty:
+            return []
+        city_col = "City" if "City" in src.columns else None
+        name_col = "DSR" if "DSR" in src.columns else None
+        if not name_col:
+            return []
+        out = []
+        for _, r in src.iterrows():
+            name = str(r[name_col])
+            city = str(r[city_col]) if city_col else ""
+            out.append(f"{city} · {name}" if city and city != "nan" else name)
+        return sorted(set(out))
+    return []
+
+
+def _split_entity(entity: str) -> tuple[str | None, str]:
+    text = str(entity or "").strip()
+    if " · " in text:
+        left, right = text.split(" · ", 1)
+        return left.strip(), right.strip()
+    return None, text
+
+
+def _filter_table(df: pd.DataFrame, col: str, value: str) -> pd.DataFrame:
+    if df is None or df.empty or col not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    return df[df[col].astype(str) == str(value)].copy()
+
+
+def focus_pack(pack: StrategyPack, report_type: str, entity: str) -> StrategyPack:
+    """Narrow a national pack to one city, distributor, or DSR plus its children."""
+    from dataclasses import replace
+
+    kind = (report_type or "national").strip().lower()
+    if kind in {"national", "country", ""}:
+        return pack
+    city_key, name = _split_entity(entity)
+    if kind == "city":
+        city = name
+        cities = pack.cities
+        keep_cities = cities[cities["City"].astype(str).isin(["Country", city])] if cities is not None and not cities.empty else cities
+        dists = _filter_table(pack.all_distributors, "City", city)
+        dsrs = _filter_table(pack.all_dsrs, "City", city)
+        shops = _filter_table(pack.all_shops, "City", city)
+        lag_d = _filter_table(pack.lagging_distributors, "City", city)
+        lag_s = _filter_table(pack.lagging_dsrs, "City", city)
+        lag_shops = _filter_table(pack.lagging_shops, "City", city)
+        city_dists = _filter_table(pack.city_distributors, "City", city)
+        city_shops = _filter_table(pack.city_distributor_shops, "City", city)
+        headline = f"{city} — city pack"
+        return replace(
+            pack,
+            headline=headline or pack.headline,
+            cities=keep_cities,
+            city_distributors=city_dists if city_dists is not None and not city_dists.empty else dists,
+            city_distributor_shops=city_shops if city_shops is not None and not city_shops.empty else shops,
+            lagging_distributors=lag_d,
+            lagging_dsrs=lag_s,
+            lagging_shops=lag_shops if lag_shops is not None and not lag_shops.empty else shops,
+            all_distributors=dists,
+            all_dsrs=dsrs,
+            all_shops=shops,
+            scope="city",
+            scope_label=city,
+        )
+    if kind == "distributor":
+        dist = name
+        dists_src = pack.all_distributors if pack.all_distributors is not None and not pack.all_distributors.empty else pack.lagging_distributors
+        row = pd.DataFrame()
+        if dists_src is not None and not dists_src.empty:
+            mask = dists_src["Distributor"].astype(str) == dist
+            if city_key and "City" in dists_src.columns:
+                mask = mask & (dists_src["City"].astype(str) == city_key)
+            row = dists_src.loc[mask].copy()
+        city = city_key or (str(row.iloc[0]["City"]) if not row.empty and "City" in row.columns else "")
+        shops_src = pack.all_shops if pack.all_shops is not None and not pack.all_shops.empty else pack.lagging_shops
+        shops = _filter_table(shops_src, "Distributor", dist)
+        if city and shops is not None and not shops.empty and "City" in shops.columns:
+            shops = shops[shops["City"].astype(str) == city]
+        dsrs = pd.DataFrame()
+        if shops is not None and not shops.empty and "DSR" in shops.columns:
+            names = set(shops["DSR"].dropna().astype(str))
+            dsrs_src = pack.all_dsrs if pack.all_dsrs is not None and not pack.all_dsrs.empty else pack.lagging_dsrs
+            if dsrs_src is not None and not dsrs_src.empty:
+                dsrs = dsrs_src[dsrs_src["DSR"].astype(str).isin(names)].copy()
+                if city and "City" in dsrs.columns:
+                    dsrs = dsrs[dsrs["City"].astype(str) == city]
+        headline = f"{dist} — distributor pack"
+        return replace(
+            pack,
+            headline=headline,
+            cities=row,
+            city_distributors=row,
+            city_distributor_shops=shops,
+            lagging_distributors=row,
+            lagging_dsrs=dsrs,
+            lagging_shops=shops,
+            all_distributors=row,
+            all_dsrs=dsrs,
+            all_shops=shops,
+            scope="distributor",
+            scope_label=f"{city} · {dist}" if city else dist,
+        )
+    if kind == "dsr":
+        dsr = name
+        dsrs_src = pack.all_dsrs if pack.all_dsrs is not None and not pack.all_dsrs.empty else pack.lagging_dsrs
+        row = pd.DataFrame()
+        if dsrs_src is not None and not dsrs_src.empty:
+            mask = dsrs_src["DSR"].astype(str) == dsr
+            if city_key and "City" in dsrs_src.columns:
+                mask = mask & (dsrs_src["City"].astype(str) == city_key)
+            row = dsrs_src.loc[mask].copy()
+        city = city_key or (str(row.iloc[0]["City"]) if not row.empty and "City" in row.columns else "")
+        shops_src = pack.all_shops if pack.all_shops is not None and not pack.all_shops.empty else pack.lagging_shops
+        shops = _filter_table(shops_src, "DSR", dsr)
+        if city and shops is not None and not shops.empty and "City" in shops.columns:
+            shops = shops[shops["City"].astype(str) == city]
+        headline = f"{dsr} — DSR pack"
+        return replace(
+            pack,
+            headline=headline,
+            cities=row,
+            city_distributors=pd.DataFrame(),
+            city_distributor_shops=shops,
+            lagging_distributors=pd.DataFrame(),
+            lagging_dsrs=row,
+            lagging_shops=shops,
+            all_distributors=pd.DataFrame(),
+            all_dsrs=row,
+            all_shops=shops,
+            scope="dsr",
+            scope_label=f"{city} · {dsr}" if city else dsr,
+        )
+    return pack
 
 
 def score_shops(shop_month: pd.DataFrame, cities: pd.DataFrame, period: str, pace: float) -> pd.DataFrame:
@@ -403,9 +571,9 @@ def _present_shops(df: pd.DataFrame, meta: dict[str, float]) -> pd.DataFrame:
     rest = {label: None for _, label in SHOP_VIEW}
     rest["Shop"] = (
         f"Not listed — {n_hidden} doors with recoverable ≤ {SHOP_RECOVERABLE_FLOOR:.2f} MT "
-        f"({hidden_mt:.1f} MT recoverable). Coverage KPI, not a visit list."
+        f"({hidden_mt:.0f} MT recoverable). Coverage KPI, not a visit list."
     )
-    rest["Recoverable (MT)"] = hidden_mt
+    rest["Recoverable (MT)"] = _round_num(hidden_mt)
     return pd.concat([table, pd.DataFrame([rest])], ignore_index=True)
 
 
@@ -452,6 +620,16 @@ def excel_bytes_detailed(pack: StrategyPack) -> bytes:
     return buf.getvalue()
 
 
+def pdf_bytes(pack: StrategyPack, detailed: bool = False) -> bytes:
+    from sndintel.pdf import render_pdf
+
+    return render_pdf(pack, detailed=detailed)
+
+
+def pdf_bytes_detailed(pack: StrategyPack) -> bytes:
+    return pdf_bytes(pack, detailed=True)
+
+
 def html_bytes(pack: StrategyPack) -> bytes:
     return render_html(pack).encode("utf-8")
 
@@ -463,45 +641,12 @@ def html_bytes_detailed(pack: StrategyPack) -> bytes:
 def write_excel(pack: StrategyPack, path: Path | str | BytesIO) -> None:
     wb = Workbook()
     _sheet_cover(wb, pack)
-    _sheet_table(
-        wb, "01 Country by city",
-        "Every city versus the country",
-        "Recoverable is the local hole after national weather. From drop size / unvisited / unbilled split that hole. Country row is first. Distributors and DSRs with AMS = 0 are hidden.",
-        pack.cities, freeze="A2",
-        bar_col="Recoverable (MT)", cat_col="City",
-    )
-    _sheet_table(
-        wb, "02 Lagging cities-dists",
-        "Distributors inside lagging cities",
-        "Only cities on the lagging list. A distributor here is behind its city — that is who to call first.",
-        pack.city_distributors,
-    )
-    _sheet_table(
-        wb, "03 Those dists-shops",
-        "Lagging shops under those distributors",
-        (pack.shop_note or "Shops with recoverable greater than 0.25 MT.")
-        + " Recoverable is volume that comes back if the door matches the city.",
-        pack.city_distributor_shops,
-    )
-    _sheet_table(
-        wb, "04 All lagging distributors",
-        "Every lagging distributor (all cities)",
-        "Includes distributors that are behind a city even when the city itself moved with the country. Sheet 02 only showed distributors in lagging cities.",
-        pack.lagging_distributors,
-    )
-    _sheet_table(
-        wb, "05 All lagging DSRs",
-        "Every lagging DSR (all cities)",
-        "Salespeople behind their city. Ride-with this list; do not build a city hit-list from national weather.",
-        pack.lagging_dsrs,
-    )
-    _sheet_table(
-        wb, "06 All lagging shops",
-        "Every lagging shop worth a visit",
-        pack.shop_note or "Shops with recoverable greater than 0.25 MT. Shallower doors are the remainder line.",
-        pack.lagging_shops,
-    )
-    # First default sheet was cover
+    for i, (sheet, heading, note, df) in enumerate(iter_report_sheets(pack, detailed=False)):
+        kwargs: dict[str, Any] = {}
+        if i == 0 and df is not None and not df.empty and "Recoverable (MT)" in df.columns:
+            cat = "City" if "City" in df.columns else list(df.columns)[0]
+            kwargs = dict(bar_col="Recoverable (MT)", cat_col=cat, freeze="A2")
+        _sheet_table(wb, sheet, heading, note, df, **kwargs)
     if path is not None:
         wb.save(path)
 
@@ -509,39 +654,156 @@ def write_excel(pack: StrategyPack, path: Path | str | BytesIO) -> None:
 def write_excel_detailed(pack: StrategyPack, path: Path | str | BytesIO) -> None:
     wb = Workbook()
     _sheet_cover(wb, pack, detailed=True)
-    _sheet_table(
-        wb, "01 City detail",
-        "Every city",
-        "Full city list, highest recoverable first. From coverage and From drop size split the hole. Strike % = billed shops ÷ universe.",
-        pack.cities, freeze="A2",
-        bar_col="Recoverable (MT)", cat_col="City",
-    )
-    _sheet_table(
-        wb, "02 Distributor detail",
-        "Every distributor with AMS greater than 0",
-        "Not just lagging distributors. AMS = 0 is hidden. Sorted highest recoverable first.",
-        pack.all_distributors,
-    )
-    _sheet_table(
-        wb, "03 DSR detail",
-        "Every DSR with AMS greater than 0",
-        "Not just lagging DSRs. AMS = 0 is hidden. Sorted highest recoverable first.",
-        pack.all_dsrs,
-    )
-    _sheet_table(
-        wb, "04 National DSRs",
-        "National DSR list",
-        "Same as DSR detail — every salesperson with a recent run-rate (AMS > 0).",
-        pack.all_dsrs,
-    )
-    _sheet_table(
-        wb, "05 National shops",
-        "National shop list",
-        pack.shop_note or "Every shop with recoverable greater than 0.25 MT.",
-        pack.all_shops,
-    )
+    for sheet, heading, note, df in iter_report_sheets(pack, detailed=True):
+        kwargs: dict[str, Any] = {}
+        if sheet.startswith("01") and df is not None and not df.empty and "Recoverable (MT)" in df.columns:
+            cat = "City" if "City" in df.columns else list(df.columns)[0]
+            kwargs = dict(bar_col="Recoverable (MT)", cat_col=cat, freeze="A2")
+        _sheet_table(wb, sheet, heading, note, df, **kwargs)
     if path is not None:
         wb.save(path)
+
+
+def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple[str, str, str, pd.DataFrame]]:
+    """Ordered (sheet, heading, note, table) for Excel and PDF."""
+    scope = (pack.scope or "national").lower()
+    label = pack.scope_label or scope
+    if scope == "city":
+        return [
+            (
+                "01 City",
+                f"{label} versus the country",
+                "Country row is first when included. Recoverable is the local hole after national weather. From drop / unvisited / unbilled add to Recoverable.",
+                pack.cities,
+            ),
+            (
+                "02 Distributors",
+                f"Distributors in {label}",
+                "AMS = 0 is hidden. Highest recoverable first.",
+                pack.all_distributors,
+            ),
+            (
+                "03 DSRs",
+                f"DSRs in {label}",
+                "Salespeople in this city with AMS greater than 0.",
+                pack.all_dsrs,
+            ),
+            (
+                "04 Shops",
+                f"Shops in {label}",
+                pack.shop_note or "Shops with recoverable greater than 0.25 MT.",
+                pack.all_shops,
+            ),
+        ]
+    if scope == "distributor":
+        dist_tbl = pack.all_distributors if pack.all_distributors is not None and not pack.all_distributors.empty else pack.city_distributors
+        return [
+            (
+                "01 Distributor",
+                f"{label}",
+                "Scorecard versus its city. From drop / unvisited / unbilled add to Recoverable.",
+                dist_tbl,
+            ),
+            (
+                "02 DSRs",
+                f"Salespeople under {label}",
+                "DSRs on shops billed or listed under this distributor.",
+                pack.all_dsrs,
+            ),
+            (
+                "03 Shops",
+                f"Shops under {label}",
+                pack.shop_note or "Shops with recoverable greater than 0.25 MT.",
+                pack.all_shops,
+            ),
+        ]
+    if scope == "dsr":
+        return [
+            (
+                "01 DSR",
+                f"{label}",
+                "Scorecard versus its city. From drop / unvisited / unbilled add to Recoverable.",
+                pack.all_dsrs,
+            ),
+            (
+                "02 Shops",
+                f"Shops on this beat",
+                pack.shop_note or "Shops with recoverable greater than 0.25 MT.",
+                pack.all_shops,
+            ),
+        ]
+    if detailed:
+        return [
+            (
+                "01 City detail",
+                "Every city",
+                "Full city list, highest recoverable first. From drop / unvisited / unbilled add to Recoverable. Strike % = billed shops ÷ universe.",
+                pack.cities,
+            ),
+            (
+                "02 Distributor detail",
+                "Every distributor with AMS greater than 0",
+                "Not just lagging distributors. AMS = 0 is hidden. Sorted highest recoverable first.",
+                pack.all_distributors,
+            ),
+            (
+                "03 DSR detail",
+                "Every DSR with AMS greater than 0",
+                "Not just lagging DSRs. AMS = 0 is hidden. Sorted highest recoverable first.",
+                pack.all_dsrs,
+            ),
+            (
+                "04 National DSRs",
+                "National DSR list",
+                "Same as DSR detail — every salesperson with a recent run-rate (AMS > 0).",
+                pack.all_dsrs,
+            ),
+            (
+                "05 National shops",
+                "National shop list",
+                pack.shop_note or "Every shop with recoverable greater than 0.25 MT.",
+                pack.all_shops,
+            ),
+        ]
+    return [
+        (
+            "01 Country by city",
+            "Every city versus the country",
+            "Recoverable is the local hole after national weather. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than fair share). Country row is first. Distributors and DSRs with AMS = 0 are hidden.",
+            pack.cities,
+        ),
+        (
+            "02 Lagging cities-dists",
+            "Distributors inside lagging cities",
+            "Only cities on the lagging list. A distributor here is behind its city — that is who to call first.",
+            pack.city_distributors,
+        ),
+        (
+            "03 Those dists-shops",
+            "Lagging shops under those distributors",
+            (pack.shop_note or "Shops with recoverable greater than 0.25 MT.")
+            + " Recoverable is volume that comes back if the door matches the city.",
+            pack.city_distributor_shops,
+        ),
+        (
+            "04 All lagging distributors",
+            "Every lagging distributor (all cities)",
+            "Includes distributors that are behind a city even when the city itself moved with the country. Sheet 02 only showed distributors in lagging cities.",
+            pack.lagging_distributors,
+        ),
+        (
+            "05 All lagging DSRs",
+            "Every lagging DSR (all cities)",
+            "Salespeople behind their city. Ride-with this list; do not build a city hit-list from national weather.",
+            pack.lagging_dsrs,
+        ),
+        (
+            "06 All lagging shops",
+            "Every lagging shop worth a visit",
+            pack.shop_note or "Shops with recoverable greater than 0.25 MT. Shallower doors are the remainder line.",
+            pack.lagging_shops,
+        ),
+    ]
 
 
 def render_html(pack: StrategyPack, detailed: bool = False) -> str:
@@ -550,7 +812,7 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
         _html_cover(pack, k, detailed=detailed),
         _html_section(
             "1. The country — every city",
-            "Recoverable is the local hole after national weather, highest first. From drop size / unvisited / unbilled split that hole. Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first.",
+            "Recoverable is the local hole after national weather, highest first. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than fair share). Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first. Remarks are the last column.",
             pack.cities,
         ),
         _html_section(
@@ -630,6 +892,7 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
   table {{ border-collapse: collapse; width: 100%; font-size: 12px; margin: 8px 0 4px; }}
   th {{ background: var(--ink); color: white; text-align: left; padding: 6px 8px; font-weight: 600; }}
   td {{ border-bottom: 1px solid var(--line); padding: 5px 8px; vertical-align: top; }}
+  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
   tr.lagging td {{ background: #fef2f2; }}
   tr.country td {{ background: #e2e8f0; font-weight: 600; }}
   .note {{ font-size: 12px; color: var(--muted); margin: 0 0 8px; }}
@@ -733,7 +996,59 @@ def _present(df: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
         cols.append(label)
         data[label] = df[src] if src in df.columns else pd.NA
     out = pd.DataFrame(data)[cols]
-    return out.reset_index(drop=True)
+    return _round_display(out).reset_index(drop=True)
+
+
+def _round_num(val: Any) -> Any:
+    if val is None:
+        return pd.NA
+    try:
+        if pd.isna(val):
+            return pd.NA
+    except (TypeError, ValueError):
+        return val
+    try:
+        return int(round(float(val)))
+    except (TypeError, ValueError):
+        return val
+
+
+def _round_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Whole numbers for MT, counts, and percents. From-columns still sum to Recoverable."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    rec_col = "Recoverable (MT)"
+    from_cols = [
+        c
+        for c in ["From drop size (MT)", "From unvisited shops (MT)", "From unbilled shops (MT)"]
+        if c in out.columns
+    ]
+    count_cols = {"Billed shops", "Visited shops", "Universe", "Visits MTD"}
+    for col in out.columns:
+        if col == "Remarks":
+            continue
+        name = str(col)
+        if "(MT)" in name or name.endswith("%") or name in count_cols:
+            out[col] = [_round_num(v) for v in out[col]]
+    if rec_col in out.columns and len(from_cols) == 3:
+        for i in out.index:
+            rec = out.loc[i, rec_col]
+            rec_i = int(rec) if rec is not None and pd.notna(rec) else 0
+            parts = []
+            for c in from_cols:
+                v = out.loc[i, c]
+                parts.append(int(v) if v is not None and pd.notna(v) else 0)
+            if rec_i != 0:
+                target = rec_i
+            else:
+                target = int(round(sum(parts)))
+            diff = target - sum(parts)
+            if diff:
+                j = max(range(len(parts)), key=lambda k: abs(parts[k]))
+                parts[j] += diff
+                out.loc[i, from_cols[j]] = parts[j]
+    return out
 
 
 def _present_with_national(nat: pd.DataFrame, cities: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
@@ -903,10 +1218,10 @@ def _sheet_cover(wb: Workbook, pack: StrategyPack, detailed: bool = False) -> Wo
 
     k = pack.kpis
     labels = [
-        ("Billed (MT)", k.get("billed_mt"), "0.0"),
-        ("Expected (MT)", k.get("expected_mt"), "0.0"),
-        ("Gap vs expected (MT)", k.get("gap_mt"), "+0.0;-0.0;0.0"),
-        ("Extra hole after weather (MT)", k.get("extra_hole_mt"), "+0.0;-0.0;0.0"),
+        ("Billed (MT)", k.get("billed_mt"), "0"),
+        ("Expected (MT)", k.get("expected_mt"), "0"),
+        ("Gap vs expected (MT)", k.get("gap_mt"), "+0;-0;0"),
+        ("Extra hole after weather (MT)", k.get("extra_hole_mt"), "+0;-0;0"),
         ("Lagging cities", k.get("n_lagging_cities"), "0"),
     ]
     for i, (lab, val, fmt) in enumerate(labels, start=1):
@@ -1012,12 +1327,18 @@ def _sheet_table(
                     cell.fill = PatternFill("solid", fgColor="FEF2F2")
                 elif sit == "Ahead":
                     cell.fill = PatternFill("solid", fgColor="F0FDF4")
+                elif sit == "Country":
+                    cell.fill = PatternFill("solid", fgColor="E2E8F0")
+                    cell.font = Font(size=10, bold=True)
     headers = list(df.columns)
     for i, name in enumerate(headers, start=1):
         width = min(max(len(str(name)) + 2, 12), 28)
         if name in {"What to do", "Shop", "Remarks"}:
-            width = 48
+            width = 56 if name == "Remarks" else 48
         ws.column_dimensions[get_column_letter(i)].width = width
+    if "Remarks" in headers:
+        for r in range(start + 1, start + 1 + len(df)):
+            ws.row_dimensions[r].height = 68
     ws.auto_filter.ref = f"A{start}:{get_column_letter(len(headers))}{start + len(df)}"
     ws.freeze_panes = f"A{start + 1}"
     ws.page_setup.orientation = "landscape"
@@ -1061,12 +1382,17 @@ def _format_metric_cell(cell, header: str) -> None:
     h = str(header)
     if "(MT)" in h:
         cell.number_format = (
-            "+0.00;-0.00;0.00"
+            "+0;-0;0"
             if h.startswith("Extra") or h.startswith("vs ") or h.startswith("From ") or "Gap" in h
-            else "0.00"
+            else "#,##0"
         )
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
     elif h.endswith("%") or "Strike" in h:
-        cell.number_format = "0.0"
+        cell.number_format = "0"
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
+    elif h in {"Billed shops", "Visited shops", "Universe", "Visits MTD"}:
+        cell.number_format = "#,##0"
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
 
 
 def _row_situation(df: pd.DataFrame, idx: int) -> str:
@@ -1087,10 +1413,10 @@ def _html_cover(pack: StrategyPack, k: dict[str, Any], detailed: bool = False) -
         return str(val)
 
     kpis = [
-        ("Billed", fmt(k.get("billed_mt")) + " MT"),
-        ("Expected", fmt(k.get("expected_mt")) + " MT"),
-        ("Gap vs expected", fmt(k.get("gap_mt"), "{:+.1f}") + " MT"),
-        ("Extra hole after weather", fmt(k.get("extra_hole_mt"), "{:+.1f}") + " MT"),
+        ("Billed", fmt(k.get("billed_mt"), "{:.0f}") + " MT"),
+        ("Expected", fmt(k.get("expected_mt"), "{:.0f}") + " MT"),
+        ("Gap vs expected", fmt(k.get("gap_mt"), "{:+.0f}") + " MT"),
+        ("Extra hole after weather", fmt(k.get("extra_hole_mt"), "{:+.0f}") + " MT"),
         ("Lagging cities", str(k.get("n_lagging_cities") or 0)),
     ]
     kpi_html = "".join(f'<div class="kpi"><span>{html.escape(a)}</span><b>{html.escape(b)}</b></div>' for a, b in kpis)
@@ -1162,9 +1488,18 @@ def _df_html(df: pd.DataFrame) -> str:
                 klass = "ahead"
             elif sit == "Country":
                 klass = "country"
-        tds = "".join(f"<td>{html.escape(_html_cell(row[c], c))}</td>" for c in df.columns)
+        tds = "".join(
+            f"<td>{_html_td(row[c], c)}</td>" for c in df.columns
+        )
         body.append(f"<tr class='{klass}'>{tds}</tr>")
     return f"<table><thead><tr>{heads}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+
+
+def _html_td(val: Any, col: str) -> str:
+    text = html.escape(_html_cell(val, col))
+    if str(col) == "Remarks":
+        text = text.replace("\n", "<br/>")
+    return text
 
 
 def _html_cell(val: Any, col: str) -> str:
@@ -1172,14 +1507,20 @@ def _html_cell(val: Any, col: str) -> str:
         return "—"
     if isinstance(val, (int, float)) and "(MT)" in str(col):
         if str(col).startswith("Extra") or str(col).startswith("vs ") or str(col).startswith("From "):
-            return f"{val:+.2f}"
-        return f"{val:.2f}"
-    if isinstance(val, (int, float)) and "Strike" in str(col):
+            return f"{val:+.0f}"
+        return f"{val:,.0f}"
+    if isinstance(val, (int, float)) and ("Strike" in str(col) or str(col).endswith("%")):
         return f"{val:.0f}"
     if isinstance(val, float):
-        return f"{val:.2f}"
+        return f"{val:.0f}"
     return str(val)
 
 
 def write_html(pack: StrategyPack, path: Path | str, detailed: bool = False) -> None:
     Path(path).write_text(render_html(pack, detailed=detailed), encoding="utf-8")
+
+
+def write_pdf(pack: StrategyPack, path: Path | str, detailed: bool = False) -> None:
+    from sndintel.pdf import write_pdf as _write
+
+    _write(pack, path, detailed=detailed)

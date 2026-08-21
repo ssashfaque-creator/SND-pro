@@ -7,7 +7,17 @@ from io import BytesIO
 import pandas as pd
 from openpyxl import load_workbook
 
-from sndintel.briefing import ams_last_n, build_strategy_pack, excel_bytes, excel_bytes_detailed, render_html
+from sndintel.briefing import (
+    ams_last_n,
+    build_strategy_pack,
+    excel_bytes,
+    excel_bytes_detailed,
+    focus_pack,
+    list_report_entities,
+    pdf_bytes,
+    render_html,
+)
+from sndintel.coverage import allocate_recoverable_drivers
 from sndintel.hierarchy import build_hierarchy_pack
 
 
@@ -101,6 +111,7 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "From unvisited shops (MT)" in cities.columns
     assert "From unbilled shops (MT)" in cities.columns
     assert "Remarks" in cities.columns
+    assert list(cities.columns)[-1] == "Remarks"
     assert "Main driver" not in cities.columns
     assert "From coverage (MT)" not in cities.columns
     assert "Extra vs country (MT)" not in cities.columns
@@ -161,6 +172,75 @@ def test_excel_and_html_are_readable_packs():
     wb_d = load_workbook(BytesIO(raw_d))
     assert "01 City detail" in wb_d.sheetnames
     assert "05 National shops" in wb_d.sheetnames
+    pdf = pdf_bytes(report)
+    assert pdf.startswith(b"%PDF")
+    pdf_d = pdf_bytes(report, detailed=True)
+    assert pdf_d.startswith(b"%PDF")
+
+
+def test_from_columns_sum_to_recoverable_and_are_positive_when_behind():
+    df = pd.DataFrame(
+        {
+            "recoverable_mt": [100.0, 0.0, 50.0],
+            "isolated_mt": [-100.0, 40.0, -50.0],
+            "volume_mt": [80.0, 140.0, 90.0],
+            "share_expected_mt": [180.0, 100.0, 140.0],
+            "from_drop_size_mt": [-40.0, 20.0, 10.0],
+            "from_unvisited_mt": [-30.0, 5.0, -20.0],
+            "from_unbilled_mt": [-80.0, 15.0, -30.0],
+        }
+    )
+    out = allocate_recoverable_drivers(df)
+    behind = out.iloc[0]
+    assert abs(behind["from_drop_size_mt"] + behind["from_unvisited_mt"] + behind["from_unbilled_mt"] - 100.0) < 1e-9
+    assert behind["from_drop_size_mt"] >= -1e-9
+    assert behind["from_unvisited_mt"] >= -1e-9
+    assert behind["from_unbilled_mt"] >= -1e-9
+    ahead = out.iloc[1]
+    assert ahead["recoverable_mt"] == 0.0
+    assert ahead["from_drop_size_mt"] <= 1e-9
+    assert abs(ahead["from_drop_size_mt"] + ahead["from_unvisited_mt"] + ahead["from_unbilled_mt"] + 40.0) < 1e-9
+    mixed = out.iloc[2]
+    assert abs(mixed["from_drop_size_mt"] + mixed["from_unvisited_mt"] + mixed["from_unbilled_mt"] - 50.0) < 1e-9
+    assert mixed["from_drop_size_mt"] == 0.0  # gain is not a hole
+
+
+def test_pack_from_columns_sum_to_recoverable_after_rounding():
+    rows = []
+    rows.append(_row("K1", "2026-08", 5.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows.append(_row("K1", "2025-08", 80.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows.append(_row("K2", "2026-08", 15.0, "Karachi", "South Dist", "Amir", name="Hold K"))
+    rows.append(_row("K2", "2025-08", 20.0, "Karachi", "South Dist", "Amir", name="Hold K"))
+    rows.append(_row("L1", "2026-08", 90.0, "Lahore", "Holding Dist", "Lahore Ace", name="Big L"))
+    rows.append(_row("L1", "2025-08", 100.0, "Lahore", "Holding Dist", "Lahore Ace", name="Big L"))
+    rows.append(_row("L2", "2026-08", 10.0, "Lahore", "Local Dist", "Lahore Weak", name="Small L"))
+    rows.append(_row("L2", "2025-08", 100.0, "Lahore", "Local Dist", "Lahore Weak", name="Small L"))
+    rows = _with_recent_ams(rows, volume_by_store={"K1": 8.0, "K2": 18.0, "L1": 95.0, "L2": 80.0})
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
+    report = build_strategy_pack(pack_h.units, sm, period="2026-08")
+    cities = report.cities
+    assert list(cities.columns)[-1] == "Remarks"
+    from_cols = ["From drop size (MT)", "From unvisited shops (MT)", "From unbilled shops (MT)"]
+    for _, row in cities.iterrows():
+        rec = row["Recoverable (MT)"]
+        rec_i = 0 if rec is None or pd.isna(rec) else int(rec)
+        parts = [0 if row[c] is None or pd.isna(row[c]) else int(row[c]) for c in from_cols]
+        if rec_i > 0:
+            assert sum(parts) == rec_i
+            assert all(p >= 0 for p in parts)
+        # whole numbers in the table
+        for col in ["Billed this period (MT)", "Recoverable (MT)"]:
+            val = row[col]
+            if val is not None and pd.notna(val):
+                assert float(val) == float(int(round(float(val))))
+    cities_opt = list_report_entities(report, "City")
+    assert "Karachi" in cities_opt
+    focused = focus_pack(report, "City", "Karachi")
+    assert focused.scope == "city"
+    assert set(focused.cities["City"].astype(str)) <= {"Country", "Karachi"}
+    dist_opt = list_report_entities(report, "Distributor")
+    assert any("Eva Foods" in x for x in dist_opt)
 
 
 def test_tiny_shops_are_not_on_visit_lists():

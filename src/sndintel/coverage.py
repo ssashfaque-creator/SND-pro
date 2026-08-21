@@ -160,6 +160,72 @@ def rollup_coverage(book: pd.DataFrame, keys: list[str] | None) -> pd.DataFrame:
     return g
 
 
+def allocate_recoverable_drivers(df: pd.DataFrame) -> pd.DataFrame:
+    """Partition recoverable across drop size / unvisited / unbilled.
+
+    Recoverable is not recalculated. The three From columns keep the same
+    coverage identity as weights, then scale so they add to the extra vs fair
+    share:
+
+    * behind (recoverable > 0) — positive pieces of the hole, summing to recoverable
+    * ahead (billed > fair share) — negative pieces of the surplus; recoverable stays 0
+    * in line — zeros
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    drop = pd.to_numeric(out.get("from_drop_size_mt"), errors="coerce").fillna(0.0)
+    unv = pd.to_numeric(out.get("from_unvisited_mt"), errors="coerce").fillna(0.0)
+    unb = pd.to_numeric(out.get("from_unbilled_mt"), errors="coerce").fillna(0.0)
+    rec = pd.to_numeric(out.get("recoverable_mt"), errors="coerce").fillna(0.0)
+    iso = pd.to_numeric(out.get("isolated_mt"), errors="coerce")
+    vol = pd.to_numeric(out.get("volume_mt"), errors="coerce")
+    fair = pd.to_numeric(out.get("share_expected_mt"), errors="coerce")
+    out["from_drop_size_raw_mt"] = drop
+    out["from_unvisited_raw_mt"] = unv
+    out["from_unbilled_raw_mt"] = unb
+
+    new_drop: list[float] = []
+    new_unv: list[float] = []
+    new_unb: list[float] = []
+    for i in range(len(out)):
+        r = float(rec.iloc[i] or 0.0)
+        d, u, b = float(drop.iloc[i]), float(unv.iloc[i]), float(unb.iloc[i])
+        isolated = iso.iloc[i] if i < len(iso) else np.nan
+        isolated_f = float(isolated) if pd.notna(isolated) else 0.0
+        billed = vol.iloc[i] if i < len(vol) else np.nan
+        share = fair.iloc[i] if i < len(fair) else np.nan
+        ahead = isolated_f > 1e-9
+        if not ahead and pd.notna(billed) and pd.notna(share):
+            ahead = float(billed) > float(share) + 1e-9
+        if r > 1e-9:
+            target = r
+            weights = [max(0.0, -d), max(0.0, -u), max(0.0, -b)]
+        elif ahead:
+            surplus = isolated_f
+            if surplus <= 1e-9 and pd.notna(billed) and pd.notna(share):
+                surplus = max(0.0, float(billed) - float(share))
+            target = -max(0.0, surplus)
+            weights = [max(0.0, d), max(0.0, u), max(0.0, b)]
+        else:
+            target = 0.0
+            weights = [0.0, 0.0, 0.0]
+        total_w = sum(weights)
+        if abs(target) < 1e-12:
+            vals = [0.0, 0.0, 0.0]
+        elif total_w < 1e-12:
+            vals = [target, 0.0, 0.0]
+        else:
+            vals = [target * w / total_w for w in weights]
+        new_drop.append(vals[0])
+        new_unv.append(vals[1])
+        new_unb.append(vals[2])
+    out["from_drop_size_mt"] = new_drop
+    out["from_unvisited_mt"] = new_unv
+    out["from_unbilled_mt"] = new_unb
+    return out
+
+
 def attach_coverage_split(units: pd.DataFrame, book: pd.DataFrame) -> pd.DataFrame:
     """Merge grain-level unvisited / unbilled / drop-size onto unit scorecards."""
     if units is None or units.empty:
@@ -259,7 +325,9 @@ def sibling_z_frame(df: pd.DataFrame) -> dict[str, pd.Series]:
         return {}
     visit = pd.to_numeric(df.get("visit_rate"), errors="coerce")
     prod = pd.to_numeric(df.get("productivity"), errors="coerce")
-    drop = pd.to_numeric(df.get("from_drop_size_mt"), errors="coerce")
+    drop = pd.to_numeric(df.get("from_drop_size_raw_mt"), errors="coerce")
+    if drop is None or drop.isna().all():
+        drop = pd.to_numeric(df.get("from_drop_size_mt"), errors="coerce")
     billed = pd.to_numeric(df.get("billed"), errors="coerce").replace(0, np.nan)
     drop_per = drop / billed
     return {
@@ -271,7 +339,7 @@ def sibling_z_frame(df: pd.DataFrame) -> dict[str, pd.Series]:
 
 def _remark_row(r: pd.Series, parent: dict[str, Any], z_visit, z_prod, z_drop) -> str:
     bits = [_trend_bit(r, parent), _coverage_bit(r, parent, z_visit), _productivity_bit(r, parent, z_prod), _drop_bit(r, parent, z_drop)]
-    return " ".join(b for b in bits if b)
+    return "\n".join(f"• {b}" for b in bits if b)
 
 
 def _trend_bit(r: pd.Series, parent: dict[str, Any]) -> str:
@@ -282,9 +350,9 @@ def _trend_bit(r: pd.Series, parent: dict[str, Any]) -> str:
     parts = ["Trend:"]
     if ams is not None and ams > 1e-9 and vs_ams is not None:
         pct = 100.0 * vs_ams / ams
-        parts.append(f"{vs_ams:+.1f} MT vs AMS ({pct:+.0f}%).")
+        parts.append(f"{vs_ams:+.0f} MT vs AMS ({pct:+.0f}%).")
     elif vol is not None:
-        parts.append(f"billed {vol:.1f} MT.")
+        parts.append(f"billed {vol:.0f} MT.")
     if ly is not None and ly > 1e-9 and vol is not None:
         yoy = 100.0 * (vol - ly) / ly
         p_yoy = parent.get("yoy_pct")
@@ -333,7 +401,9 @@ def _productivity_bit(r: pd.Series, parent: dict[str, Any], z) -> str:
 
 
 def _drop_bit(r: pd.Series, parent: dict[str, Any], z) -> str:
-    drop = _num(r.get("from_drop_size_mt"))
+    drop = _num(r.get("from_drop_size_raw_mt"))
+    if drop is None:
+        drop = _num(r.get("from_drop_size_mt"))
     billed = _num(r.get("billed"))
     vol = _num(r.get("volume_mt"))
     if drop is None:
@@ -341,7 +411,7 @@ def _drop_bit(r: pd.Series, parent: dict[str, Any], z) -> str:
     per = (vol / billed) if billed and billed > 0 and vol is not None else None
     tag = _z_tag(z)
     extra = f"; {per:.2f} MT/billed door" if per is not None else ""
-    return f"Drop size: {drop:+.1f} MT vs AMS/LY on billed doors{extra}{tag}."
+    return f"Drop size: {drop:+.0f} MT vs AMS/LY on billed doors{extra}{tag}."
 
 
 def _z_tag(z) -> str:

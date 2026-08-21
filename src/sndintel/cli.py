@@ -216,7 +216,7 @@ def serve_api(port: int = 8080):
 
 @app.command("export-excel")
 def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
-    """Write the strategy pack: country → lagging cities → people → doors, plus a printable HTML."""
+    """Write the strategy pack: Excel working file plus a real PDF board pack."""
     init_db()
     with connect() as conn:
         units = read_sql(conn, "SELECT * FROM unit_scorecards")
@@ -230,7 +230,7 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
             visits = read_sql(conn, "SELECT * FROM shop_visits")
         except Exception:
             visits = pd.DataFrame()
-    from sndintel.briefing import build_strategy_pack, write_excel, write_excel_detailed, write_html
+    from sndintel.briefing import build_strategy_pack, write_excel, write_excel_detailed, write_pdf
     from sndintel.features import latest_period
 
     period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
@@ -238,16 +238,16 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_excel(pack, path)
-    html_path = path.with_suffix(".html")
-    write_html(pack, html_path)
+    pdf_path = path.with_suffix(".pdf")
+    write_pdf(pack, pdf_path)
     detailed_xlsx = path.with_name(path.stem + "_detailed.xlsx")
-    detailed_html = path.with_name(path.stem + "_detailed.html")
+    detailed_pdf = path.with_name(path.stem + "_detailed.pdf")
     write_excel_detailed(pack, detailed_xlsx)
-    write_html(pack, detailed_html, detailed=True)
+    write_pdf(pack, detailed_pdf, detailed=True)
     console.print(f"Wrote {path}")
-    console.print(f"Wrote {html_path}  (open and File → Print → Save as PDF)")
+    console.print(f"Wrote {pdf_path}")
     console.print(f"Wrote {detailed_xlsx}")
-    console.print(f"Wrote {detailed_html}")
+    console.print(f"Wrote {detailed_pdf}")
 
 
 @app.command()

@@ -13,7 +13,16 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from sndintel.briefing import GLOSSARY, build_strategy_pack, excel_bytes, excel_bytes_detailed, html_bytes, html_bytes_detailed
+from sndintel.briefing import (
+    GLOSSARY,
+    build_strategy_pack,
+    excel_bytes,
+    excel_bytes_detailed,
+    focus_pack,
+    list_report_entities,
+    pdf_bytes,
+    pdf_bytes_detailed,
+)
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
@@ -117,13 +126,14 @@ def _inject_css():
     st.markdown(
         """
         <style>
-        .block-container {padding-top: 1.0rem; max-width: 1440px;}
+        .block-container {padding-top: 1.0rem; max-width: 1480px;}
         div[data-testid="stMetricValue"] {font-size: 1.35rem;}
         .sit-card {border-radius: 14px; padding: 1.15rem 1.35rem; margin-bottom: 0.9rem; color: #0f172a;}
         .sit-kicker {font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase; font-weight: 700; margin-bottom: 0.35rem;}
         .sit-headline {font-size: 1.55rem; line-height: 1.25; font-weight: 700; margin: 0 0 0.55rem 0;}
         .sit-body {font-size: 1.02rem; line-height: 1.45; margin: 0 0 0.4rem 0;}
         .sit-action {font-size: 1.02rem; line-height: 1.45; margin: 0; font-weight: 600;}
+        [data-testid="stDataFrame"] td {white-space: pre-wrap;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -142,7 +152,7 @@ def main():
     st.sidebar.caption("Secondary sales · shop × SKU · Pakistan S&D")
     page = st.sidebar.radio(
         "Workspace",
-        ["Strategy", "Upload files", "Focus", "People", "Mix", "Shops", "Warehouse"],
+        ["Strategy", "Report", "Upload files", "Focus", "People", "Mix", "Shops", "Warehouse"],
         index=1 if empty else 0,
     )
     st.sidebar.divider()
@@ -169,6 +179,8 @@ def main():
 
     if page == "Strategy":
         _page_strategy(data, latest, period, mtd, ledger)
+    elif page == "Report":
+        _page_report(data, latest, period, mtd, ledger)
     elif page == "Focus":
         _page_focus(data, period)
     elif page == "People":
@@ -351,7 +363,7 @@ def _page_strategy(data, latest, period, mtd, ledger):
 
     c1, c2, c3, c4, c5 = st.columns(5)
     if nat is not None:
-        c1.metric("Billed", metric_or_dash(nat["volume_mt"], "{:.1f}", " MT"))
+        c1.metric("Billed", metric_or_dash(nat["volume_mt"], "{:.0f}", " MT"))
         hist_help = (
             f"Typical same calendar month from {n_hist} months in the warehouse"
             if n_hist
@@ -361,16 +373,16 @@ def _page_strategy(data, latest, period, mtd, ledger):
             hist_help += f" ({n_same} prior {period[5:7] if period else 'same'} months, not last year alone)"
         c2.metric(
             "Seasonal expected",
-            metric_or_dash(nat["expected_mt"], "{:.1f}", " MT"),
+            metric_or_dash(nat["expected_mt"], "{:.0f}", " MT"),
             help=hist_help,
         )
-        c3.metric("Gap vs expected", metric_or_dash(nat["gap_mt"], "{:+.1f}", " MT"))
+        c3.metric("Gap vs expected", metric_or_dash(nat["gap_mt"], "{:+.0f}", " MT"))
         extra_val = extra if extra else (
             float(cities.loc[cities["situation"] == "lagging", "isolated_mt"].sum())
             if "situation" in cities.columns
             else 0.0
         )
-        c4.metric("Extra hole after weather", metric_or_dash(extra_val, "{:+.1f}", " MT"))
+        c4.metric("Extra hole after weather", metric_or_dash(extra_val, "{:+.0f}", " MT"))
         n_lag = int((cities["situation"] == "lagging").sum()) if "situation" in cities.columns else 0
         c5.metric("Exception cities", str(n_lag))
     else:
@@ -410,10 +422,10 @@ def _page_strategy(data, latest, period, mtd, ledger):
         )
     with cdr:
         st.download_button(
-            "Download printable briefing (HTML → Print to PDF)",
-            html_bytes(pack),
-            file_name=f"SND_strategy_{period}.html",
-            mime="text/html",
+            "Download strategy pack (PDF)",
+            pdf_bytes(pack),
+            file_name=f"SND_strategy_{period}.pdf",
+            mime="application/pdf",
         )
     ddl, ddr = st.columns(2)
     with ddl:
@@ -425,22 +437,24 @@ def _page_strategy(data, latest, period, mtd, ledger):
         )
     with ddr:
         st.download_button(
-            "Download detailed briefing (HTML → Print to PDF)",
-            html_bytes_detailed(pack),
-            file_name=f"SND_strategy_{period}_detailed.html",
-            mime="text/html",
+            "Download detailed pack (PDF)",
+            pdf_bytes_detailed(pack),
+            file_name=f"SND_strategy_{period}_detailed.pdf",
+            mime="application/pdf",
         )
     st.caption(
         "Excel is the working file (filters, one sheet per layer). "
-        "HTML opens in a browser — File → Print → Save as PDF for a board pack. "
+        "PDF is the board pack — whole numbers, remarks as bullets in the last column. "
+        "For a city / distributor / DSR pack, use **Report**. "
         "Detailed pack = every city, every distributor and DSR with AMS > 0, and every shop with recoverable > 0.25 MT."
     )
 
     st.markdown("##### 1. The country — every city")
     st.caption(
         "Start here. The first row is the **country**. **Recoverable** is the local hole after national weather. "
-        "**From drop size / unvisited / unbilled** split that hole. **Remarks** compare trend, visit coverage, "
-        "productivity, and drop size to the country. Distributors and DSRs with AMS = 0 are hidden later."
+        "**From drop size / unvisited / unbilled** add to Recoverable (positive = hole; negative = billed more than fair share). "
+        "**Remarks** (last column) are four bullets: trend, coverage, productivity, drop size. "
+        "Distributors and DSRs with AMS = 0 are hidden later."
     )
     left, right = st.columns((1.4, 1))
     with left:
@@ -557,11 +571,118 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
         return
     cfg = {}
     for col in df.columns:
-        if "(MT)" in str(col):
-            cfg[col] = st.column_config.NumberColumn(col, format="%.2f")
-        elif str(col).endswith("%") or str(col) == "Strike %":
-            cfg[col] = st.column_config.NumberColumn(col, format="%.0f")
-    st.dataframe(df, use_container_width=True, hide_index=True, height=min(height, 80 + 28 * max(3, len(df))), column_config=cfg)
+        name = str(col)
+        if name == "Remarks":
+            cfg[col] = st.column_config.TextColumn(name, width="large")
+        elif "(MT)" in name:
+            cfg[col] = st.column_config.NumberColumn(name, format="%.0f")
+        elif name.endswith("%") or name == "Strike %":
+            cfg[col] = st.column_config.NumberColumn(name, format="%.0f")
+        elif name in {"Billed shops", "Visited shops", "Universe", "Visits MTD"}:
+            cfg[col] = st.column_config.NumberColumn(name, format="%.0f")
+    n = max(3, len(df))
+    row_h = 56 if "Remarks" in df.columns else 28
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(max(height, 160), 80 + row_h * min(n, 12)),
+        column_config=cfg,
+    )
+
+
+def _page_report(data, latest, period, mtd, ledger):
+    st.title("Report")
+    st.caption(
+        f"**{mtd['label'] or period}** · Pick a report, then a city / distributor / DSR if needed, then PDF or Excel. "
+        "National is the current briefing. Figures are whole numbers. Remarks are bullets in the last column."
+    )
+    units = data.get("units", pd.DataFrame())
+    if units is None or units.empty:
+        st.warning("No scorecards yet. Rebuild from the warehouse or upload files.")
+        _rescore_button()
+        return
+    pack = build_strategy_pack(
+        units,
+        data.get("shop_month", pd.DataFrame()),
+        situation=data.get("situation", pd.DataFrame()),
+        ledger=ledger,
+        period=period,
+        visits=data.get("visits", pd.DataFrame()),
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        report_type = st.selectbox("1. Report type", ["National", "City", "Distributor", "DSR"], key="report_type")
+    entity = None
+    with c2:
+        if report_type == "National":
+            st.selectbox("2. Scope", ["Whole country"], disabled=True, key="report_scope_national")
+        else:
+            options = list_report_entities(pack, report_type)
+            q = st.text_input("Search", placeholder=f"Type to filter {report_type.lower()}s", key="report_search")
+            filtered = [o for o in options if not q or q.lower() in o.lower()]
+            if not options:
+                st.selectbox(f"2. {report_type}", ["No options in the warehouse"], disabled=True, key="report_entity_empty")
+            elif not filtered:
+                st.selectbox(f"2. {report_type}", [f"No match for “{q}”"], disabled=True, key="report_entity_nomatch")
+            else:
+                entity = st.selectbox(f"2. {report_type}", filtered, index=0, key="report_entity")
+    with c3:
+        fmt = st.selectbox("3. Format", ["PDF", "Excel"], key="report_format")
+
+    if report_type != "National" and not entity:
+        st.info("Choose a city, distributor, or DSR — type in Search to narrow the list.")
+        return
+
+    focused = pack if report_type == "National" else focus_pack(pack, report_type, entity)
+    kind = (focused.scope or "national").lower()
+    if kind == "city":
+        preview = focused.cities
+        preview_label = "City scorecard"
+    elif kind == "distributor":
+        preview = focused.all_distributors
+        preview_label = "Distributor scorecard"
+    elif kind == "dsr":
+        preview = focused.all_dsrs
+        preview_label = "DSR scorecard"
+    else:
+        preview = focused.cities
+        preview_label = "Country by city"
+
+    st.markdown(f"**{focused.headline or focused.scope_label or 'National briefing'}**")
+    st.caption(focused.weather or "")
+    st.markdown(f"##### Preview — {preview_label}")
+    _strategy_table(preview, height=280)
+
+    if kind == "city":
+        st.markdown("##### Distributors in this city")
+        _strategy_table(focused.all_distributors, height=240)
+    elif kind == "distributor":
+        st.markdown("##### Shops under this distributor")
+        _strategy_table(focused.all_shops, height=280)
+    elif kind == "dsr":
+        st.markdown("##### Shops on this beat")
+        _strategy_table(focused.all_shops, height=280)
+
+    label = focused.scope_label or "national"
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(label))[:60]
+    if fmt == "Excel":
+        payload = excel_bytes(focused)
+        name = f"SND_{report_type.lower()}_{safe}_{period}.xlsx"
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        payload = pdf_bytes(focused)
+        name = f"SND_{report_type.lower()}_{safe}_{period}.pdf"
+        mime = "application/pdf"
+    st.download_button(
+        f"Download {report_type.lower()} report ({fmt})",
+        payload,
+        file_name=name,
+        mime=mime,
+        type="primary",
+    )
+    st.caption("PDF is a real PDF (not HTML). Excel keeps one sheet per layer for filters.")
+    _rescore_button()
 
 
 def _rescore_button():
