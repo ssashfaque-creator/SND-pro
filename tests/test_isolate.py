@@ -9,6 +9,7 @@ from sndintel.isolate import (
     apply_expected_gap,
     coverage_velocity,
     empirical_bayes,
+    isolate_key_holes,
     intra_month_fraction,
     situation_brief,
 )
@@ -178,3 +179,26 @@ def test_hierarchy_isolates_shop_inside_a_city():
     khi = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Karachi")].iloc[0]
     assert float(khi["expected_mt"]) > float(khi["volume_mt"])
     assert khi["situation"] == "lagging"
+
+
+def test_vital_few_keeps_outlier_and_pareto_head_not_the_tail():
+    rows = [{"grain_id": "Eva", "parent_id": "Karachi", "recoverable_mt": 40.0}]
+    rows.append({"grain_id": "South", "parent_id": "Karachi", "recoverable_mt": 30.0})
+    for i in range(20):
+        rows.append({"grain_id": f"Tiny{i}", "parent_id": "Karachi", "recoverable_mt": 0.4})
+    df = pd.DataFrame(rows)
+    kept, meta = isolate_key_holes(df, group_col="parent_id", abs_floor=0.25)
+    names = set(kept["grain_id"].astype(str))
+    assert "Eva" in names
+    assert "South" in names
+    assert not any(n.startswith("Tiny") for n in names)
+    assert meta["n_hidden"] == 20
+    assert meta["hidden_mt"] > 5
+
+
+def test_vital_few_equal_micro_holes_are_all_remainder():
+    rows = [{"grain_id": f"K{i}", "parent_id": "Lahore", "recoverable_mt": 0.3} for i in range(40)]
+    df = pd.DataFrame(rows)
+    kept, meta = isolate_key_holes(df, group_col="parent_id", abs_floor=0.25)
+    assert kept.empty
+    assert meta["n_hidden"] == 40

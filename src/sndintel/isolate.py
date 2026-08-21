@@ -70,6 +70,122 @@ def robust_z(values: pd.Series) -> pd.Series:
     return 0.6745 * (s - med) / mad
 
 
+VITAL_COVERAGE = 0.80
+VITAL_MIN_Z = 1.0
+VITAL_MIN_SHARE = 0.05
+
+
+def isolate_key_holes(
+    df: pd.DataFrame,
+    value_col: str = "recoverable_mt",
+    group_col: str | None = None,
+    coverage: float = VITAL_COVERAGE,
+    min_z: float = VITAL_MIN_Z,
+    min_share: float = VITAL_MIN_SHARE,
+    abs_floor: float = 0.0,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Keep the vital few holes; roll the rest into a remainder.
+
+    Among lagging units (optionally within a parent city/distributor):
+
+    1. Iglewicz–Hoaglin modified z of Gap versus other lagging Gaps.
+       Keep z ≥ ``min_z`` (unusually large vs peers on the lagging list).
+    2. Then walk largest-first and add a unit only if it is at least
+       ``min_share`` of that group's hole (default 5%) until named rows
+       cover ``coverage`` of the hole (default 80%). The tail is not listed
+       just to hit 80% — a city of equal 0.3 MT doors is a coverage KPI.
+
+    Always keeps the single largest hole in a group when it clears ``abs_floor``.
+    """
+    empty_meta = {
+        "n_kept": 0,
+        "n_hidden": 0,
+        "hidden_mt": 0.0,
+        "n_pool": 0,
+        "coverage": float(coverage),
+        "min_z": float(min_z),
+        "min_share": float(min_share),
+        "abs_floor": float(abs_floor),
+    }
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame(), empty_meta
+    work = df.copy()
+    val = pd.to_numeric(work.get(value_col), errors="coerce").fillna(0.0)
+    work = work.assign(_vital_gap=val)
+    pool = work.loc[val > float(abs_floor)].copy()
+    below = work.loc[val <= float(abs_floor)].copy()
+    if pool.empty:
+        hidden_mt = float(val.sum())
+        meta = {**empty_meta, "n_hidden": int(len(work)), "hidden_mt": hidden_mt, "n_pool": int(len(work))}
+        return work.iloc[0:0].drop(columns=["_vital_gap"], errors="ignore"), meta
+
+    kept_parts: list[pd.DataFrame] = []
+    rest_parts: list[pd.DataFrame] = [below] if not below.empty else []
+    if group_col and group_col in pool.columns:
+        for _, g in pool.groupby(pool[group_col].astype(str), dropna=False):
+            k, r = _vital_few_split(g, coverage=coverage, min_z=min_z, min_share=min_share)
+            if not k.empty:
+                kept_parts.append(k)
+            if not r.empty:
+                rest_parts.append(r)
+    else:
+        k, r = _vital_few_split(pool, coverage=coverage, min_z=min_z, min_share=min_share)
+        if not k.empty:
+            kept_parts.append(k)
+        if not r.empty:
+            rest_parts.append(r)
+
+    kept = pd.concat(kept_parts, ignore_index=False) if kept_parts else pool.iloc[0:0]
+    rest = pd.concat(rest_parts, ignore_index=False) if rest_parts else pool.iloc[0:0]
+    if "_vital_gap" in kept.columns:
+        kept = kept.drop(columns=["_vital_gap"])
+    hidden_mt = float(pd.to_numeric(rest.get(value_col), errors="coerce").fillna(0).sum()) if not rest.empty else 0.0
+    meta = {
+        **empty_meta,
+        "n_kept": int(len(kept)),
+        "n_hidden": int(len(rest)),
+        "hidden_mt": hidden_mt,
+        "n_pool": int(len(work)),
+    }
+    return kept, meta
+
+
+def _vital_few_split(
+    g: pd.DataFrame,
+    coverage: float,
+    min_z: float,
+    min_share: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    x = pd.to_numeric(g["_vital_gap"], errors="coerce").fillna(0.0)
+    if x.empty:
+        return g.iloc[0:0], g
+    if len(g) == 1:
+        return g, g.iloc[0:0]
+    keep = pd.Series(False, index=g.index)
+    total = float(x.sum()) or 1.0
+    hurdle = max(0.0, float(min_share) * total)
+    leader = x.idxmax()
+    if len(g) == 1 or float(x.loc[leader]) + 1e-12 >= hurdle:
+        keep.loc[leader] = True
+    med = float(x.median())
+    mad = float((x - med).abs().median())
+    if mad >= 1e-12:
+        z = 0.6745 * (x - med) / mad
+        keep.loc[z >= float(min_z)] = True
+    running = float(x.loc[keep].sum()) if keep.any() else 0.0
+    if running / total < float(coverage):
+        for idx, v in x.sort_values(ascending=False).items():
+            if keep.loc[idx]:
+                continue
+            if float(v) + 1e-12 < hurdle:
+                break
+            keep.loc[idx] = True
+            running += float(v)
+            if running / total >= float(coverage):
+                break
+    return g.loc[keep].copy(), g.loc[~keep].copy()
+
+
 def coverage_velocity(
     n_now: float, n_ly: float, vol_now: float, vol_ly: float
 ) -> tuple[float, float, float, float, float]:

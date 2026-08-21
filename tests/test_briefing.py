@@ -174,8 +174,8 @@ def test_excel_and_html_are_readable_packs():
     names = wb.sheetnames
     assert names[0] == "00 Cover"
     assert "01 Country by city" in names
-    assert "04 All lagging distributors" in names
-    assert "06 All lagging shops" in names
+    assert "04 Key lagging distributors" in names
+    assert "06 Key lagging shops" in names
     cover = wb["00 Cover"]
     col_a = [c.value for row in cover.iter_rows(min_col=1, max_col=1, values_only=False) for c in row]
     assert "Glossary" in col_a
@@ -297,4 +297,28 @@ def test_tiny_shops_are_not_on_visit_lists():
     drill = report.city_distributor_shops["Shop"].astype(str)
     assert not drill.str.contains("Kiryana").any()
     assert drill.str.contains("Kifaya Mart").any() or drill.str.contains("Medium Mart").any()
+
+
+def test_summary_pack_hides_tiny_lagging_distributors_as_remainder():
+    """One big lagging dist plus many small ones: summary keeps the vital few only."""
+    rows = []
+    rows.append(_row("BIG", "2026-08", 10.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    rows.append(_row("BIG", "2025-08", 80.0, "Karachi", "Eva Foods", "Amir", name="Kifaya"))
+    for i in range(15):
+        rows.append(_row(f"S{i}", "2026-08", 0.6, "Karachi", f"Tiny Dist {i}", f"Rep {i}", name=f"Shop {i}"))
+        rows.append(_row(f"S{i}", "2025-08", 1.2, "Karachi", f"Tiny Dist {i}", f"Rep {i}", name=f"Shop {i}"))
+    rows = _with_recent_ams(
+        rows,
+        volume_by_store={"BIG": 70.0, **{f"S{i}": 1.2 for i in range(15)}},
+    )
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
+    report = build_strategy_pack(pack_h.units, sm, period="2026-08")
+    named = [x for x in report.lagging_distributors["Distributor"].astype(str) if not str(x).startswith("Not listed")]
+    assert "Eva Foods" in named
+    assert sum(1 for x in named if str(x).startswith("Tiny Dist")) <= 2
+    assert report.lagging_distributors["Distributor"].astype(str).str.contains("Not listed").any()
+    # Detailed list still has the tiny distributors.
+    all_names = set(report.all_distributors["Distributor"].astype(str))
+    assert "Tiny Dist 0" in all_names
 

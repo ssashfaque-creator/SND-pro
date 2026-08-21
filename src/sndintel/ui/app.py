@@ -507,7 +507,9 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         "Excel is the working file (filters, one sheet per layer). "
         "PDF is the board pack — whole numbers, remarks as bullets in the last column. "
         "For a city / distributor / DSR pack, use **Report**. "
-        "Detailed pack = every city, every distributor and DSR with AMS > 0, and every shop with recoverable > 0.25 MT."
+        "National summary keeps only the vital few lagging distributors, DSRs, and shops "
+        "(modified z of Gap, then Pareto of each city’s hole). "
+        "Detailed pack = every city, every distributor and DSR with AMS > 0, and every shop with gap > 0.25 MT."
     )
 
     st.markdown("##### 1. The country — every city")
@@ -573,19 +575,19 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         fig.update_layout(height=200, margin=dict(l=10, r=10, t=30, b=10), title="National volume")
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("##### 2. Lagging cities — distributors")
+    st.markdown("##### 2. Lagging cities — key distributors")
     st.caption(
-        "Only cities on the lagging list, broken by distributor. AMS = 0 is hidden. "
-        "These are the first calls — not every distributor in the country."
+        "Vital few of each lagging city’s hole (modified z of Gap, then Pareto). AMS = 0 is hidden. "
+        "Remainder line is the tail — not every lagging distributor."
     )
     if pack.city_distributors.empty:
         st.info("No lagging city, or no distributor inside those cities is behind the city.")
     else:
         _strategy_table(pack.city_distributors)
 
-    st.markdown("##### 3. Those distributors — lagging shops")
+    st.markdown("##### 3. Those distributors — key shops")
     st.caption(
-        (pack.shop_note or "Every shop with recoverable greater than 0.25 MT.")
+        (pack.shop_note or "Vital few shops of that distributor’s hole.")
         + " **Gap** is the volume you get back if the door billed its own Expected."
     )
     if pack.city_distributor_shops.empty:
@@ -593,19 +595,19 @@ def _page_strategy(data, _latest, period, mtd, ledger):
     else:
         _strategy_table(pack.city_distributor_shops, height=360)
 
-    st.markdown("##### 4. Every lagging distributor (all cities)")
+    st.markdown("##### 4. Key lagging distributors (all cities)")
     st.caption(
-        "Distributors behind their own city even when the city moved with the country. "
-        "AMS = 0 is hidden. Section 2 only showed distributors in lagging cities."
+        "Vital few per city, including pockets inside cities that are on expected. "
+        "AMS = 0 is hidden. Section 2 only showed lagging cities."
     )
     _strategy_table(pack.lagging_distributors)
 
-    st.markdown("##### 5. Every lagging DSR (all cities)")
-    st.caption("Salespeople behind their city. AMS = 0 is hidden. Ride-with this list.")
-    _strategy_table(pack.lagging_dsrs.head(60))
+    st.markdown("##### 5. Key lagging DSRs (all cities)")
+    st.caption("Vital few salespeople per city. Remainder line is the tail. Ride-with this list.")
+    _strategy_table(pack.lagging_dsrs)
 
-    st.markdown("##### 6. Every lagging shop above 0.25 MT gap")
-    st.caption(pack.shop_note or "Every shop with recoverable greater than 0.25 MT. Shallower doors are the remainder line.")
+    st.markdown("##### 6. Key lagging shops")
+    st.caption(pack.shop_note or "Vital few shops per city. The rest of the hole is the remainder line.")
     _strategy_table(pack.lagging_shops, height=420)
 
     with st.expander("How to read the columns", expanded=False):
