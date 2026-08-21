@@ -233,9 +233,12 @@ def test_excel_and_html_are_readable_packs():
     assert names[0] == "00 Cover"
     assert "01 Country by city" in names
     assert "02 Top 10 distributors" in names
-    assert "04 Top 10 dists all cities" in names
-    assert "05 Top 10 DSRs of those" in names
-    assert "06 Top 50 shops" in names
+    assert "03 Top 10 DSRs" in names
+    assert "04 Top 50 shops" in names
+    assert "04 Top 10 dists all cities" not in names
+    assert "05 Top 10 DSRs of those" not in names
+    assert "03 Top 50 shops of those" not in names
+    assert len([n for n in names if n != "00 Cover"]) == 4
     cover = wb["00 Cover"]
     col_a = [c.value for row in cover.iter_rows(min_col=1, max_col=1, values_only=False) for c in row]
     assert "Glossary" in col_a
@@ -243,16 +246,22 @@ def test_excel_and_html_are_readable_packs():
     assert "Executive summary" in col_a
     assert col_a.index("Glossary") < col_a.index("Executive summary")
     html = render_html(report)
-    assert html.find("Glossary") < html.find("1. The country — every city")
+    assert html.find("Glossary") < html.find("1. Every city versus its own Expected")
     assert "How the figures are calculated" in html
     assert "Executive summary" in html
     detailed = render_html(report, detailed=True)
-    assert "Distributor detail" in detailed
-    assert "National detail" in detailed
+    assert "Every distributor with AMS greater than 0" in detailed
+    assert "Every DSR with AMS greater than 0" in detailed
+    assert "National shop list" in detailed
+    assert "National DSR list" not in detailed
     raw_d = excel_bytes_detailed(report)
     wb_d = load_workbook(BytesIO(raw_d))
     assert "01 City detail" in wb_d.sheetnames
-    assert "05 National shops" in wb_d.sheetnames
+    assert "02 Distributor detail" in wb_d.sheetnames
+    assert "03 DSR detail" in wb_d.sheetnames
+    assert "04 National shops" in wb_d.sheetnames
+    assert "04 National DSRs" not in wb_d.sheetnames
+    assert "05 National shops" not in wb_d.sheetnames
     pdf = pdf_bytes(report)
     assert pdf.startswith(b"%PDF")
     pdf_d = pdf_bytes(report, detailed=True)
@@ -376,9 +385,6 @@ def test_tiny_shops_are_not_on_visit_lists():
     assert not names.str.contains("Kiryana").any()
     assert names.str.contains("Not listed").any()
     assert report.kpis["n_shops_hidden"] >= 20
-    drill = report.city_distributor_shops["Shop"].astype(str)
-    assert not drill.str.contains("Kiryana").any()
-    assert drill.str.contains("Kifaya Mart").any() or drill.str.contains("Medium Mart").any()
 
 
 def test_keep_top_holes_caps_and_remainder():
@@ -420,8 +426,8 @@ def test_summary_pack_hides_tiny_lagging_distributors_as_remainder():
     assert "Tiny Dist 14" in all_names
 
 
-def test_summary_dsrs_are_top_10_from_those_distributors():
-    """DSRs on the summary are only from the top 10 distributors, at most 10 named."""
+def test_summary_dsrs_are_national_top_10():
+    """DSRs on the summary are the national top 10 by seriousness, at most 10 named."""
     rows = []
     for i in range(12):
         dist = f"Dist {i:02d}"
@@ -446,21 +452,21 @@ def test_summary_dsrs_are_top_10_from_those_distributors():
     assert "Rep 11" in all_dsrs
 
 
-def test_summary_excludes_dsr_from_distributor_outside_top_10():
-    """A DSR under a mild-miss 11th distributor must not enter the ride-with ten."""
+def test_summary_includes_serious_dsr_outside_top_10_distributors():
+    """A collapsed DSR under an 11th distributor still ranks on the national DSR ten."""
     rows = []
     volume_by_store = {}
     for d in range(10):
-        for r in range(3):
+        for r in range(5):
             sid = f"D{d:02d}R{r}"
             dist = f"Fat Dist {d:02d}"
             dsr = f"Fat Rep {d:02d}-{r}"
             volume_by_store[sid] = 20.0
-            rows.append(_row(sid, "2026-08", 5.0, "Karachi", dist, dsr, name=sid))
+            rows.append(_row(sid, "2026-08", 17.0, "Karachi", dist, dsr, name=sid))
             rows.append(_row(sid, "2025-08", 20.0, "Karachi", dist, dsr, name=sid))
-    volume_by_store["MILD"] = 40.0
-    rows.append(_row("MILD", "2026-08", 36.0, "Lahore", "Thin Dist", "Mild Rep", name="Mild Shop"))
-    rows.append(_row("MILD", "2025-08", 40.0, "Lahore", "Thin Dist", "Mild Rep", name="Mild Shop"))
+    volume_by_store["MILD"] = 30.0
+    rows.append(_row("MILD", "2026-08", 24.0, "Lahore", "Thin Dist", "Mild Rep", name="Mild Shop"))
+    rows.append(_row("MILD", "2025-08", 30.0, "Lahore", "Thin Dist", "Mild Rep", name="Mild Shop"))
     rows = _with_recent_ams(rows, volume_by_store=volume_by_store)
     sm = pd.DataFrame(rows)
     pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
@@ -469,13 +475,13 @@ def test_summary_excludes_dsr_from_distributor_outside_top_10():
     assert all(str(x).startswith("Fat Dist") for x in dist_named)
     assert "Thin Dist" not in dist_named
     dsr_named = [x for x in report.lagging_dsrs["DSR"].astype(str) if not str(x).startswith("Not listed")]
-    assert "Mild Rep" not in dsr_named
-    assert all(str(x).startswith("Fat Rep") for x in dsr_named)
+    assert "Mild Rep" in dsr_named
+    assert dsr_named[0] == "Mild Rep"
     assert "Mild Rep" in set(report.all_dsrs["DSR"].astype(str))
 
 
 def test_summary_shops_are_top_50_most_serious():
-    """National and those-distributor shop lists name at most 50 doors; detailed still has everyone above 0.25 MT."""
+    """National shop list names at most 50 doors; detailed still has everyone above 0.25 MT."""
     rows = []
     volume_by_store = {}
     for i in range(60):
@@ -493,8 +499,6 @@ def test_summary_shops_are_top_50_most_serious():
     assert named[0] == "Door 59"
     assert "Door 00" not in named
     assert report.lagging_shops["Shop"].astype(str).str.contains("Not listed").any()
-    drill = [x for x in report.city_distributor_shops["Shop"].astype(str) if not str(x).startswith("Not listed")]
-    assert len(drill) == SUMMARY_SHOP_N
     detailed = [x for x in report.all_shops["Shop"].astype(str) if not str(x).startswith("Not listed")]
     assert len(detailed) == 60
 

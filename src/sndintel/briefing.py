@@ -1,11 +1,11 @@
-"""One strategy pack: country → top lagging distributors → DSRs → doors, plus full lists.
+"""One strategy pack: country → distributors → DSRs → doors, plus full lists.
 
 Built for a sales head to print or filter. Column names are in English; jargon lives
 in the glossary, not the headers. Excel is the working file. PDF is the board pack.
-The national summary names the top 10 distributors, the top 10 DSRs from
-those distributors, and the top 50 shops. Those caps rank the most serious
-misses versus each unit’s own Expected (not the biggest books by Gap tons).
-Report packs and the detailed pack are full lists.
+The national summary has one table per grain: top 10 distributors, top 10 DSRs,
+and top 50 shops, each ranked nationally by how serious the miss is versus that
+unit’s own Expected (not nested under the other list, and not the biggest books
+by Gap tons). Report packs and the detailed pack are one full list per grain.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ GLOSSARY = [
     ("AMS = 0 distributors / DSRs", "Hidden everywhere in the report. No recent three-month run-rate, so they are not a call."),
     (
         "Summary pack lists",
-        "Hard caps, not a statistical sample of the country: top 10 distributors, top 10 DSRs under those distributors, top 50 shops. Ranked by how serious the miss is versus that unit’s own Expected given its size (Gap ÷ √Expected), so a collapsed mid-size name can outrank a large book that is only slightly light. Remainder lines are the tail. The detailed pack is the full list (AMS > 0 distributors/DSRs; shops above 0.25 MT).",
+        "Hard caps, not a statistical sample of the country: one table of the top 10 distributors, one of the top 10 DSRs, one of the top 50 shops — each ranked nationally, not nested under the other. Ranked by how serious the miss is versus that unit’s own Expected given its size (Gap ÷ √Expected), so a collapsed mid-size name can outrank a large book that is only slightly light. Remainder lines are the tail. The detailed pack is the full list (AMS > 0 distributors/DSRs; shops above 0.25 MT).",
     ),
 ]
 
@@ -101,11 +101,11 @@ CALCULATION_NOTES = [
     ),
     (
         "Rounding and lists",
-        "MT, shop counts, and percents print as whole numbers. From-columns are adjusted so they still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names the top 10 lagging distributors, the top 10 lagging DSRs from those distributors, and the top 50 lagging shops (after the 0.25 MT floor), ranked by miss versus own Expected given size — not the largest Gap tons. Remainder lines are the tail. The detailed pack lists every AMS > 0 distributor/DSR and every shop above 0.25 MT.",
+        "MT, shop counts, and percents print as whole numbers. From-columns are adjusted so they still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names one top 10 of lagging distributors, one top 10 of lagging DSRs, and one top 50 of lagging shops (after the 0.25 MT floor), each ranked nationally by miss versus own Expected given size — not the largest Gap tons, and not nested under the other list. Remainder lines are the tail. The detailed pack lists every AMS > 0 distributor/DSR and every shop above 0.25 MT.",
     ),
     (
         "Top-N lists",
-        "National summary only. Rank lagging units by how far they are behind their own Expected for their size (Gap ÷ √Expected). Keep 10 distributors, then 10 DSRs that appear on doors under those 10 distributors, then 50 shops (Gap > 0.25 MT). A large book that is 8% light loses to a mid-size book that has collapsed. City / distributor / DSR Report packs and the detailed pack are still the full lists, highest Gap first.",
+        "National summary only. Rank lagging units by how far they are behind their own Expected for their size (Gap ÷ √Expected). Keep 10 distributors, 10 DSRs, and 50 shops (Gap > 0.25 MT) as three separate national lists. A DSR can appear even if its distributor is not in the ten; a shop can appear even if its distributor is not in the ten. A large book that is 8% light loses to a mid-size book that has collapsed. City / distributor / DSR Report packs and the detailed pack are still one full list per grain, highest Gap first.",
     ),
 ]
 
@@ -140,8 +140,8 @@ def how_to_read_steps(pack: StrategyPack, detailed: bool = False) -> list[str]:
     return [
         "Country by city — every city versus its own Expected. Highest gap first.",
         "Top 10 most serious lagging distributors nationally. Ranked by miss versus own Expected given size, not the biggest Gap. AMS = 0 is hidden.",
-        "Top 10 most serious lagging DSRs from those 10 distributors. Ride-with this list.",
-        "Top 50 most serious lagging shops (doors ≤ 0.25 MT and the tail are the remainder line).",
+        "Top 10 most serious lagging DSRs nationally — not only DSRs under the ten distributors. Ranked the same way. AMS = 0 is hidden.",
+        "Top 50 most serious lagging shops nationally (doors ≤ 0.25 MT and the tail are the remainder line).",
     ]
 
 SHOP_RECOVERABLE_FLOOR = 0.25
@@ -171,8 +171,6 @@ SCORECARD_METRICS = [
 ]
 
 CITY_VIEW = [("grain_id", "City"), *SCORECARD_METRICS]
-
-DIST_IN_CITY_VIEW = [("city", "City"), ("grain_id", "Distributor"), *SCORECARD_METRICS]
 
 DIST_ALL_VIEW = [("grain_id", "Distributor"), ("city", "City"), *SCORECARD_METRICS]
 
@@ -363,31 +361,16 @@ def build_strategy_pack(
     if not all_lag_dist.empty:
         lagging_dist_names = [str(x) for x in all_lag_dist["grain_id"].tolist()]
 
-    # Same ten names on both distributor sheets — not a per-city statistical cut.
-    city_dists = all_lag_dist
-    city_dist_meta = lag_dist_meta
-
     shops = score_shops(shop_month, cities, period, pace)
     shops = _attach_ams(shops, shop_month, period, ["store_id"], ledger, pace)
     shops = _attach_shop_calls(shops, visits, period)
     hole_floor = SHOP_RECOVERABLE_FLOOR
 
-    city_dist_shops = pd.DataFrame()
-    city_dist_shop_meta = {"n_hidden": 0, "hidden_mt": 0.0, "top_n": SUMMARY_SHOP_N}
-    if not shops.empty and lagging_dist_names:
-        city_dist_shops = shops[shops["distributor"].astype(str).isin(set(lagging_dist_names))].copy()
-        city_dist_shops, floor_meta = keep_visit_shops(city_dist_shops, hole_floor)
-        city_dist_shops = attach_seriousness(city_dist_shops, pace)
-        city_dist_shops, top_meta = keep_top_holes(city_dist_shops, SUMMARY_SHOP_N, rank_col="_seriousness")
-        city_dist_shop_meta = _merge_hole_meta(floor_meta, top_meta)
-
     all_lag_dsr = dsrs[dsrs["situation"] == "lagging"].copy() if not dsrs.empty else dsrs
-    if all_lag_dsr is None or all_lag_dsr.empty or not lagging_dist_names:
+    if all_lag_dsr is None or all_lag_dsr.empty:
         all_lag_dsr = all_lag_dsr.iloc[0:0].copy() if all_lag_dsr is not None else pd.DataFrame()
         lag_dsr_meta = keep_top_holes(all_lag_dsr, SUMMARY_DSR_N)[1]
     else:
-        dsr_keys = _dsr_keys_under_distributors(shop_month, set(lagging_dist_names), period, shops)
-        all_lag_dsr = _filter_dsrs_by_keys(all_lag_dsr, dsr_keys)
         all_lag_dsr = attach_seriousness(all_lag_dsr, pace)
         all_lag_dsr, lag_dsr_meta = keep_top_holes(all_lag_dsr, SUMMARY_DSR_N, rank_col="_seriousness")
         all_lag_dsr = _sort_focus(all_lag_dsr)
@@ -416,6 +399,10 @@ def build_strategy_pack(
         f"{float(lag_meta.get('hidden_mt') or 0):.0f} MT gap are the remainder line "
         f"(includes gaps ≤ {hole_floor:.2f} MT)."
     )
+    presented_dists = _present_with_remainder(
+        all_lag_dist, DIST_ALL_VIEW, lag_dist_meta, "Distributor", "distributors"
+    )
+    presented_shops = _present_shops(lag_shops, lag_meta)
 
     pack = StrategyPack(
         period=period,
@@ -426,11 +413,11 @@ def build_strategy_pack(
         action=sit.get("action") or sit.get("action_summary") or "",
         kpis=kpis,
         cities=_present_with_national(nat_grain, cities, CITY_VIEW),
-        city_distributors=_present_with_remainder(city_dists, DIST_IN_CITY_VIEW, city_dist_meta, "Distributor", "distributors"),
-        city_distributor_shops=_present_shops(city_dist_shops, city_dist_shop_meta),
-        lagging_distributors=_present_with_remainder(all_lag_dist, DIST_ALL_VIEW, lag_dist_meta, "Distributor", "distributors"),
+        city_distributors=presented_dists,
+        city_distributor_shops=presented_shops,
+        lagging_distributors=presented_dists,
         lagging_dsrs=_present_with_remainder(all_lag_dsr, DSR_VIEW, lag_dsr_meta, "DSR", "DSRs"),
-        lagging_shops=_present_shops(lag_shops, lag_meta),
+        lagging_shops=presented_shops,
         lagging_city_names=lagging_city_names,
         lagging_distributor_names=lagging_dist_names,
         shop_note=shop_note,
@@ -519,21 +506,16 @@ def focus_pack(pack: StrategyPack, report_type: str, entity: str) -> StrategyPac
         dists = _filter_table(pack.all_distributors, "City", city)
         dsrs = _filter_table(pack.all_dsrs, "City", city)
         shops = _filter_table(pack.all_shops, "City", city)
-        lag_d = _filter_table(pack.lagging_distributors, "City", city)
-        lag_s = _filter_table(pack.lagging_dsrs, "City", city)
-        lag_shops = _filter_table(pack.lagging_shops, "City", city)
-        city_dists = _filter_table(pack.city_distributors, "City", city)
-        city_shops = _filter_table(pack.city_distributor_shops, "City", city)
         headline = f"{city} — city pack"
         return replace(
             pack,
             headline=headline or pack.headline,
             cities=keep_cities,
-            city_distributors=city_dists if city_dists is not None and not city_dists.empty else dists,
-            city_distributor_shops=city_shops if city_shops is not None and not city_shops.empty else shops,
-            lagging_distributors=lag_d,
-            lagging_dsrs=lag_s,
-            lagging_shops=lag_shops if lag_shops is not None and not lag_shops.empty else shops,
+            city_distributors=dists,
+            city_distributor_shops=shops,
+            lagging_distributors=dists,
+            lagging_dsrs=dsrs,
+            lagging_shops=shops,
             all_distributors=dists,
             all_dsrs=dsrs,
             all_shops=shops,
@@ -751,54 +733,6 @@ def attach_seriousness(df: pd.DataFrame, pace: float = 1.0) -> pd.DataFrame:
     base = base.clip(lower=SERIOUSNESS_FLOOR)
     out["_seriousness"] = miss / (base ** 0.5)
     return out
-
-
-def _dsr_keys_under_distributors(
-    shop_month: pd.DataFrame,
-    dist_names: set[str],
-    period: str,
-    shops: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """City + DSR pairs that appear on doors under the named distributors."""
-    frames: list[pd.DataFrame] = []
-    cols = ["city", "dsr_name"]
-    if shop_month is not None and not shop_month.empty and dist_names:
-        cur = shop_month
-        if "period" in cur.columns:
-            this = cur[cur["period"].astype(str) == str(period)]
-            if not this.empty:
-                cur = this
-        if "distributor" in cur.columns:
-            mask = cur["distributor"].astype(str).isin(dist_names)
-            have = [c for c in cols if c in cur.columns]
-            if have:
-                frames.append(cur.loc[mask, have].copy())
-    if shops is not None and not shops.empty and dist_names and "distributor" in shops.columns:
-        mask = shops["distributor"].astype(str).isin(dist_names)
-        have = [c for c in cols if c in shops.columns]
-        if have:
-            frames.append(shops.loc[mask, have].copy())
-    if not frames:
-        return pd.DataFrame(columns=cols)
-    out = pd.concat(frames, ignore_index=True)
-    for c in cols:
-        if c not in out.columns:
-            out[c] = ""
-    return out[cols].drop_duplicates()
-
-
-def _filter_dsrs_by_keys(dsrs: pd.DataFrame, keys: pd.DataFrame) -> pd.DataFrame:
-    if dsrs is None or dsrs.empty or keys is None or keys.empty:
-        return dsrs.iloc[0:0].copy() if dsrs is not None else pd.DataFrame()
-    city_col = "city" if "city" in dsrs.columns else "parent_id"
-    dsr_col = "dsr_name" if "dsr_name" in dsrs.columns else "grain_id"
-    key_city = "city" if "city" in keys.columns else None
-    key_dsr = "dsr_name" if "dsr_name" in keys.columns else None
-    if not key_city or not key_dsr:
-        return dsrs.iloc[0:0].copy()
-    left = dsrs[city_col].astype(str) + "\0" + dsrs[dsr_col].astype(str)
-    right = set(keys[key_city].astype(str) + "\0" + keys[key_dsr].astype(str))
-    return dsrs.loc[left.isin(right)].copy()
 
 
 def _merge_hole_meta(floor_meta: dict[str, float], vital_meta: dict[str, float]) -> dict[str, float]:
@@ -1071,13 +1005,7 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
                 pack.all_dsrs,
             ),
             (
-                "04 National DSRs",
-                "National DSR list",
-                "Same as DSR detail — every salesperson with a recent run-rate (AMS > 0).",
-                pack.all_dsrs,
-            ),
-            (
-                "05 National shops",
+                "04 National shops",
                 "National shop list",
                 "Every shop with gap greater than 0.25 MT. Shallower doors are one remainder line.",
                 pack.all_shops,
@@ -1092,33 +1020,20 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
         ),
         (
             "02 Top 10 distributors",
-            "Top 10 lagging distributors by how serious the miss is",
-            "Ranked by Gap ÷ √Expected — collapsed mid-size names beat large books that are only slightly light. AMS = 0 is hidden. Remainder line is everyone after the tenth.",
-            pack.city_distributors,
-        ),
-        (
-            "03 Top 50 shops of those",
-            "Top 50 lagging shops under those distributors",
-            (pack.shop_note or "Top 50 most serious shops under the distributors above.")
-            + " Gap is volume that comes back if the door billed its own Expected.",
-            pack.city_distributor_shops,
-        ),
-        (
-            "04 Top 10 dists all cities",
-            "Top 10 lagging distributors (all cities)",
-            "Same ten names as sheet 02 — national rank by how serious the miss is versus own Expected, including pockets inside cities that are on expected.",
+            "Top 10 lagging distributors",
+            "One national list. Ranked by Gap ÷ √Expected — collapsed mid-size names beat large books that are only slightly light. AMS = 0 is hidden. Remainder line is everyone after the tenth.",
             pack.lagging_distributors,
         ),
         (
-            "05 Top 10 DSRs of those",
-            "Top 10 lagging DSRs from those distributors",
-            "Salespeople whose shops sit under the top 10 distributors, then the ten most serious misses versus their own Expected. Ride-with this list.",
+            "03 Top 10 DSRs",
+            "Top 10 lagging DSRs",
+            "One national list — not nested under the ten distributors. Ranked by Gap ÷ √Expected. AMS = 0 is hidden. Remainder line is everyone after the tenth.",
             pack.lagging_dsrs,
         ),
         (
-            "06 Top 50 shops",
+            "04 Top 50 shops",
             "Top 50 lagging shops",
-            pack.shop_note or "Top 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.",
+            pack.shop_note or "One national list of the 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.",
             pack.lagging_shops,
         ),
     ]
@@ -1131,70 +1046,8 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
         sections.append(_html_exec(pack))
     else:
         sections.append(_html_cover(pack, k, detailed=detailed))
-    sections.extend(
-        [
-        _html_section(
-            "1. The country — every city",
-            "Gap is billed versus this unit’s own Expected, highest first. From drop size / unvisited / unbilled add to Gap (positive = hole; negative = billed more than Expected). Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first. Remarks are the last column.",
-            pack.cities,
-        ),
-        _html_section(
-            "2. Top 10 lagging distributors",
-            "Ranked by how serious the miss is versus own Expected given size, not the biggest books. AMS = 0 is hidden. Remainder line is everyone after the tenth.",
-            pack.city_distributors,
-        ),
-        _html_section(
-            "3. Top 50 shops of those distributors",
-            "Top 50 most serious doors under the distributors above. Remainder line is the tail of that hole.",
-            pack.city_distributor_shops,
-        ),
-        _html_section(
-            "4. Top 10 lagging distributors (all cities)",
-            "Same ten names as section 2 — national rank by miss versus own Expected.",
-            pack.lagging_distributors,
-        ),
-        _html_section(
-            "5. Top 10 lagging DSRs from those distributors",
-            "Salespeople whose shops sit under the top 10 distributors, then the ten most serious misses versus their own Expected. Ride-with this list.",
-            pack.lagging_dsrs,
-        ),
-        _html_section(
-            "6. Top 50 lagging shops",
-            pack.shop_note or "Top 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.",
-            pack.lagging_shops,
-        ),
-        ]
-    )
-    if detailed:
-        sections.extend(
-            [
-                _html_section(
-                    "City detail — every city",
-                    "Full city list with billed shops, strike %, coverage and drop-size split.",
-                    pack.cities,
-                ),
-                _html_section(
-                    "Distributor detail — every distributor with AMS > 0",
-                    "Not just lagging. Sorted highest gap first.",
-                    pack.all_distributors,
-                ),
-                _html_section(
-                    "DSR detail — every DSR with AMS > 0",
-                    "Not just lagging. Sorted highest gap first.",
-                    pack.all_dsrs,
-                ),
-                _html_section(
-                    "National detail — every DSR with AMS > 0",
-                    "Full salesperson list for the country.",
-                    pack.all_dsrs,
-                ),
-                _html_section(
-                    "National detail — every shop above 0.25 MT gap",
-                    "Every shop with gap greater than 0.25 MT. Shallower doors are one remainder line.",
-                    pack.all_shops,
-                ),
-            ]
-        )
+    for i, (_sheet, heading, note, df) in enumerate(iter_report_sheets(pack, detailed=detailed), start=1):
+        sections.append(_html_section(f"{i}. {heading}", note, df))
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/>

@@ -545,10 +545,10 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         "Excel is the working file (filters, one sheet per layer). "
         "PDF is the board pack — whole numbers, remarks as bullets in the last column. "
         "For a city / distributor / DSR pack, use **Report**. "
-        "National summary names the top 10 lagging distributors, the top 10 lagging DSRs "
-        "from those distributors, and the top 50 lagging shops — ranked by how serious the miss "
+        "National summary names one top 10 of lagging distributors, one top 10 of lagging DSRs, "
+        "and one top 50 of lagging shops — each ranked nationally by how serious the miss "
         "is versus that unit’s own Expected given its size, not the biggest Gap tons "
-        "(after the 0.25 MT shop floor). "
+        "(after the 0.25 MT shop floor), and not nested under the other list. "
         "Detailed pack = every city, every distributor and DSR with AMS > 0, and every shop with gap > 0.25 MT."
     )
 
@@ -617,35 +617,24 @@ def _page_strategy(data, _latest, period, mtd, ledger):
 
     st.markdown("##### 2. Top 10 lagging distributors")
     st.caption(
-        "Biggest Gap first, nationally. AMS = 0 is hidden. Remainder line is everyone after the tenth."
+        "One national list. Ranked by how serious the miss is versus own Expected given size, not the biggest Gap. AMS = 0 is hidden. Remainder line is everyone after the tenth."
     )
-    if pack.city_distributors.empty:
+    if pack.lagging_distributors.empty:
         st.info("No lagging distributor with a recent run-rate.")
     else:
-        _strategy_table(pack.city_distributors)
+        _strategy_table(pack.lagging_distributors)
 
-    st.markdown("##### 3. Those distributors — top 50 shops")
+    st.markdown("##### 3. Top 10 lagging DSRs")
     st.caption(
-        (pack.shop_note or "Top 50 most serious shops under those distributors.")
-        + " **Gap** is the volume you get back if the door billed its own Expected."
+        "One national list — not nested under the ten distributors. Ranked by miss versus own Expected given size. AMS = 0 is hidden. Remainder line is everyone after the tenth."
     )
-    if pack.city_distributor_shops.empty:
-        st.info("No material lagging shops under those distributors.")
+    if pack.lagging_dsrs.empty:
+        st.info("No lagging DSR with a recent run-rate.")
     else:
-        _strategy_table(pack.city_distributor_shops, height=360)
+        _strategy_table(pack.lagging_dsrs)
 
-    st.markdown("##### 4. Top 10 lagging distributors (all cities)")
-    st.caption(
-        "Same ten names as section 2 — national rank by how serious the miss is versus own Expected, including pockets inside cities that are on expected."
-    )
-    _strategy_table(pack.lagging_distributors)
-
-    st.markdown("##### 5. Top 10 lagging DSRs from those distributors")
-    st.caption("DSRs whose shops sit under the top 10 distributors, then the ten most serious misses versus their own Expected. Ride-with this list.")
-    _strategy_table(pack.lagging_dsrs)
-
-    st.markdown("##### 6. Top 50 lagging shops")
-    st.caption(pack.shop_note or "Top 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.")
+    st.markdown("##### 4. Top 50 lagging shops")
+    st.caption(pack.shop_note or "One national list of the 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.")
     _strategy_table(pack.lagging_shops, height=420)
 
     with st.expander("How to read the columns", expanded=False):

@@ -60,7 +60,7 @@ How the pack is built (use these definitions; do not redefine them in the prose)
 - From drop / unvisited / unbilled add to Gap. Positive = part of the hole. Negative = billed more than Expected.
 - Drop size (MT) = billed MT ÷ billed shops. Remarks compare drop size vs expected drop vs the national average. Expected drop = Expected volume ÷ Expected billed shops (same last-3 / last-6 run-rate as Expected sales; not paced; not this month’s shop count). It is not From drop size.
 - Visit % = visited ÷ universe (a billed shop counts as visited). Strike % = billed ÷ universe.
-- AMS = 0 distributors/DSRs are already hidden. The summary pack then names the top 10 lagging distributors, the top 10 lagging DSRs whose shops sit under those 10 distributors, and the top 50 lagging shops (after dropping Gap ≤ 0.25 MT). Those lists are ranked by how serious the miss is versus that unit's own Expected given its size, not the biggest Gap tons. The remainder line is the tail. Shop lists in the detailed pack still drop doors with Gap ≤ 0.25 MT.
+- AMS = 0 distributors/DSRs are already hidden. The summary pack then names one top 10 of lagging distributors, one top 10 of lagging DSRs, and one top 50 of lagging shops (after dropping Gap ≤ 0.25 MT). Those three lists are ranked nationally by how serious the miss is versus that unit's own Expected given its size, not the biggest Gap tons, and not nested under each other. The remainder line is the tail. Shop lists in the detailed pack still drop doors with Gap ≤ 0.25 MT.
 - Last-year = 0 can produce a huge YoY %. That is an artifact, not a win.
 
 Quality bar (pattern, not numbers to copy):
