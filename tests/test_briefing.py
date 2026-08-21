@@ -165,11 +165,15 @@ def test_excel_and_html_are_readable_packs():
     assert "04 All lagging distributors" in names
     assert "06 All lagging shops" in names
     cover = wb["00 Cover"]
-    assert "Glossary" in [c.value for row in cover.iter_rows(min_col=1, max_col=1, values_only=False) for c in row]
+    col_a = [c.value for row in cover.iter_rows(min_col=1, max_col=1, values_only=False) for c in row]
+    assert "Glossary" in col_a
+    assert "How the figures are calculated" in col_a
+    assert "Executive summary" in col_a
+    assert col_a.index("Glossary") < col_a.index("Executive summary")
     html = render_html(report)
-    assert "AMS last 3 months" in html or "Recoverable" in html
-    assert "Glossary" in html
-    assert "Fair share" in html or "From coverage" in html
+    assert html.find("Glossary") < html.find("1. The country — every city")
+    assert "How the figures are calculated" in html
+    assert "Executive summary" in html
     detailed = render_html(report, detailed=True)
     assert "Distributor detail" in detailed
     assert "National detail" in detailed

@@ -6,6 +6,7 @@ require re-uploading history.
 
 from __future__ import annotations
 
+import html
 import json
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import plotly.express as px
 import streamlit as st
 
 from sndintel.briefing import (
+    CALCULATION_NOTES,
     GLOSSARY,
     build_strategy_pack,
     excel_bytes,
@@ -73,6 +75,25 @@ def _last_shop() -> Path | None:
     return _last("shop")
 
 
+def _exec_row(data, period: str):
+    from sndintel.narrative import exec_row_from_frame
+
+    return exec_row_from_frame(data.get("exec_summary"), period)
+
+
+def _strategy_pack(data, period, ledger):
+    pack = build_strategy_pack(
+        data.get("units", pd.DataFrame()),
+        data.get("shop_month", pd.DataFrame()),
+        situation=data.get("situation", pd.DataFrame()),
+        ledger=ledger,
+        period=period,
+        visits=data.get("visits", pd.DataFrame()),
+        exec_summary=_exec_row(data, period),
+    )
+    return pack
+
+
 @st.cache_data(ttl=15)
 def load_all():
     ensure_dirs()
@@ -113,6 +134,10 @@ def load_all():
             data["visits"] = read_sql(conn, "SELECT * FROM shop_visits")
         except Exception:
             data["visits"] = pd.DataFrame()
+        try:
+            data["exec_summary"] = read_sql(conn, "SELECT * FROM exec_summary")
+        except Exception:
+            data["exec_summary"] = pd.DataFrame()
     return data
 
 
@@ -232,6 +257,90 @@ def _page_upload(empty: bool):
         "- First time: universe **and** sales. Optional legacy shop list fills **zone**.\n"
         "- Every later week: **sales + visit calls**. Closed months stay. Re-upload universe when shops/DSRs move."
     )
+
+    st.divider()
+    st.subheader("National executive summary")
+    st.caption(
+        "After each upload or rebuild, the national PDF opens with a glossary, then an AI summary of the current situation and key focus areas. "
+        "The model is given the same rounded country / city / distributor / DSR / shop figures as the pack. It cannot invent volumes. "
+        "City, distributor, and DSR reports skip the AI page. The key stays on this machine — it is not written into the warehouse or git."
+    )
+    from sndintel.narrative import (
+        DEFAULT_MODEL,
+        has_openai_key,
+        load_openai_settings,
+        refresh_exec_summary,
+        save_openai_settings,
+    )
+
+    settings = load_openai_settings()
+    models = ["gpt-4.1", "gpt-4o"]
+    stored_model = settings.get("model") or DEFAULT_MODEL
+    if stored_model not in models:
+        models = [stored_model, *models]
+    ckey, cmodel = st.columns([2, 1])
+    with ckey:
+        new_key = st.text_input(
+            "OpenAI API key",
+            type="password",
+            value="",
+            placeholder="Key saved — paste a new one to replace" if settings.get("has_stored_key") or has_openai_key() else "sk-…",
+            help="Stored under the SND Intelligence data directory (chmod 600). Environment OPENAI_API_KEY also works.",
+        )
+    with cmodel:
+        model_choice = st.selectbox("Model", models, index=models.index(stored_model) if stored_model in models else 0)
+    k1, k2 = st.columns(2)
+    with k1:
+        if st.button("Save API key"):
+            if new_key.strip():
+                save_openai_settings(api_key=new_key.strip(), model=model_choice)
+                st.success(f"Key saved. National summaries will use {model_choice} after the next score or generate.")
+            else:
+                save_openai_settings(model=model_choice)
+                if has_openai_key():
+                    st.success(f"Model set to {model_choice}. Existing key kept.")
+                else:
+                    st.warning("No key yet. Paste an OpenAI key, then save.")
+    with k2:
+        if st.button("Generate national summary now"):
+            units = None
+            try:
+                with connect() as conn:
+                    units = read_sql(conn, "SELECT * FROM unit_scorecards")
+                    shop_month = read_sql(conn, "SELECT * FROM shop_month")
+                    try:
+                        situation = read_sql(conn, "SELECT * FROM situation_brief")
+                    except Exception:
+                        situation = pd.DataFrame()
+                    try:
+                        visits = read_sql(conn, "SELECT * FROM shop_visits")
+                    except Exception:
+                        visits = pd.DataFrame()
+                    ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
+                    if units is None or units.empty:
+                        st.error("No scorecards yet. Upload files or rebuild first.")
+                    else:
+                        from sndintel.features import latest_period
+
+                        period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+                        pack = build_strategy_pack(
+                            units,
+                            shop_month,
+                            situation=situation,
+                            ledger=ledger,
+                            period=period,
+                            visits=visits,
+                        )
+                        with st.spinner("Writing the national executive summary from this period’s scorecards."):
+                            meta = refresh_exec_summary(conn, pack)
+                        st.cache_data.clear()
+                        if meta.get("ok"):
+                            st.success(f"National executive summary stored ({meta.get('model') or model_choice}).")
+                        else:
+                            st.warning(meta.get("error") or "Summary was not generated.")
+            except Exception as exc:  # noqa: BLE001
+                st.exception(exc)
+
     go = st.button("Score warehouse", type="primary", disabled=sales is None and empty)
     if not go:
         return
@@ -271,6 +380,10 @@ def _page_upload(empty: bool):
     )
     if result.get("open_mtd_period"):
         st.info(f"Open MTD: {result['open_mtd_period']}")
+    if result.get("exec_ok"):
+        st.success(f"National executive summary written ({result.get('exec_model') or 'OpenAI'}).")
+    elif result.get("exec_error"):
+        st.warning(f"Scorecards rebuilt; executive summary skipped. {result.get('exec_error')}")
     st.rerun()
 
 
@@ -293,6 +406,64 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         _rescore_button()
         return
 
+    pack = _strategy_pack(data, period, ledger)
+    if pack.exec_situation:
+        st.markdown(
+            '<div class="sit-card" style="background:#f8fafc;border-left:8px solid #0f172a">'
+            '<div class="sit-kicker">Executive summary · national</div>'
+            "<h3 style='margin:0 0 0.4rem 0;'>Summary of current situation</h3>"
+            + "".join(f'<p class="sit-body">{html.escape(p)}</p>' for p in pack.exec_situation)
+            + "<h3 style='margin:0.8rem 0 0.4rem 0;'>Key focus areas</h3>"
+            + "".join(
+                "<p class='sit-body'><b>"
+                + html.escape(item.get("title") or "")
+                + "</b> "
+                + html.escape(item.get("why") or "")
+                + ((" Do this week. " + html.escape(item.get("do") or "")) if item.get("do") else "")
+                + "</p>"
+                for item in pack.exec_focus
+            )
+            + (
+                f'<p class="sit-body" style="opacity:0.7">Model {html.escape(pack.exec_model)}. Figures match the tables below.</p>'
+                if pack.exec_model
+                else ""
+            )
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        national = units[units["grain"] == "national"]
+        nat = national.iloc[0] if not national.empty else None
+        sit_df = data.get("situation", pd.DataFrame())
+        sit = sit_df.iloc[0] if sit_df is not None and not sit_df.empty else None
+        headline = (sit["headline"] if sit is not None else None) or (
+            nat.get("do_this_week") if nat is not None else None
+        )
+        weather = sit["weather"] if sit is not None else ""
+        problem = sit["problem"] if sit is not None else ""
+        action = sit["action_summary"] if sit is not None else ""
+        weather_dir = "declining"
+        if nat is not None and float(nat.get("gap_mt") or 0) > 1:
+            weather_dir = "growing"
+        elif nat is not None and abs(float(nat.get("gap_mt") or 0)) <= 1:
+            weather_dir = "flat"
+        bar = {"declining": "#b91c1c", "growing": "#15803d", "flat": "#334155"}[weather_dir]
+        miss = html.escape(
+            pack.exec_error
+            or "Paste an OpenAI key on Upload files, then rebuild, to write the national executive summary."
+        )
+        st.markdown(
+            f'<div class="sit-card" style="background:#f8fafc;border-left:8px solid {bar}">'
+            f'<div class="sit-kicker">Situation</div>'
+            f'<p class="sit-headline">{html.escape(str(headline or "Scorecards ready"))}</p>'
+            f'<p class="sit-body">{html.escape(str(weather or ""))}</p>'
+            f'<p class="sit-body"><b>The problem.</b> {html.escape(str(problem or ""))}</p>'
+            f'<p class="sit-action">Do this week. {html.escape(str(action or ""))}</p>'
+            f'<p class="sit-body" style="opacity:0.75">{miss}</p>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
     cities = units[units["grain"] == "city"].copy()
     if "recoverable_mt" in cities.columns:
         rec = pd.to_numeric(cities["isolated_mt"], errors="coerce").fillna(0).clip(upper=0).abs()
@@ -302,40 +473,6 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         cities = cities.sort_values("isolated_mt")
     else:
         cities = cities.sort_values("gap_mt")
-    national = units[units["grain"] == "national"]
-    nat = national.iloc[0] if not national.empty else None
-    sit_df = data.get("situation", pd.DataFrame())
-    sit = sit_df.iloc[0] if sit_df is not None and not sit_df.empty else None
-
-    headline = (sit["headline"] if sit is not None else None) or (nat.get("do_this_week") if nat is not None else None)
-    weather = sit["weather"] if sit is not None else ""
-    problem = sit["problem"] if sit is not None else ""
-    action = sit["action_summary"] if sit is not None else ""
-    weather_dir = "declining"
-    if nat is not None and float(nat.get("gap_mt") or 0) > 1:
-        weather_dir = "growing"
-    elif nat is not None and abs(float(nat.get("gap_mt") or 0)) <= 1:
-        weather_dir = "flat"
-    bar = {"declining": "#b91c1c", "growing": "#15803d", "flat": "#334155"}[weather_dir]
-    st.markdown(
-        f'<div class="sit-card" style="background:#f8fafc;border-left:8px solid {bar}">'
-        f'<div class="sit-kicker">Situation</div>'
-        f'<p class="sit-headline">{headline or "Scorecards ready"}</p>'
-        f'<p class="sit-body">{weather}</p>'
-        f'<p class="sit-body"><b>The problem.</b> {problem}</p>'
-        f'<p class="sit-action">Do this week. {action}</p>'
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    pack = build_strategy_pack(
-        units,
-        data.get("shop_month", pd.DataFrame()),
-        situation=sit_df,
-        ledger=ledger,
-        period=period,
-        visits=data.get("visits", pd.DataFrame()),
-    )
     cdl, cdr = st.columns(2)
     with cdl:
         st.download_button(
@@ -475,6 +612,9 @@ def _page_strategy(data, _latest, period, mtd, ledger):
     with st.expander("How to read the columns", expanded=False):
         for term, meaning in GLOSSARY:
             st.markdown(f"**{term}.** {meaning}")
+        st.markdown("##### How the figures are calculated")
+        for term, meaning in CALCULATION_NOTES:
+            st.markdown(f"**{term}.** {meaning}")
 
     _rescore_button()
 
@@ -522,21 +662,15 @@ def _page_report(data, _latest, period, mtd, ledger):
     st.title("Report")
     st.caption(
         f"**{mtd['label'] or period}** · Pick a report, then a city / distributor / DSR if needed, then PDF or Excel. "
-        "National is the current briefing. Figures are whole numbers. Remarks are bullets in the last column."
+        "National PDF starts with the glossary, then the AI executive summary, then the tables. "
+        "Figures are whole numbers. Remarks are bullets in the last column."
     )
     units = data.get("units", pd.DataFrame())
     if units is None or units.empty:
         st.warning("No scorecards yet. Rebuild from the warehouse or upload files.")
         _rescore_button()
         return
-    pack = build_strategy_pack(
-        units,
-        data.get("shop_month", pd.DataFrame()),
-        situation=data.get("situation", pd.DataFrame()),
-        ledger=ledger,
-        period=period,
-        visits=data.get("visits", pd.DataFrame()),
-    )
+    pack = _strategy_pack(data, period, ledger)
     c1, c2, c3 = st.columns(3)
     with c1:
         report_type = st.selectbox("1. Report type", ["National", "City", "Distributor", "DSR"], key="report_type")
@@ -578,6 +712,35 @@ def _page_report(data, _latest, period, mtd, ledger):
 
     st.markdown(f"**{focused.headline or focused.scope_label or 'National briefing'}**")
     st.caption(focused.weather or "")
+    if kind == "national":
+        if focused.exec_situation:
+            st.markdown("##### Summary of current situation")
+            for para in focused.exec_situation:
+                st.write(para)
+            st.markdown("##### Key focus areas")
+            for item in focused.exec_focus:
+                st.markdown(f"**{item.get('title') or ''}.** {item.get('why') or ''}")
+                if item.get("do"):
+                    st.caption(f"Do this week. {item['do']}")
+            if focused.exec_model:
+                st.caption(f"Model {focused.exec_model}. Figures match the tables in the download.")
+        else:
+            st.info(
+                focused.exec_error
+                or "No national executive summary stored. Paste an OpenAI key on Upload files, then generate or rebuild."
+            )
+            if st.button("Generate national executive summary"):
+                from sndintel.narrative import refresh_exec_summary
+
+                with connect() as conn:
+                    with st.spinner("Writing the national executive summary from this period’s scorecards."):
+                        meta = refresh_exec_summary(conn, pack)
+                st.cache_data.clear()
+                if meta.get("ok"):
+                    st.success(f"Stored ({meta.get('model')}). Download again.")
+                    st.rerun()
+                else:
+                    st.warning(meta.get("error") or "Summary was not generated.")
     st.markdown(f"##### Preview — {preview_label}")
     _strategy_table(preview, height=280)
 
@@ -627,6 +790,10 @@ def _rescore_button():
             f"Rebuilt {result.get('n_cities', 0)} cities · {result.get('n_targets', 0)} named targets · "
             f"latest {result.get('latest_period')}"
         )
+        if result.get("exec_ok"):
+            st.success(f"National executive summary written ({result.get('exec_model') or 'OpenAI'}).")
+        elif result.get("exec_error"):
+            st.warning(f"Scorecards rebuilt; executive summary skipped. {result.get('exec_error')}")
         st.rerun()
 
 

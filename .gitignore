@@ -21,5 +21,7 @@ data/models/*
 !data/models/.gitkeep
 data/raw/
 .streamlit/secrets.toml
+**/openai.json
+data/secrets/
 dist/
 build/

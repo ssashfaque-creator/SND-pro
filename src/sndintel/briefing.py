@@ -7,6 +7,7 @@ in the glossary, not the headers. Excel is the working file. PDF is the board pa
 from __future__ import annotations
 
 import html
+import json
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -62,7 +63,84 @@ GLOSSARY = [
     ("Situation: Lagging", "Worse than the parent’s current book. A city can be down with the country and *not* lagging."),
     ("Situation: With the country", "Moved in line with the parent. Weather, not a local fire."),
     ("Situation: Ahead", "Better than the parent’s current book."),
+    ("Weather vs extra hole", "Gap versus Expected is national weather. Extra hole / country Recoverable is only the residual after that weather — the sum of lagging cities’ isolated MT."),
 ]
+
+CALCULATION_NOTES = [
+    (
+        "Expected this month",
+        "Mean of every same calendar month already in the warehouse (every August, not only last year) blended with destationalized recent trend × that month’s seasonal index. City indexes are shrunk toward the national index. If the month is still open, Expected is that full-month typical × the intra-month fraction (learned mid-month MTD cuts when they exist; otherwise elapsed calendar days).",
+    ),
+    (
+        "Fair share",
+        "This unit’s last-year volume × (parent billed now ÷ parent billed last year). Cities versus the country; distributors and DSRs versus their city. Country fair share equals Expected. Fair share is ‘moved with the parent’; Expected is ‘typical same calendar month’.",
+    ),
+    (
+        "Recoverable / extra hole",
+        "Isolated volume versus the parent after taking out the parent’s current book. Lagging means worse than the parent, not merely down versus last year. Country Recoverable is the absolute extra hole: the sum of lagging cities’ isolated MT. A city can be down with the country and not lagging.",
+    ),
+    (
+        "From drop / unvisited / unbilled",
+        "Shop-level identity: opportunity is AMS × pace (else last-year × pace). Unvisited = not called and not billed. Unbilled = called (or, with no visit file, simply not billed) and did not buy. Drop size = billed volume versus opportunity on billed doors. Those three are weights, then scaled so they add to Recoverable. Positive = part of the hole; negative = billed more than fair share.",
+    ),
+    (
+        "Drop size (MT) versus From drop size",
+        "Drop size is billed MT ÷ billed shops this period (two decimals). From drop size is that driver’s share of Recoverable, not the average drop.",
+    ),
+    (
+        "vs AMS",
+        "Billed minus (AMS of the last three closed months × fraction of the month elapsed). Negative = behind the recent run-rate.",
+    ),
+    (
+        "Visit % and Strike %",
+        "Visit % = visited ÷ universe. A billed shop counts as visited even if the visit file missed it. Strike % = billed ÷ universe. High visit and low strike means conversion (unbilled), not coverage (unvisited).",
+    ),
+    (
+        "Open MTD",
+        "Billed is month-to-date. Expected and AMS comparisons are paced. Last year is the full closed same month.",
+    ),
+    (
+        "Rounding and lists",
+        "MT, shop counts, and percents print as whole numbers. From-columns are adjusted so they still add to Recoverable after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. Shops with recoverable ≤ 0.25 MT are one remainder line.",
+    ),
+]
+
+
+def how_to_read_steps(pack: StrategyPack, detailed: bool = False) -> list[str]:
+    scope = (pack.scope or "national").lower()
+    if scope == "city":
+        return [
+            "City scorecard versus the country. Recoverable is the local hole after national weather.",
+            "Every distributor in this city with AMS greater than 0.",
+            "Every DSR in this city with AMS greater than 0.",
+            "Shops in this city with recoverable greater than 0.25 MT.",
+        ]
+    if scope == "distributor":
+        return [
+            "Distributor scorecard versus its city.",
+            "DSRs on this distributor’s doors.",
+            "Shops under this distributor with recoverable greater than 0.25 MT.",
+        ]
+    if scope == "dsr":
+        return [
+            "DSR scorecard versus its city.",
+            "Shops on this beat with recoverable greater than 0.25 MT.",
+        ]
+    if detailed:
+        return [
+            "City detail — every city, highest recoverable first.",
+            "Distributor detail — every distributor with AMS greater than 0.",
+            "DSR detail — every DSR with AMS greater than 0.",
+            "National shops — every door with recoverable greater than 0.25 MT.",
+        ]
+    return [
+        "Country by city — every city versus national weather. Highest recoverable first.",
+        "Lagging cities → distributors — first calls. AMS = 0 is hidden.",
+        "Those distributors → shops with recoverable greater than 0.25 MT.",
+        "Every lagging distributor (AMS > 0), including cities that are not national exceptions.",
+        "Every lagging DSR (AMS > 0).",
+        "Every shop with recoverable greater than 0.25 MT (shallower doors rolled into the last row).",
+    ]
 
 SHOP_RECOVERABLE_FLOOR = 0.25
 
@@ -194,6 +272,70 @@ class StrategyPack:
     all_shops: pd.DataFrame = field(default_factory=pd.DataFrame)
     scope: str = "national"
     scope_label: str = ""
+    exec_situation: list[str] = field(default_factory=list)
+    exec_focus: list[dict[str, str]] = field(default_factory=list)
+    exec_error: str = ""
+    exec_model: str = ""
+
+
+def is_national_pack(pack: StrategyPack) -> bool:
+    return (pack.scope or "national").strip().lower() in {"", "national", "country"}
+
+
+def apply_exec_summary(pack: StrategyPack, row: dict[str, Any] | None) -> StrategyPack:
+    """Attach a stored national executive summary onto the pack."""
+    from dataclasses import replace
+
+    if not row:
+        return pack
+    situation = _parse_exec_list(row.get("situation_json") or row.get("situation"))
+    focus = _parse_exec_focus(row.get("focus_json") or row.get("focus"))
+    return replace(
+        pack,
+        exec_situation=situation,
+        exec_focus=focus,
+        exec_error=str(row.get("error") or ""),
+        exec_model=str(row.get("model") or ""),
+    )
+
+
+def _parse_exec_list(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return [raw.strip()]
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+        if parsed:
+            return [str(parsed).strip()]
+    return []
+
+
+def _parse_exec_focus(raw: Any) -> list[dict[str, str]]:
+    items: list[Any]
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        items = parsed if isinstance(parsed, list) else []
+    else:
+        return []
+    out: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        why = str(item.get("why") or "").strip()
+        do = str(item.get("do") or item.get("action") or "").strip()
+        if title or why or do:
+            out.append({"title": title, "why": why, "do": do})
+    return out
 
 
 def build_strategy_pack(
@@ -204,6 +346,7 @@ def build_strategy_pack(
     national: dict[str, Any] | None = None,
     period: str | None = None,
     visits: pd.DataFrame | None = None,
+    exec_summary: dict[str, Any] | None = None,
 ) -> StrategyPack:
     empty = StrategyPack(period=period or "", label=period or "")
     if units is None or units.empty:
@@ -317,7 +460,7 @@ def build_strategy_pack(
         f"{float(lag_meta.get('hidden_mt') or 0):.0f} MT recoverable are one remainder line."
     )
 
-    return StrategyPack(
+    pack = StrategyPack(
         period=period,
         label=label,
         headline=sit.get("headline") or "",
@@ -340,6 +483,7 @@ def build_strategy_pack(
         scope="national",
         scope_label="Country",
     )
+    return apply_exec_summary(pack, exec_summary)
 
 
 def list_report_entities(pack: StrategyPack, report_type: str) -> list[str]:
@@ -403,6 +547,13 @@ def focus_pack(pack: StrategyPack, report_type: str, entity: str) -> StrategyPac
     kind = (report_type or "national").strip().lower()
     if kind in {"national", "country", ""}:
         return pack
+    pack = replace(
+        pack,
+        exec_situation=[],
+        exec_focus=[],
+        exec_error="",
+        exec_model="",
+    )
     city_key, name = _split_entity(entity)
     if kind == "city":
         city = name
@@ -811,8 +962,13 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
 
 def render_html(pack: StrategyPack, detailed: bool = False) -> str:
     k = pack.kpis
-    sections = [
-        _html_cover(pack, k, detailed=detailed),
+    sections = [_html_glossary()]
+    if is_national_pack(pack):
+        sections.append(_html_exec(pack))
+    else:
+        sections.append(_html_cover(pack, k, detailed=detailed))
+    sections.extend(
+        [
         _html_section(
             "1. The country — every city",
             "Recoverable is the local hole after national weather, highest first. From drop size / unvisited / unbilled add to Recoverable (positive = hole; negative = billed more than fair share). Strike % = billed ÷ universe. Visit % = visited ÷ universe. Country row is first. Remarks are the last column.",
@@ -843,7 +999,8 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
             pack.shop_note or "Shops with recoverable greater than 0.25 MT. Shallower doors are the remainder line.",
             pack.lagging_shops,
         ),
-    ]
+        ]
+    )
     if detailed:
         sections.extend(
             [
@@ -874,7 +1031,6 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
                 ),
             ]
         )
-    sections.append(_html_glossary())
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
@@ -1218,67 +1374,107 @@ def _sheet_cover(wb: Workbook, pack: StrategyPack, detailed: bool = False) -> Wo
     ws["A1"].font = Font(name="Calibri", size=14, bold=True, color=NAVY)
     ws["A2"] = f"{'Detailed pack' if detailed else 'Strategy pack'} · {pack.label}"
     ws["A2"].font = Font(name="Calibri", size=18, bold=True, color=NAVY)
-    ws["A3"] = pack.headline or "Scorecards ready"
-    ws["A3"].font = Font(name="Calibri", size=14, bold=True)
+    ws["A3"] = "Glossary first, then the national executive summary (national packs only), then the tables."
+    ws["A3"].font = Font(name="Calibri", size=10, italic=True, color=SLATE)
     ws.merge_cells("A3:H3")
-    ws["A5"] = pack.weather or ""
-    ws.merge_cells("A5:H6")
-    ws["A5"].alignment = Alignment(wrap_text=True, vertical="top")
-    ws["A7"] = "The problem"
-    ws["A7"].font = Font(bold=True, color=RED)
-    ws["A8"] = pack.problem or ""
-    ws.merge_cells("A8:H9")
-    ws["A8"].alignment = Alignment(wrap_text=True, vertical="top")
-    ws["A10"] = "Do this week"
-    ws["A10"].font = Font(bold=True, color=GREEN)
-    ws["A11"] = pack.action or ""
-    ws.merge_cells("A11:H12")
-    ws["A11"].alignment = Alignment(wrap_text=True, vertical="top")
 
-    ws["A14"] = "How to read this pack"
-    ws["A14"].font = Font(bold=True, size=12)
-    if detailed:
-        steps = [
-            "01 City detail — every city, highest recoverable first. From coverage / From drop size split the hole.",
-            "02 Distributor detail — every distributor with AMS greater than 0, not only lagging.",
-            "03 DSR detail — every DSR with AMS greater than 0, not only lagging.",
-            "04 National DSRs — same salesperson list for the whole country.",
-            "05 National shops — every door with recoverable greater than 0.25 MT.",
-        ]
-    else:
-        steps = [
-            "01 Country by city — every city versus national weather. Start here. Highest recoverable first.",
-            "02 Lagging cities-dists — only the cities that showed up as lagging, broken by distributor. First calls. AMS = 0 is hidden.",
-            "03 Those dists-shops — shops under those distributors with recoverable greater than 0.25 MT. Remainder line is the tail.",
-            "04 All lagging distributors — every distributor behind its own city (AMS > 0), including cities that are not national exceptions.",
-            "05 All lagging DSRs — every salesperson behind their city (AMS > 0).",
-            "06 All lagging shops — every door with recoverable greater than 0.25 MT. Shallower doors are one remainder line.",
-        ]
-    for i, line in enumerate(steps):
-        ws.cell(15 + i, 1, line)
-        ws.merge_cells(start_row=15 + i, start_column=1, end_row=15 + i, end_column=8)
-        ws.cell(15 + i, 1).alignment = Alignment(wrap_text=True)
+    row = 5
+    ws.cell(row, 1, "Glossary")
+    ws.cell(row, 1).font = Font(bold=True, size=12, color=NAVY)
+    row += 1
+    ws.cell(row, 1, "Term").font = Font(bold=True, color=WHITE)
+    ws.cell(row, 2, "Meaning").font = Font(bold=True, color=WHITE)
+    ws.cell(row, 1).fill = _fill(NAVY)
+    ws.cell(row, 2).fill = _fill(NAVY)
+    row += 1
+    for term, meaning in GLOSSARY:
+        ws.cell(row, 1, term).font = Font(bold=True)
+        ws.cell(row, 2, meaning)
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=8)
+        ws.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[row].height = 32
+        row += 1
 
-    ws["A22"] = "Glossary"
-    ws["A22"].font = Font(bold=True, size=12)
-    ws["A23"] = "Term"
-    ws["B23"] = "Meaning"
-    ws["A23"].font = Font(bold=True, color=WHITE)
-    ws["B23"].font = Font(bold=True, color=WHITE)
-    ws["A23"].fill = _fill(NAVY)
-    ws["B23"].fill = _fill(NAVY)
-    for i, (term, meaning) in enumerate(GLOSSARY, start=24):
-        ws.cell(i, 1, term).font = Font(bold=True)
-        ws.cell(i, 2, meaning)
-        ws.merge_cells(start_row=i, start_column=2, end_row=i, end_column=8)
-        ws.cell(i, 2).alignment = Alignment(wrap_text=True)
-        ws.row_dimensions[i].height = 28
+    row += 1
+    ws.cell(row, 1, "How the figures are calculated")
+    ws.cell(row, 1).font = Font(bold=True, size=12, color=NAVY)
+    row += 1
+    for term, meaning in CALCULATION_NOTES:
+        ws.cell(row, 1, term).font = Font(bold=True)
+        ws.cell(row, 2, meaning)
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=8)
+        ws.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[row].height = 48
+        row += 1
+
+    if is_national_pack(pack):
+        row += 1
+        ws.cell(row, 1, "Executive summary")
+        ws.cell(row, 1).font = Font(bold=True, size=12, color=NAVY)
+        row += 1
+        if pack.exec_model and pack.exec_situation:
+            ws.cell(
+                row,
+                1,
+                f"Written from this period’s scorecards ({pack.exec_model}). Figures match the tables.",
+            )
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+            ws.cell(row, 1).font = Font(italic=True, color=SLATE, size=10)
+            row += 1
+        if pack.exec_situation:
+            ws.cell(row, 1, "Summary of current situation")
+            ws.cell(row, 1).font = Font(bold=True, color=NAVY)
+            row += 1
+            for para in pack.exec_situation:
+                ws.cell(row, 1, para)
+                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+                ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.row_dimensions[row].height = 56
+                row += 1
+            ws.cell(row, 1, "Key focus areas")
+            ws.cell(row, 1).font = Font(bold=True, color=NAVY)
+            row += 1
+            for i, item in enumerate(pack.exec_focus, start=1):
+                title = item.get("title") or f"Focus {i}"
+                why = item.get("why") or ""
+                do = item.get("do") or ""
+                text = f"{i}. {title}"
+                if why:
+                    text += f" — {why}"
+                if do:
+                    text += f" Do this week: {do}"
+                ws.cell(row, 1, text)
+                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+                ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.row_dimensions[row].height = 48
+                row += 1
+        elif pack.exec_error:
+            ws.cell(row, 1, f"Executive summary not generated. {pack.exec_error}")
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+            ws.cell(row, 1).alignment = Alignment(wrap_text=True)
+            row += 1
+        else:
+            ws.cell(
+                row,
+                1,
+                "No national executive summary stored. Paste an OpenAI key on Upload files and rebuild scorecards.",
+            )
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+            row += 1
+
+    row += 1
+    ws.cell(row, 1, "How to read the tables")
+    ws.cell(row, 1).font = Font(bold=True, size=12, color=NAVY)
+    row += 1
+    for i, line in enumerate(how_to_read_steps(pack, detailed=detailed), start=1):
+        ws.cell(row, 1, f"{i:02d}. {line}")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.cell(row, 1).alignment = Alignment(wrap_text=True)
+        row += 1
+
     ws.column_dimensions["A"].width = 36
     for col in "BCDEFGH":
         ws.column_dimensions[col].width = 18
-    ws.row_dimensions[5].height = 48
-    ws.row_dimensions[8].height = 48
-    ws.row_dimensions[11].height = 48
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToPage = True
     ws.page_setup.fitToWidth = 1
@@ -1412,35 +1608,54 @@ def _row_situation(df: pd.DataFrame, idx: int) -> str:
 
 def _html_cover(pack: StrategyPack, k: dict[str, Any], detailed: bool = False) -> str:
     del k
-    if detailed:
-        steps = [
-            "City detail — every city, highest recoverable first.",
-            "Distributor detail — every distributor with AMS greater than 0.",
-            "DSR detail — every DSR with AMS greater than 0.",
-            "National DSRs — full salesperson list.",
-            "National shops — every door with recoverable greater than 0.25 MT.",
-        ]
-    else:
-        steps = [
-            "Country by city — every city versus national weather. Highest recoverable first.",
-            "Lagging cities → distributors — first calls. AMS = 0 is hidden.",
-            "Those distributors → shops with recoverable greater than 0.25 MT; remainder line is the tail.",
-            "Every lagging distributor (AMS > 0), including cities that are not national exceptions.",
-            "Every lagging DSR (AMS > 0).",
-            "Every shop with recoverable greater than 0.25 MT (shallower doors rolled into the last row).",
-        ]
-    ol = "".join(f"<li>{html.escape(s)}</li>" for s in steps)
+    ol = "".join(f"<li>{html.escape(s)}</li>" for s in how_to_read_steps(pack, detailed=detailed))
     return f"""<section class="cover">
-  <div class="kicker">SND Intelligence · {"detailed pack" if detailed else "strategy pack"}</div>
-  <h1>{html.escape(pack.label)}</h1>
+  <div class="kicker">SND Intelligence · {html.escape(pack.scope or "report")} pack</div>
+  <h1>{html.escape(pack.scope_label or pack.label)}</h1>
   <p class="headline">{html.escape(pack.headline or "Scorecards ready")}</p>
   <p class="lead">{html.escape(pack.weather or "")}</p>
-  <p class="lead"><b>The problem.</b> {html.escape(pack.problem or "")}</p>
-  <p class="lead"><b>Do this week.</b> {html.escape(pack.action or "")}</p>
   <p class="note">How to read this pack</p>
   <ol class="note">{ol}</ol>
 </section>
 """
+
+
+def _html_exec(pack: StrategyPack) -> str:
+    bits = [
+        '<section class="cover">',
+        '<div class="kicker">Executive summary · national</div>',
+        f"<h1>{html.escape(pack.label)}</h1>",
+        "<h2>Executive summary</h2>",
+    ]
+    if pack.exec_model and pack.exec_situation:
+        bits.append(
+            f'<p class="note">Written from this period’s scorecards ({html.escape(pack.exec_model)}). Figures match the tables.</p>'
+        )
+    if pack.exec_situation:
+        bits.append("<h2>Summary of current situation</h2>")
+        for para in pack.exec_situation:
+            bits.append(f'<p class="lead">{html.escape(para)}</p>')
+        bits.append("<h2>Key focus areas</h2>")
+        items = []
+        for i, item in enumerate(pack.exec_focus, start=1):
+            title = html.escape(item.get("title") or f"Focus {i}")
+            why = html.escape(item.get("why") or "")
+            do = html.escape(item.get("do") or "")
+            body = f"<b>{i}. {title}</b>"
+            if why:
+                body += f" — {why}"
+            if do:
+                body += f" <b>Do this week.</b> {do}"
+            items.append(f"<li>{body}</li>")
+        bits.append(f'<ol class="note">{"".join(items)}</ol>')
+    elif pack.exec_error:
+        bits.append(f'<p class="lead">Executive summary not generated. {html.escape(pack.exec_error)}</p>')
+    else:
+        bits.append(
+            '<p class="lead">No national executive summary stored. Paste an OpenAI key on Upload files and rebuild scorecards.</p>'
+        )
+    bits.append("</section>")
+    return "\n".join(bits)
 
 
 def _html_section(title: str, note: str, df: pd.DataFrame) -> str:
@@ -1456,9 +1671,15 @@ def _html_glossary() -> str:
     items = "".join(
         f"<dt>{html.escape(t)}</dt><dd>{html.escape(d)}</dd>" for t, d in GLOSSARY
     )
+    calc = "".join(
+        f"<dt>{html.escape(t)}</dt><dd>{html.escape(d)}</dd>" for t, d in CALCULATION_NOTES
+    )
     return f"""<section>
   <h2>Glossary</h2>
+  <p class="note">Read this first. Every later table uses these words. From drop / unvisited / unbilled add to Recoverable.</p>
   <dl class="glossary">{items}</dl>
+  <h2>How the figures are calculated</h2>
+  <dl class="glossary">{calc}</dl>
 </section>
 """
 

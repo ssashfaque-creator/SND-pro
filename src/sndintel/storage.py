@@ -325,6 +325,17 @@ CREATE TABLE IF NOT EXISTS situation_brief (
     metrics_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS exec_summary (
+    period TEXT PRIMARY KEY,
+    model TEXT,
+    situation_json TEXT,
+    focus_json TEXT,
+    brief_json TEXT,
+    raw_json TEXT,
+    error TEXT,
+    created_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS mtd_observations (
     period TEXT NOT NULL,
     as_of_day INTEGER NOT NULL,

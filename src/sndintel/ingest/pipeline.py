@@ -5,6 +5,7 @@ from __future__ import annotations
 from calendar import monthrange
 from pathlib import Path
 from typing import Optional
+import os
 
 import pandas as pd
 
@@ -323,6 +324,9 @@ def run_pipeline(
         "n_targets": int(len(pack.targets)) if pack is not None and pack.targets is not None else 0,
         "n_universe": int(universe_report.n_clean_rows) if universe_report else None,
         "n_visits": int(visit_report.n_clean_rows) if visit_report else None,
+        "exec_ok": bool(scored.get("exec_ok")),
+        "exec_error": scored.get("exec_error") or "",
+        "exec_model": scored.get("exec_model") or "",
         "data_dir": str(DATA_DIR),
     }
 
@@ -476,6 +480,8 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
     if not plays.empty:
         plays.to_sql("strategy_plays", conn, if_exists="append", index=False)
 
+    exec_meta = _write_national_exec(conn, shop_month, visits_df, ledger, pack.period)
+
     return {
         "latest_period": period,
         "n_sales_rows": int(len(facts_df)),
@@ -485,6 +491,9 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
         "n_plays": int(len(plays)) if plays is not None else 0,
         "n_cities": int(pack.national.get("n_cities") or 0) if pack.national else 0,
         "n_targets": int(len(pack.targets)) if pack.targets is not None else 0,
+        "exec_ok": bool(exec_meta.get("ok")),
+        "exec_error": exec_meta.get("error") or "",
+        "exec_model": exec_meta.get("model") or "",
         "_facts": facts_df,
         "_stores": stores_df,
         "_insights": insights,
@@ -492,6 +501,49 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
         "_plays": plays,
         "_pack": pack,
     }
+
+
+def _write_national_exec(conn, shop_month, visits_df, ledger, period) -> dict:
+    """Rebuild the national pack and ask the model for the executive summary.
+
+    Missing keys or API failures are stored as exec_error. Ingest still succeeds.
+    """
+    from sndintel.briefing import build_strategy_pack
+    from sndintel.narrative import refresh_exec_summary
+
+    if not period:
+        return {"ok": False, "error": "No period to summarise.", "skipped": True}
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        from sndintel.narrative import store_exec_summary
+
+        store_exec_summary(
+            conn,
+            period,
+            {
+                "ok": False,
+                "error": "OpenAI skipped under pytest",
+                "model": "",
+                "brief": {},
+                "situation": [],
+                "focus": [],
+                "raw": "",
+            },
+        )
+        return {"ok": False, "error": "OpenAI skipped under pytest", "skipped": True}
+    units = read_sql(conn, "SELECT * FROM unit_scorecards")
+    try:
+        situation = read_sql(conn, "SELECT * FROM situation_brief")
+    except Exception:
+        situation = pd.DataFrame()
+    report = build_strategy_pack(
+        units,
+        shop_month,
+        situation=situation,
+        ledger=ledger,
+        period=period,
+        visits=visits_df,
+    )
+    return refresh_exec_summary(conn, report)
 
 
 def rescore_warehouse(db_path: Optional[str | Path] = None) -> dict:
@@ -544,6 +596,9 @@ def rescore_warehouse(db_path: Optional[str | Path] = None) -> dict:
         "n_plays": scored["n_plays"],
         "n_cities": scored["n_cities"],
         "n_targets": int(len(pack.targets)) if pack.targets is not None else 0,
+        "exec_ok": bool(scored.get("exec_ok")),
+        "exec_error": scored.get("exec_error") or "",
+        "exec_model": scored.get("exec_model") or "",
         "data_dir": str(DATA_DIR),
     }
 

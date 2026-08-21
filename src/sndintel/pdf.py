@@ -27,7 +27,14 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from sndintel.briefing import GLOSSARY, StrategyPack, iter_report_sheets
+from sndintel.briefing import (
+    CALCULATION_NOTES,
+    GLOSSARY,
+    StrategyPack,
+    how_to_read_steps,
+    is_national_pack,
+    iter_report_sheets,
+)
 
 NAVY = colors.HexColor("#0F172A")
 SLATE = colors.HexColor("#475569")
@@ -99,7 +106,13 @@ def write_pdf(pack: StrategyPack, path: Path | str | BytesIO, detailed: bool = F
     )
     styles = _styles()
     story: list[Any] = []
-    story.extend(_cover_flowables(pack, styles, detailed=detailed))
+    story.extend(_glossary_flowables(pack, styles, detailed=detailed))
+    if is_national_pack(pack):
+        story.append(PageBreak())
+        story.extend(_exec_flowables(pack, styles))
+    else:
+        story.append(PageBreak())
+        story.extend(_cover_flowables(pack, styles, detailed=detailed))
     usable = pagesize[0] - doc.leftMargin - doc.rightMargin
     for _sheet, heading, note, df in iter_report_sheets(pack, detailed=detailed):
         story.append(PageBreak())
@@ -111,10 +124,6 @@ def write_pdf(pack: StrategyPack, path: Path | str | BytesIO, detailed: bool = F
         ]
         story.append(KeepTogether(block[:2]))
         story.extend(block[2:])
-    story.append(PageBreak())
-    story.append(Paragraph("Glossary", styles["h2"]))
-    for term, meaning in GLOSSARY:
-        story.append(Paragraph(f"<b>{xml_escape(term)}</b> — {xml_escape(meaning)}", styles["gloss"]))
     label = pack.label or ""
     scope = pack.scope_label or pack.scope or "national"
 
@@ -168,6 +177,16 @@ def _styles() -> dict[str, ParagraphStyle]:
             textColor=NAVY,
             spaceBefore=0,
             spaceAfter=4,
+        ),
+        "h3": ParagraphStyle(
+            "h3",
+            parent=base["Heading3"],
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            textColor=NAVY,
+            spaceBefore=8,
+            spaceAfter=4,
+            leading=14,
         ),
         "headline": ParagraphStyle(
             "headline",
@@ -244,55 +263,124 @@ def _styles() -> dict[str, ParagraphStyle]:
     }
 
 
-def _cover_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle], detailed: bool = False) -> list[Any]:
-    kicker = "DETAILED PACK" if detailed else "STRATEGY PACK"
-    if pack.scope and pack.scope != "national":
-        kicker = f"{pack.scope.upper()} PACK"
+def _glossary_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle], detailed: bool = False) -> list[Any]:
+    kicker = "NATIONAL PACK" if is_national_pack(pack) else f"{(pack.scope or 'report').upper()} PACK"
+    if detailed and is_national_pack(pack):
+        kicker = "DETAILED NATIONAL PACK"
     story: list[Any] = [
         Paragraph(kicker, styles["kicker"]),
         Paragraph(xml_escape(pack.label or "Scorecards"), styles["h1"]),
-        Paragraph(xml_escape(pack.headline or "Scorecards ready"), styles["headline"]),
-        Paragraph(xml_escape(pack.weather or ""), styles["body"]),
-        Paragraph(f"<b>The problem.</b> {xml_escape(pack.problem or '')}", styles["body"]),
-        Paragraph(f"<b>Do this week.</b> {xml_escape(pack.action or '')}", styles["body"]),
-        Spacer(1, 10),
-        Paragraph("How to read this pack", styles["headline"]),
+        Paragraph("Glossary", styles["h2"]),
+        Paragraph(
+            "Read this page first. Every later table uses these words. "
+            "Figures in MT are whole numbers; drop size is two decimals. "
+            "From drop / unvisited / unbilled add to Recoverable.",
+            styles["note"],
+        ),
+        Spacer(1, 4),
     ]
-    if pack.scope == "city":
-        steps = [
-            "City scorecard versus the country. Recoverable is the local hole after national weather.",
-            "Every distributor in this city with AMS greater than 0.",
-            "Every DSR in this city with AMS greater than 0.",
-            "Shops in this city with recoverable greater than 0.25 MT.",
-        ]
-    elif pack.scope == "distributor":
-        steps = [
-            "Distributor scorecard versus its city.",
-            "DSRs on this distributor’s doors.",
-            "Shops under this distributor with recoverable greater than 0.25 MT.",
-        ]
-    elif pack.scope == "dsr":
-        steps = [
-            "DSR scorecard versus its city.",
-            "Shops on this beat with recoverable greater than 0.25 MT.",
-        ]
-    elif detailed:
-        steps = [
-            "City detail — every city, highest recoverable first.",
-            "Distributor detail — every distributor with AMS greater than 0.",
-            "DSR detail — every DSR with AMS greater than 0.",
-            "National shops — every door with recoverable greater than 0.25 MT.",
-        ]
+    rows = [[Paragraph("Term", styles["th"]), Paragraph("Meaning", styles["th"])]]
+    for term, meaning in GLOSSARY:
+        rows.append(
+            [
+                Paragraph(xml_escape(term), styles["td"]),
+                Paragraph(xml_escape(meaning), styles["gloss"]),
+            ]
+        )
+    gloss = Table(rows, colWidths=[55 * mm, 212 * mm])
+    gloss.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+                ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
+                ("BACKGROUND", (0, 1), (-1, -1), WHITE),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("GRID", (0, 0), (-1, -1), 0.25, LINE),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, WASH]),
+            ]
+        )
+    )
+    story.append(gloss)
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("How the figures are calculated", styles["h2"]))
+    for term, meaning in CALCULATION_NOTES:
+        story.append(Paragraph(f"<b>{xml_escape(term)}.</b> {xml_escape(meaning)}", styles["body"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("How to read the tables that follow", styles["h2"]))
+    for i, step in enumerate(how_to_read_steps(pack, detailed=detailed), start=1):
+        story.append(Paragraph(f"<b>{i}.</b>  {xml_escape(step)}", styles["body"]))
+    return story
+
+
+def _exec_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    story: list[Any] = [
+        Paragraph("EXECUTIVE SUMMARY · NATIONAL", styles["kicker"]),
+        Paragraph(xml_escape(pack.label or "Scorecards"), styles["h1"]),
+        Paragraph("Executive summary", styles["h2"]),
+    ]
+    if pack.exec_model and pack.exec_situation:
+        story.append(
+            Paragraph(
+                f"Written from this period’s scorecards ({xml_escape(pack.exec_model)}). "
+                "Every figure matches the tables that follow. Nothing here is estimated by the model.",
+                styles["note"],
+            )
+        )
+    if pack.exec_situation:
+        story.append(Paragraph("Summary of current situation", styles["h3"]))
+        for para in pack.exec_situation:
+            story.append(Paragraph(xml_escape(para), styles["body"]))
+        if pack.exec_focus:
+            story.append(Paragraph("Key focus areas", styles["h3"]))
+            for i, item in enumerate(pack.exec_focus, start=1):
+                title = xml_escape(item.get("title") or f"Focus {i}")
+                why = xml_escape(item.get("why") or "")
+                do = xml_escape(item.get("do") or "")
+                bits = [f"<b>{i}. {title}</b>"]
+                if why:
+                    bits.append(why)
+                if do:
+                    bits.append(f"<b>Do this week.</b> {do}")
+                story.append(Paragraph("<br/>".join(bits), styles["body"]))
+                story.append(Spacer(1, 4))
+        return story
+    if pack.exec_error:
+        story.append(
+            Paragraph(
+                "The national executive summary was not generated. "
+                f"{xml_escape(pack.exec_error)} "
+                "Paste an OpenAI key on Upload files and rebuild scorecards (or use Generate on that page).",
+                styles["body"],
+            )
+        )
     else:
-        steps = [
-            "Country by city — every city versus national weather. Highest recoverable first.",
-            "Lagging cities → distributors — first calls. AMS = 0 is hidden.",
-            "Those distributors → shops with recoverable greater than 0.25 MT.",
-            "Every lagging distributor (AMS > 0), including cities that are not national exceptions.",
-            "Every lagging DSR (AMS > 0).",
-            "Every shop with recoverable greater than 0.25 MT (shallower doors rolled into the last row).",
-        ]
-    for i, step in enumerate(steps, start=1):
+        story.append(
+            Paragraph(
+                "No national executive summary is stored for this period. "
+                "Paste an OpenAI API key on Upload files, then upload data or rebuild scorecards. "
+                "The model is given the same rounded country, city, distributor, DSR, and shop figures as this pack.",
+                styles["body"],
+            )
+        )
+    return story
+
+
+def _cover_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle], detailed: bool = False) -> list[Any]:
+    kicker = f"{(pack.scope or 'report').upper()} PACK"
+    story: list[Any] = [
+        Paragraph(kicker, styles["kicker"]),
+        Paragraph(xml_escape(pack.scope_label or pack.label or "Scorecards"), styles["h1"]),
+        Paragraph(xml_escape(pack.headline or "Scorecards ready"), styles["headline"]),
+    ]
+    if pack.weather:
+        story.append(Paragraph(xml_escape(pack.weather), styles["body"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("How to read this pack", styles["headline"]))
+    for i, step in enumerate(how_to_read_steps(pack, detailed=detailed), start=1):
         story.append(Paragraph(f"<b>{i}.</b>  {xml_escape(step)}", styles["body"]))
     return story
 

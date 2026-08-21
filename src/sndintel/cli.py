@@ -218,6 +218,10 @@ def serve_api(port: int = 8080):
 def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
     """Write the strategy pack: Excel working file plus a real PDF board pack."""
     init_db()
+    from sndintel.briefing import build_strategy_pack, write_excel, write_excel_detailed, write_pdf
+    from sndintel.features import latest_period
+    from sndintel.narrative import load_exec_summary_row
+
     with connect() as conn:
         units = read_sql(conn, "SELECT * FROM unit_scorecards")
         shop_month = read_sql(conn, "SELECT * FROM shop_month")
@@ -230,11 +234,11 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
             visits = read_sql(conn, "SELECT * FROM shop_visits")
         except Exception:
             visits = pd.DataFrame()
-    from sndintel.briefing import build_strategy_pack, write_excel, write_excel_detailed, write_pdf
-    from sndintel.features import latest_period
-
-    period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
-    pack = build_strategy_pack(units, shop_month, situation=situation, ledger=ledger, period=period, visits=visits)
+        period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+        exec_row = load_exec_summary_row(conn, period)
+    pack = build_strategy_pack(
+        units, shop_month, situation=situation, ledger=ledger, period=period, visits=visits, exec_summary=exec_row
+    )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_excel(pack, path)
