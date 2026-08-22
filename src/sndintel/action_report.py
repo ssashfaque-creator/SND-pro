@@ -17,35 +17,31 @@ from sndintel.briefing import NAVY, SLATE, _excel_value, _sheet_table
 GLOSSARY = [
     (
         "Expected this month",
-        "Same recipe as the scorecard: last three closed calendar months blended with the last-six-month median. Daily history does not change Expected.",
+        "Same recipe as the scorecard: last three closed calendar months blended with the last-six-month median. Day-of-month seasonality is not used.",
     ),
     (
-        "Should have by today",
-        "Expected × this door’s delivery curve through today. The curve is learned from billed days in earlier months, shrunk shop → DSR → city → country so a thin history does not invent a shape.",
+        "Usual cycle / typical drop",
+        "Median days between billed days and median billed-day tonnes, shrunk shop → DSR → city so a thin history borrows the beat. Store Y that bills every 15 days is due when it has been ~15 days with no bill.",
     ),
     (
-        "Behind pace",
-        "max(0, should-have − billed). A back-loaded shop can be quiet at mid-month and still be on pace. A front-loaded shop that is quiet is late.",
+        "Cover left",
+        "Last drop ÷ daily run-rate, minus days since that bill. If last month was ≥1.6× AMS (two months of stock), leftover cover uses last-month volume instead — that door is less likely to buy now.",
     ),
     (
         "Still to Expected",
-        "max(0, Expected − billed). What the door still owes the month, regardless of shape.",
+        "max(0, Expected − billed). What the door still owes the month.",
     ),
     (
-        "This week",
-        "Behind-pace catch-up plus the slice of remaining volume the curve says should arrive in the next 7 days (or the rest of the month if fewer days remain).",
+        "Ask this week",
+        "Typical drop for Due / Due · visited / Lapsing. Remaining-to-Expected for Another visit. Zero on Hold.",
     ),
     (
-        "Typical drop / usual bill day",
-        "Median billed-day volume and median day-of-month, shrunk toward the DSR. Use the drop as the order to close; use the day so you do not write off a late buyer on the 12th.",
-    ),
-    (
-        "Call / Convert / Lift drop / Hold",
-        "Call = unvisited and behind. Convert = visited, not billed. Lift drop = billed but behind its own curve. Hold = on its own curve — leave the beat alone.",
+        "Due / Due · visited / Another visit / Lapsing / Hold",
+        "Due = cycle has elapsed, cover is gone, nobody visited. Due · visited = same, but the beat already called and still no bill. Another visit = billed this month but too little, and the cycle says they should have bought again. Lapsing = two cycles quiet, or declining last-3 vs prior-3 and unbilled this cycle. Hold = leftover cover — do not pull the beat.",
     ),
     (
         "Backtest",
-        "On each of the last closed months, cut the file at day 15 and rank shops. Precision@50 is how many of the top 50 actually finished ≥ 0.25 MT below Expected. Curve should beat a flat calendar pace. Back-loaded left alone = shops calendar would chase that the curve held; finished OK means they hit Expected.",
+        "At day 15 of each closed month, mark shops whose cycle has elapsed and who no longer have cover. Precision is the share that billed in the next 14 days versus picking that many shops at random. Loaded hold = last month ≥1.6× AMS; quiet means they stayed below 0.25 MT for the rest of the month.",
     ),
 ]
 
@@ -55,18 +51,19 @@ def how_to_read(pack: ActionPack, detailed: bool = False) -> list[str]:
     if detailed:
         return [
             f"{day}. Full lists — every AMS > 0 distributor, DSR, and shop the engine scored.",
-            "Distributors ranked by this-week tonnes (not Gap tons).",
+            "Distributors ranked by this-week ask tonnes (not Gap tons).",
             "DSRs ranked the same way.",
-            "Every shop with an action, instruction included.",
+            "Every shop with an action. Do this names the door and why it is due, light, lapsing, or hold.",
         ]
     return [
-        f"{day}. Country: billed vs should-have vs still-to-Expected vs this week.",
-        "One distributor push list — who to lean on, how many doors, how many tonnes.",
+        f"{day}. Country: billed vs Expected vs still-to-Expected vs this week's ask.",
+        "One distributor push list — how many doors are due, need another visit, or are lapsing.",
         "One DSR push list — ride-with names, not nested under the distributors.",
-        "Call these shops — unvisited doors with an exact this-week tonnes ask.",
-        "Convert — already visited, still unbilled.",
-        "Lift drop — billed but behind their own curve.",
-        "Backtest — whether the curve beat calendar pace on closed months.",
+        "Due — cycle elapsed, no leftover cover, not visited this month.",
+        "Due · visited — same clock, already called, still no bill.",
+        "Another visit — bought too little this month and the cycle says they should have bought again.",
+        "Lapsing — long gap or declining volume. Unvisited overdue doors rank first.",
+        "Backtest — whether 'due' shops actually billed in the next 14 days on closed months.",
     ]
 
 
@@ -76,13 +73,13 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
             (
                 "01 Country",
                 "Country this week",
-                pack.headline or "Billed versus the door-level delivery curve, rolled to the country.",
+                pack.headline or "Who is due, light, or lapsing, rolled to the country.",
                 pack.country,
             ),
             (
                 "02 Distributors",
                 "Every distributor to push",
-                "AMS = 0 is hidden. Ranked by this-week tonnes.",
+                "AMS = 0 is hidden. Ranked by this-week ask tonnes.",
                 pack.all_distributors,
             ),
             (
@@ -94,12 +91,12 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
             (
                 "04 Shops",
                 "Every scored shop",
-                "Call / convert / lift / hold. Do this is the instruction.",
+                "Due / Due · visited / Another visit / Lapsing / Hold. Do this is the instruction.",
                 pack.all_shops,
             ),
             (
                 "05 Backtest",
-                "Did the curve beat calendar pace?",
+                "Did due shops bill in the next 14 days?",
                 "Walk-forward cut at day 15 of closed months.",
                 pack.backtest,
             ),
@@ -108,13 +105,13 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
         (
             "01 Country",
             "Country this week",
-            pack.headline or "Billed versus the door-level delivery curve, rolled to the country.",
+            pack.headline or "Who is due, light, or lapsing, rolled to the country.",
             pack.country,
         ),
         (
             "02 Distributors",
             "Push these distributors",
-            "One list. Ranked by this-week tonnes. Instruction names how many doors to call, convert, and lift.",
+            "One list. Ranked by this-week ask. Instruction names how many doors are due, need another visit, or are lapsing.",
             pack.distributors,
         ),
         (
@@ -124,26 +121,32 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
             pack.dsrs,
         ),
         (
-            "04 Call",
-            "Call these shops this week",
-            "Unvisited doors behind their own curve. This week is the tonnes ask. Typical drop is the order size.",
+            "04 Due",
+            "Due and unvisited",
+            "Usual cycle has elapsed, leftover cover is gone, nobody visited this month. Ask is the typical drop.",
             pack.calls,
         ),
         (
-            "05 Convert",
-            "Visited · not billed",
-            "Already on the beat. Close the order.",
+            "05 Due visited",
+            "Due · already visited",
+            "Cycle says they should have billed. The beat already called. Close the order.",
             pack.converts,
         ),
         (
-            "06 Lift drop",
-            "Billed but behind their own curve",
-            "They bought. The drop is light versus the shape they usually deliver by today.",
+            "06 Another visit",
+            "Bought too little this month",
+            "Billed once (or a stub) and still short of Expected. Cycle says they should have bought again.",
             pack.lifts,
         ),
         (
-            "07 Backtest",
-            "Did the curve beat calendar pace?",
+            "07 Lapsing",
+            "Quiet too long or declining",
+            "Two cycles with no bill, or last-three months down ≥25% versus the three before and unbilled this cycle.",
+            pack.lapses,
+        ),
+        (
+            "08 Backtest",
+            "Did due shops bill in the next 14 days?",
             "If daily history is thin this sheet stays empty. Rebuild after Outlet Date Wise is in the warehouse.",
             pack.backtest,
         ),
@@ -161,9 +164,9 @@ def write_excel(pack: ActionPack, path: Path | str | BytesIO, detailed: bool = F
     _cover(wb, pack, detailed=detailed)
     for sheet, heading, note, df in iter_action_sheets(pack, detailed=detailed):
         kwargs: dict[str, Any] = {}
-        if sheet.startswith("02") and df is not None and not df.empty and "This week (MT)" in df.columns:
+        if sheet.startswith("02") and df is not None and not df.empty and "Ask this week (MT)" in df.columns:
             cat = "Distributor" if "Distributor" in df.columns else "DSR"
-            kwargs = dict(bar_col="This week (MT)", cat_col=cat)
+            kwargs = dict(bar_col="Ask this week (MT)", cat_col=cat)
         _sheet_table(wb, sheet, heading, note, df, **kwargs)
     if path is not None:
         wb.save(path)
@@ -241,7 +244,7 @@ def _cover(wb: Workbook, pack: ActionPack, detailed: bool = False) -> Worksheet:
     ws["A1"].font = Font(name="Calibri", size=14, bold=True, color=NAVY)
     ws["A2"] = f"{'Detailed action pack' if detailed else 'This week'} · {pack.label}"
     ws["A2"].font = Font(name="Calibri", size=18, bold=True, color=NAVY)
-    ws["A3"] = pack.headline or "Call list from the shop-day delivery curve."
+    ws["A3"] = pack.headline or "Call list from each door’s purchase cycle and leftover cover."
     ws["A3"].font = Font(name="Calibri", size=11, italic=True, color=SLATE)
     ws.merge_cells("A3:H3")
     row = 5

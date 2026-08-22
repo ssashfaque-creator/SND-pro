@@ -276,7 +276,7 @@ def check_sales(
 
 @app.command()
 def actions(limit: int = typer.Option(15, help="How many call-list shops to print")):
-    """Print this week's call / convert / lift lists from the warehouse."""
+    """Print this week's due / another-visit / lapsing lists from the warehouse."""
     init_db()
     from sndintel.action import build_action_pack, load_action_pack
     from sndintel.features import latest_period
@@ -307,24 +307,38 @@ def actions(limit: int = typer.Option(15, help="How many call-list shops to prin
     if pack.dsrs is not None and not pack.dsrs.empty:
         table = Table(title="DSRs to push")
         table.add_column("DSR")
-        table.add_column("This week", justify="right")
+        table.add_column("Ask this week", justify="right")
         table.add_column("Do this")
         for _, row in pack.dsrs.head(8).iterrows():
-            table.add_row(str(row.get("DSR") or ""), str(row.get("This week (MT)") or ""), str(row.get("Do this") or "")[:80])
+            table.add_row(str(row.get("DSR") or ""), str(row.get("Ask this week (MT)") or ""), str(row.get("Do this") or "")[:80])
         console.print(table)
     if pack.calls is not None and not pack.calls.empty:
-        table = Table(title="Call these shops")
+        table = Table(title="Due and unvisited")
         table.add_column("Shop")
         table.add_column("DSR")
-        table.add_column("This week", justify="right")
+        table.add_column("Ask", justify="right")
         table.add_column("Do this")
         for _, row in pack.calls.head(limit).iterrows():
             table.add_row(
                 str(row.get("Shop") or ""),
                 str(row.get("DSR") or ""),
-                str(row.get("This week (MT)") or ""),
+                str(row.get("Ask (MT)") or ""),
                 str(row.get("Do this") or "")[:90],
             )
+        console.print(table)
+    if pack.lifts is not None and not pack.lifts.empty:
+        table = Table(title="Another visit")
+        table.add_column("Shop")
+        table.add_column("Ask", justify="right")
+        for _, row in pack.lifts.head(min(limit, 8)).iterrows():
+            table.add_row(str(row.get("Shop") or ""), str(row.get("Ask (MT)") or ""))
+        console.print(table)
+    if pack.lapses is not None and not pack.lapses.empty:
+        table = Table(title="Lapsing")
+        table.add_column("Shop")
+        table.add_column("Ask", justify="right")
+        for _, row in pack.lapses.head(min(limit, 8)).iterrows():
+            table.add_row(str(row.get("Shop") or ""), str(row.get("Ask (MT)") or ""))
         console.print(table)
 
 

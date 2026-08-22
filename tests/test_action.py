@@ -1,6 +1,7 @@
-"""This-week action engine: delivery curve, call lists, backtest."""
+"""This-week action engine: purchase cycle, leftover cover, due / another visit / lapsing."""
 
 from calendar import monthrange
+from datetime import date, timedelta
 from io import BytesIO
 
 import pandas as pd
@@ -8,10 +9,12 @@ from openpyxl import load_workbook
 
 from sndintel.action import (
     ACTION_CALL,
+    ACTION_CONVERT,
     ACTION_HOLD,
+    ACTION_LIFT,
+    ACTION_RECOVER,
     SHOP_FLOOR_MT,
     build_action_pack,
-    fit_delivery_curves,
 )
 from sndintel.action_report import excel_bytes, iter_action_sheets
 from sndintel.io_utils import period_key, shift_period
@@ -26,145 +29,206 @@ def _period_range(end: str, n: int) -> list[str]:
     return list(reversed(out))
 
 
-def _daily_rows(store_id, name, city, dist, dsr, periods, pattern, current_as_of=None, current_frac=None):
-    """pattern: 'front' bills 80% by day 10; 'back' bills 80% after day 20."""
+def _cycle_dates(last: date, every: int, n: int) -> list[date]:
+    out = []
+    cur = last
+    for _ in range(n):
+        out.append(cur)
+        cur = cur - timedelta(days=every)
+    return list(reversed(out))
+
+
+def _bill(store_id, name, city, dist, dsr, day: date, vol: float) -> dict:
+    return {
+        "store_id": store_id,
+        "store_name": name,
+        "city": city,
+        "distributor": dist,
+        "dsr_name": dsr,
+        "section": city,
+        "sale_date": day.isoformat(),
+        "year": day.year,
+        "month": day.month,
+        "day": day.day,
+        "period": f"{day.year:04d}-{day.month:02d}",
+        "volume_mt": vol,
+    }
+
+
+def _months_from_days(day_rows: list[dict]) -> list[dict]:
+    frame = pd.DataFrame(day_rows)
     rows = []
-    month_rows = []
-    for period in periods:
-        year, month = int(period[:4]), int(period[5:7])
-        days = monthrange(year, month)[1]
-        last = days
-        if current_as_of and period == periods[-1]:
-            last = current_as_of
-        total = 2.0
-        if current_frac is not None and period == periods[-1]:
-            billed = total * current_frac
-        else:
-            billed = total
-        if pattern == "front":
-            day_a, day_b = 4, 9
-            split = (0.8, 0.2) if last >= 9 else (1.0, 0.0)
-        else:
-            day_a, day_b = 22, 27
-            if last < 20:
-                day_a, day_b = 8, 14
-                split = (0.5, 0.5)
-            else:
-                split = (0.2, 0.8)
-        if current_frac is not None and period == periods[-1] and last < 20 and pattern == "back":
-            day_a, day_b = 8, 14
-            split = (0.5, 0.5)
-        vols = [billed * split[0], billed * split[1]]
-        for day, vol in ((day_a, vols[0]), (day_b, vols[1])):
-            if day > last:
-                continue
-            rows.append(
-                {
-                    "store_id": store_id,
-                    "store_name": name,
-                    "city": city,
-                    "distributor": dist,
-                    "dsr_name": dsr,
-                    "section": city,
-                    "sale_date": f"{year:04d}-{month:02d}-{day:02d}",
-                    "year": year,
-                    "month": month,
-                    "day": day,
-                    "period": period,
-                    "volume_mt": vol,
-                }
-            )
-        month_rows.append(
+    for (sid, period), g in frame.groupby(["store_id", "period"], sort=False):
+        first = g.iloc[0]
+        rows.append(
             {
-                "store_id": store_id,
-                "store_name": name,
-                "city": city,
-                "distributor": dist,
-                "dsr_name": dsr,
-                "section": city,
+                "store_id": sid,
+                "store_name": first["store_name"],
+                "city": first["city"],
+                "distributor": first["distributor"],
+                "dsr_name": first["dsr_name"],
+                "section": first["section"],
                 "period": period,
-                "year": year,
-                "month": month,
-                "volume_mt": billed if period != periods[-1] or current_frac is None else billed,
+                "year": int(first["year"]),
+                "month": int(first["month"]),
+                "volume_mt": float(g["volume_mt"].sum()),
                 "sku_count": 1,
                 "billed": 1,
                 "zone": None,
             }
         )
-    return rows, month_rows
+    return rows
 
 
-def _panel(as_of=15, front_frac=0.20, back_frac=0.20):
-    periods = _period_range("2026-08", 18)
-    hist = periods[:-1]
-    stores = pd.DataFrame(
+def _ledger(periods: list[str], as_of: int) -> pd.DataFrame:
+    return pd.DataFrame(
         [
-            {"store_id": "FRONT1", "store_name": "Front Mart", "city": "Karachi", "distributor": "Eva Foods", "dsr_name": "Amir", "section": "Clifton", "in_universe": 1},
-            {"store_id": "BACK1", "store_name": "Back Mart", "city": "Karachi", "distributor": "Eva Foods", "dsr_name": "Amir", "section": "Clifton", "in_universe": 1},
-            {"store_id": "MISS1", "store_name": "Miss Mart", "city": "Karachi", "distributor": "Eva Foods", "dsr_name": "Amir", "section": "Clifton", "in_universe": 1},
-            {"store_id": "GHOST", "store_name": "Ghost", "city": "Lahore", "distributor": "Ghost Dist", "dsr_name": "Ghost DSR", "section": "X", "in_universe": 1},
-        ]
-    )
-    day_rows, month_rows = [], []
-    a, b = _daily_rows("FRONT1", "Front Mart", "Karachi", "Eva Foods", "Amir", hist + ["2026-08"], "front", as_of, front_frac)
-    c, d = _daily_rows("BACK1", "Back Mart", "Karachi", "Eva Foods", "Amir", hist + ["2026-08"], "back", as_of, back_frac)
-    e, f = _daily_rows("MISS1", "Miss Mart", "Karachi", "Eva Foods", "Amir", hist + ["2026-08"], "front", as_of, 0.0)
-    day_rows.extend(a + c + e)
-    month_rows.extend(b + d + f)
-    shop_day = pd.DataFrame(day_rows)
-    shop_month = pd.DataFrame(month_rows)
-    ledger = pd.DataFrame(
-        [
-            {"period": p, "status": "closed" if p != "2026-08" else "mtd_open", "as_of_day": 31 if p != "2026-08" else as_of, "days_in_month": monthrange(int(p[:4]), int(p[5:7]))[1]}
+            {
+                "period": p,
+                "status": "closed" if p != periods[-1] else "mtd_open",
+                "as_of_day": monthrange(int(p[:4]), int(p[5:7]))[1] if p != periods[-1] else as_of,
+                "days_in_month": monthrange(int(p[:4]), int(p[5:7]))[1],
+            }
             for p in periods
         ]
     )
-    return shop_month, stores, shop_day, ledger
 
 
-def test_front_loaded_shop_is_called_back_loaded_is_held():
-    """Same MTD share: the early buyer is late; the late buyer is on its own curve."""
-    shop_month, stores, shop_day, ledger = _panel(as_of=15, front_frac=0.20, back_frac=0.20)
-    pack = build_action_pack(shop_month, stores, shop_day, ledger=ledger, period="2026-08")
+def _attrs(sid, name):
+    return {
+        "store_id": sid,
+        "store_name": name,
+        "city": "Karachi",
+        "distributor": "Eva Foods",
+        "dsr_name": "Amir",
+        "section": "Clifton",
+        "in_universe": 1,
+    }
+
+
+def _panel(as_of: int = 22):
+    """Six doors with distinct buying patterns. Score date is 22 Aug 2026."""
+    periods = _period_range("2026-08", 20)
+    city, dist, dsr = "Karachi", "Eva Foods", "Amir"
+    day_rows: list[dict] = []
+
+    for d in _cycle_dates(date(2026, 7, 28), 15, 20):
+        day_rows.append(_bill("DUE1", "Due Mart", city, dist, dsr, d, 1.0))
+    for d in _cycle_dates(date(2026, 7, 28), 15, 20):
+        day_rows.append(_bill("VIS1", "Visited Mart", city, dist, dsr, d, 1.0))
+    for d in _cycle_dates(date(2026, 8, 6), 15, 20):
+        vol = 0.25 if (d.year, d.month) == (2026, 8) else 1.0
+        day_rows.append(_bill("LITE1", "Lite Mart", city, dist, dsr, d, vol))
+    for d in _cycle_dates(date(2026, 6, 20), 15, 16):
+        day_rows.append(_bill("LAPSE1", "Lapse Mart", city, dist, dsr, d, 1.0))
+    for d, vol in (
+        (date(2026, 2, 15), 2.0),
+        (date(2026, 3, 15), 2.0),
+        (date(2026, 4, 15), 2.0),
+        (date(2026, 5, 15), 1.0),
+        (date(2026, 6, 15), 1.0),
+        (date(2026, 7, 15), 1.0),
+    ):
+        day_rows.append(_bill("DOWN1", "Down Mart", city, dist, dsr, d, vol))
+    for d, vol in (
+        (date(2026, 2, 20), 2.0),
+        (date(2026, 3, 20), 2.0),
+        (date(2026, 4, 20), 2.0),
+        (date(2026, 5, 20), 1.0),
+        (date(2026, 6, 20), 1.0),
+        (date(2026, 7, 5), 2.0),
+        (date(2026, 7, 20), 2.0),
+    ):
+        day_rows.append(_bill("HOLD1", "Hold Mart", city, dist, dsr, d, vol))
+
+    month_rows = _months_from_days(day_rows)
+    month_rows.append(
+        {
+            "store_id": "GHOST",
+            "store_name": "Ghost",
+            "city": "Lahore",
+            "distributor": "Ghost Dist",
+            "dsr_name": "Ghost DSR",
+            "section": "X",
+            "period": "2024-12",
+            "year": 2024,
+            "month": 12,
+            "volume_mt": 0.10,
+            "sku_count": 1,
+            "billed": 1,
+            "zone": None,
+        }
+    )
+    stores = pd.DataFrame(
+        [
+            _attrs("DUE1", "Due Mart"),
+            _attrs("VIS1", "Visited Mart"),
+            _attrs("LITE1", "Lite Mart"),
+            _attrs("LAPSE1", "Lapse Mart"),
+            _attrs("DOWN1", "Down Mart"),
+            _attrs("HOLD1", "Hold Mart"),
+            {
+                "store_id": "GHOST",
+                "store_name": "Ghost",
+                "city": "Lahore",
+                "distributor": "Ghost Dist",
+                "dsr_name": "Ghost DSR",
+                "section": "X",
+                "in_universe": 1,
+            },
+        ]
+    )
+    visits = pd.DataFrame([{"store_id": "VIS1", "period": "2026-08", "visits": 2}])
+    return pd.DataFrame(month_rows), stores, pd.DataFrame(day_rows), _ledger(periods, as_of), visits
+
+
+def test_cycle_cover_and_lapse_name_the_right_doors():
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
     raw = pack.raw_shops.set_index("store_id")
-    assert "FRONT1" in raw.index
-    assert "BACK1" in raw.index
-    assert "MISS1" in raw.index
+
+    assert "DUE1" in raw.index
     assert "GHOST" not in raw.index
-    assert raw.loc["FRONT1", "action"] == "Lift drop"
-    assert raw.loc["BACK1", "action"] == ACTION_HOLD
-    assert raw.loc["MISS1", "action"] == ACTION_CALL
-    assert float(raw.loc["FRONT1", "behind_pace_mt"]) > float(raw.loc["BACK1", "behind_pace_mt"])
-    assert float(raw.loc["FRONT1", "week_target_mt"]) >= SHOP_FLOOR_MT
-    assert "Front Mart" in str(raw.loc["FRONT1", "instruction"])
-    assert "Call Miss Mart" in str(raw.loc["MISS1", "instruction"])
-    assert pack.source == "daily_curve"
-    assert not pack.calls.empty
-    assert "Miss Mart" in set(pack.calls["Shop"].astype(str))
-    assert "Front Mart" in set(pack.lifts["Shop"].astype(str))
-    assert "Back Mart" not in set(pack.calls["Shop"].astype(str))
+    assert raw.loc["DUE1", "action"] == ACTION_CALL
+    assert raw.loc["VIS1", "action"] == ACTION_CONVERT
+    assert raw.loc["LITE1", "action"] == ACTION_LIFT
+    assert raw.loc["LAPSE1", "action"] == ACTION_RECOVER
+    assert raw.loc["DOWN1", "action"] == ACTION_RECOVER
+    assert raw.loc["HOLD1", "action"] == ACTION_HOLD
+
+    assert float(raw.loc["DUE1", "cycle_days"]) < 20
+    assert float(raw.loc["DUE1", "days_since_bill"]) >= 15
+    assert float(raw.loc["HOLD1", "cover_left_days"]) > 7
+    assert float(raw.loc["HOLD1", "last_month_mt"]) >= 3.2
+    assert float(raw.loc["LITE1", "billed_mt"]) < 0.5
+    assert float(raw.loc["LITE1", "week_target_mt"]) >= SHOP_FLOOR_MT
+    assert float(raw.loc["DUE1", "week_target_mt"]) >= SHOP_FLOOR_MT
+
+    assert "Due Mart" in str(raw.loc["DUE1", "instruction"])
+    assert "not visited" in str(raw.loc["DUE1", "instruction"]).lower()
+    assert "another visit" in str(raw.loc["LITE1", "instruction"]).lower()
+    assert "Hold Mart" in str(raw.loc["HOLD1", "instruction"])
+    assert pack.source == "cycle"
+
+    assert "Due Mart" in set(pack.calls["Shop"].astype(str))
+    assert "Visited Mart" in set(pack.converts["Shop"].astype(str))
+    assert "Lite Mart" in set(pack.lifts["Shop"].astype(str))
+    assert "Lapse Mart" in set(pack.lapses["Shop"].astype(str))
+    assert "Down Mart" in set(pack.lapses["Shop"].astype(str))
+    assert "Hold Mart" not in set(pack.calls["Shop"].astype(str))
+    assert "Due Mart" not in set(pack.lapses["Shop"].astype(str))
 
 
-def test_curve_is_below_calendar_for_back_loaded_shop():
-    shop_month, stores, shop_day, ledger = _panel()
-    hist = shop_day[shop_day["period"] != "2026-08"]
-    shops = pd.DataFrame(
-        [{"store_id": "BACK1", "city": "Karachi", "dsr_name": "Amir", "expected_mt": 2.0, "billed_mt": 0.4}]
-    )
-    curves = fit_delivery_curves(hist, shops)
-    shop_curve = curves["shop::BACK1"]
-    calendar = 15 / 31
-    assert float(shop_curve[15]) < calendar - 0.10
-    front = pd.DataFrame(
-        [{"store_id": "FRONT1", "city": "Karachi", "dsr_name": "Amir", "expected_mt": 2.0, "billed_mt": 0.4}]
-    )
-    curves_f = fit_delivery_curves(hist, front)
-    assert float(curves_f["shop::FRONT1"][15]) > calendar + 0.10
+def test_unvisited_due_ranks_ahead_of_visited_due():
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    raw = pack.raw_shops.set_index("store_id")
+    assert float(raw.loc["DUE1", "value_score"]) > float(raw.loc["VIS1", "value_score"])
 
 
 def test_dsr_instruction_names_counts_and_tonnes():
-    shop_month, stores, shop_day, ledger = _panel()
-    pack = build_action_pack(shop_month, stores, shop_day, ledger=ledger, period="2026-08")
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
     assert not pack.dsrs.empty
     row = pack.dsrs.iloc[0]
     assert row["DSR"] == "Amir"
@@ -172,37 +236,34 @@ def test_dsr_instruction_names_counts_and_tonnes():
     assert "this week" in str(row["Do this"]).lower()
 
 
-def test_visited_unbilled_is_convert():
-    shop_month, stores, shop_day, ledger = _panel(front_frac=0.0, back_frac=0.20)
-    # Front shop billed 0 this month — still in daily history for prior months.
-    shop_month.loc[(shop_month["store_id"] == "FRONT1") & (shop_month["period"] == "2026-08"), "volume_mt"] = 0.0
-    shop_month.loc[(shop_month["store_id"] == "FRONT1") & (shop_month["period"] == "2026-08"), "billed"] = 0
-    shop_day = shop_day[~((shop_day["store_id"] == "FRONT1") & (shop_day["period"] == "2026-08"))]
-    visits = pd.DataFrame([{"store_id": "FRONT1", "period": "2026-08", "visits": 2}])
+def test_action_workbook_has_due_another_visit_and_lapsing():
+    shop_month, stores, shop_day, ledger, visits = _panel()
     pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
-    raw = pack.raw_shops.set_index("store_id")
-    assert raw.loc["FRONT1", "action"] == "Convert"
-    assert "Front Mart" in set(pack.converts["Shop"].astype(str))
-
-
-def test_action_workbook_has_one_table_per_grain():
-    shop_month, stores, shop_day, ledger = _panel()
-    pack = build_action_pack(shop_month, stores, shop_day, ledger=ledger, period="2026-08")
     names = [s[0] for s in iter_action_sheets(pack)]
-    assert names == ["01 Country", "02 Distributors", "03 DSRs", "04 Call", "05 Convert", "06 Lift drop", "07 Backtest"]
+    assert names == [
+        "01 Country",
+        "02 Distributors",
+        "03 DSRs",
+        "04 Due",
+        "05 Due visited",
+        "06 Another visit",
+        "07 Lapsing",
+        "08 Backtest",
+    ]
     raw = excel_bytes(pack)
     wb = load_workbook(BytesIO(raw))
     assert "00 Cover" in wb.sheetnames
-    assert "04 Call" in wb.sheetnames
-    assert "02 Distributors" in wb.sheetnames
+    assert "04 Due" in wb.sheetnames
+    assert "06 Another visit" in wb.sheetnames
+    assert "07 Lapsing" in wb.sheetnames
     detailed = excel_bytes(pack, detailed=True)
     wb_d = load_workbook(BytesIO(detailed))
     assert "04 Shops" in wb_d.sheetnames
     assert pack.backtest is not None
-    if not pack.backtest.empty and "Curve precision@50" in pack.backtest.columns:
-        curve = pack.backtest.iloc[0]["Curve precision@50"]
-        cal = pack.backtest.iloc[0]["Calendar precision@50"]
-        assert curve is None or cal is None or float(curve) >= float(cal) - 5
+    if not pack.backtest.empty and "Due precision" in pack.backtest.columns:
+        due_p = pack.backtest.iloc[0]["Due precision"]
+        rnd = pack.backtest.iloc[0]["Random precision"]
+        assert due_p is None or rnd is None or float(due_p) >= float(rnd) - 5
 
 
 def test_period_key_stable():

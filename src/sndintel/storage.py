@@ -415,6 +415,13 @@ CREATE TABLE IF NOT EXISTS action_shops (
     call_status TEXT,
     visits INTEGER,
     value_score REAL,
+    cycle_days REAL,
+    days_overdue REAL,
+    last_drop_mt REAL,
+    cover_left_days REAL,
+    light_mt REAL,
+    trend_pct REAL,
+    last_month_mt REAL,
     PRIMARY KEY (period, store_id)
 );
 
@@ -429,6 +436,7 @@ CREATE TABLE IF NOT EXISTS action_units (
     n_call INTEGER,
     n_convert INTEGER,
     n_lift INTEGER,
+    n_lapse INTEGER,
     n_hold INTEGER,
     billed_mt REAL,
     expected_mt REAL,
@@ -473,6 +481,7 @@ CREATE TABLE IF NOT EXISTS action_brief (
     n_call INTEGER,
     n_convert INTEGER,
     n_lift INTEGER,
+    n_lapse INTEGER,
     has_daily INTEGER,
     headline TEXT,
     source TEXT,
@@ -569,6 +578,18 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("credibility", "REAL"),
         ):
             _ensure_column(conn, "seasonality_index", col, ddl)
+        for col, ddl in (
+            ("cycle_days", "REAL"),
+            ("days_overdue", "REAL"),
+            ("last_drop_mt", "REAL"),
+            ("cover_left_days", "REAL"),
+            ("light_mt", "REAL"),
+            ("trend_pct", "REAL"),
+            ("last_month_mt", "REAL"),
+        ):
+            _ensure_column(conn, "action_shops", col, ddl)
+        _ensure_column(conn, "action_units", "n_lapse", "INTEGER")
+        _ensure_column(conn, "action_brief", "n_lapse", "INTEGER")
     return db_path
 
 

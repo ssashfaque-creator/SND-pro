@@ -709,9 +709,10 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
 def _page_this_week(data, period, mtd, ledger):
     st.title("This week")
     st.caption(
-        f"**{mtd['label'] or period}** · Exact call, convert, and lift-drop instructions from each "
-        "shop’s own billed-day shape. Expected is still the last-three-closed-month run-rate — "
-        "the curve only times it through the month. Rebuild scorecards after an Outlet Date Wise upload."
+        f"**{mtd['label'] or period}** · Which doors are due to order, bought too little, or are fading. "
+        "Each shop’s usual days-between-bills and leftover cover from the last drop decide the action. "
+        "Expected is still the last-three-closed-month run-rate — no day-of-month seasonality. "
+        "Rebuild scorecards after an Outlet Date Wise upload."
     )
     if mtd.get("open"):
         st.info(banner_text(ledger, period))
@@ -740,10 +741,10 @@ def _page_this_week(data, period, mtd, ledger):
         return
 
     st.markdown(f"**{pack.headline}**")
-    if pack.source == "calendar":
-        st.caption("Daily billed days were not found — lists use calendar pace. Upload Outlet Date Wise to time the month.")
+    if pack.source == "monthly":
+        st.caption("Daily billed days were not found — cycles fall back to monthly gaps. Upload Outlet Date Wise for exact days-between-bills.")
     else:
-        st.caption("Delivery curve learned from billed days, shrunk shop → DSR → city → country.")
+        st.caption("Purchase cycle and leftover cover learned from billed days, shrunk shop → DSR → city.")
 
     left, right = st.columns(2)
     with left:
@@ -780,20 +781,24 @@ def _page_this_week(data, period, mtd, ledger):
     st.markdown("##### 1. Country this week")
     _strategy_table(pack.country, height=140)
     st.markdown("##### 2. Push these distributors")
-    st.caption("One list. Ranked by this-week tonnes — not Gap tons.")
+    st.caption("One list. Ranked by this-week ask tonnes — not Gap tons.")
     _strategy_table(pack.distributors, height=320)
     st.markdown("##### 3. Push these DSRs")
     st.caption("One national list. A DSR can appear even if its distributor is not above.")
     _strategy_table(pack.dsrs, height=320)
-    st.markdown("##### 4. Call these shops")
-    st.caption("Unvisited doors behind their own curve. This week is the tonnes ask.")
+    st.markdown("##### 4. Due — cycle elapsed, not visited")
+    st.caption("Usually buys every N days; it has been N days with no bill. Nobody visited this month.")
     _strategy_table(pack.calls, height=420)
-    st.markdown("##### 5. Convert — visited, not billed")
+    st.markdown("##### 5. Due · visited — called, still no bill")
     _strategy_table(pack.converts, height=280)
-    st.markdown("##### 6. Lift drop — billed, behind curve")
+    st.markdown("##### 6. Another visit — bought too little this month")
+    st.caption("Billed once (or a stub) and still short of Expected. Cycle says they should have bought again.")
     _strategy_table(pack.lifts, height=280)
-    st.markdown("##### 7. Backtest")
-    st.caption("Walk-forward at day 15 of closed months. Curve precision@50 should beat calendar pace.")
+    st.markdown("##### 7. Lapsing — quiet too long or declining")
+    st.caption("Two cycles with no bill, or last-three months down versus the three before. Unvisited doors rank first.")
+    _strategy_table(pack.lapses, height=280)
+    st.markdown("##### 8. Backtest")
+    st.caption("At day 15 of closed months: did shops marked due actually bill in the next 14 days?")
     _strategy_table(pack.backtest, height=160)
     with st.expander("How to read this pack", expanded=False):
         for term, meaning in ACTION_GLOSSARY:
