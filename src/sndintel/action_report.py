@@ -37,7 +37,11 @@ GLOSSARY = [
     ),
     (
         "Ask rest of month",
-        "What those named doors can still close before month-end: typical drop × orders that still fit, capped at remaining-to-Expected. Another visit already used one drop this month, so the ask is the next drop — not the whole Expected hole. Zero on Hold. Printed in KG.",
+        "Typical drops that can still land before month-end, capped at remaining-to-Expected. Not the whole hole: day 22 with 9 days left cannot close 500 MT of full-month miss. Includes doors that are due now and doors that come due before month-end (once-a-month shops that last billed late last month). Zero when leftover cover lasts past month-end, or the door already hit Expected. Printed in KG.",
+    ),
+    (
+        "Coming due",
+        "Doors that are not due today but whose cycle or leftover cover runs out before month-end. They are most of a late-month country hole. Doors is today's work list only (Due / Due visited / Another visit / Lapsing).",
     ),
     (
         "Due / Due · visited / Another visit / Lapsing / Hold",
@@ -60,8 +64,8 @@ def how_to_read(pack: ActionPack, detailed: bool = False) -> list[str]:
             "Every shop with an action. Do this names the door and why it is due, light, lapsing, or hold.",
         ]
     return [
-        f"{day}. Country: billed vs AMS vs Expected vs rest-of-month ask, all in KG. Doors is the work list (Due + Due visited + Another visit + Lapsing) — Due can be 0 when the beat already called.",
-        "One distributor push list — how many doors to work, and the KG those doors can still close before month-end.",
+        f"{day}. Country: billed vs Expected is the hole (Still to Expected). Ask rest of month is drops that can still land — including Coming due, not only today's call list.",
+        "One distributor push list — doors to work now, how many come due before month-end, and closable KG.",
         "One DSR push list — ride-with names, not nested under the distributors.",
         "Due — cycle elapsed, no leftover cover, not visited this month.",
         "Due · visited — same clock, already called, still no bill.",

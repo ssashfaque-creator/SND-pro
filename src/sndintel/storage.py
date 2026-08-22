@@ -422,6 +422,9 @@ CREATE TABLE IF NOT EXISTS action_shops (
     light_mt REAL,
     trend_pct REAL,
     last_month_mt REAL,
+    coming_due INTEGER,
+    days_until_due REAL,
+    n_orders_left REAL,
     PRIMARY KEY (period, store_id)
 );
 
@@ -439,6 +442,7 @@ CREATE TABLE IF NOT EXISTS action_units (
     n_lapse INTEGER,
     n_hold INTEGER,
     n_doors INTEGER,
+    n_coming INTEGER,
     ams_3m REAL,
     billed_mt REAL,
     expected_mt REAL,
@@ -486,6 +490,7 @@ CREATE TABLE IF NOT EXISTS action_brief (
     n_lift INTEGER,
     n_lapse INTEGER,
     n_doors INTEGER,
+    n_coming INTEGER,
     has_daily INTEGER,
     headline TEXT,
     source TEXT,
@@ -590,13 +595,18 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("light_mt", "REAL"),
             ("trend_pct", "REAL"),
             ("last_month_mt", "REAL"),
+            ("coming_due", "INTEGER"),
+            ("days_until_due", "REAL"),
+            ("n_orders_left", "REAL"),
         ):
             _ensure_column(conn, "action_shops", col, ddl)
         _ensure_column(conn, "action_units", "n_lapse", "INTEGER")
         _ensure_column(conn, "action_units", "n_doors", "INTEGER")
+        _ensure_column(conn, "action_units", "n_coming", "INTEGER")
         _ensure_column(conn, "action_units", "ams_3m", "REAL")
         _ensure_column(conn, "action_brief", "n_lapse", "INTEGER")
         _ensure_column(conn, "action_brief", "n_doors", "INTEGER")
+        _ensure_column(conn, "action_brief", "n_coming", "INTEGER")
         _ensure_column(conn, "action_brief", "ams_3m", "REAL")
     return db_path
 

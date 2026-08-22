@@ -125,7 +125,8 @@ def build_action_pack(
     shops["behind_pace_mt"] = shops["light_mt"]
     shops = _attach_calls(shops, visits, period)
     shops = _classify_actions(shops, open_mtd)
-    shops["week_target_mt"] = _ask_mt(shops, days_left, open_mtd, days_in_month)
+    shops = _attach_rest_of_month(shops, days_left, open_mtd, days_in_month)
+    shops["instruction"] = [_instruction(r) for r in shops.itertuples(index=False)]
     shops["value_score"] = _value_score(shops)
     shops = shops.sort_values(["value_score", "week_target_mt", "days_overdue"], ascending=False)
 
@@ -716,6 +717,14 @@ def _instruction(row: Any) -> str:
             f"{name} {verb} — {since_s} since the last bill (usual cycle {cycle_s}).{trend_s} "
             f"Get this door back on the beat.{last_bit}"
         )
+    coming = bool(getattr(row, "coming_due", False))
+    until = getattr(row, "days_until_due", None)
+    if coming and action == ACTION_HOLD:
+        until_s = f"{int(round(float(until)))} days" if until is not None and pd.notna(until) else "a few days"
+        return (
+            f"{name} comes due in {until_s} (cycle {cycle_s}). "
+            f"Close about {_kg_text(drop)} before month-end.{last_bit}"
+        )
     if pd.notna(cover) and float(cover) > COVER_HOLD_DAYS:
         why = f"Last drop {_kg_text(last_drop)}" if last_drop else f"Last month {_kg_text(last_month)} versus AMS {_kg_text(ams)}"
         return f"Hold {name}. {why} — {cover_s}. Do not pull the beat here.{last_bit}"
@@ -737,32 +746,55 @@ def _ask_mt(
     open_mtd: bool = True,
     days_in_month: int = 31,
 ) -> pd.Series:
-    """What those doors can still close before month-end — not the whole Expected hole.
+    """Rest-of-month closable volume. Prefer `_attach_rest_of_month` which also flags coming-due doors."""
+    return _attach_rest_of_month(shops, days_left, open_mtd, days_in_month)["week_target_mt"]
 
-    Another visit already used one drop this month, so the ask is the next
-    typical drop (or two if another cycle still fits). A fat typical-drop prior
-    cannot ask for a full month of AMS when only a stub of days remains.
+
+def _attach_rest_of_month(
+    shops: pd.DataFrame,
+    days_left: int = 0,
+    open_mtd: bool = True,
+    days_in_month: int = 31,
+) -> pd.DataFrame:
+    """Ask = typical drops that can still land before month-end, capped at remaining-to-Expected.
+
+    Today's call list is not the rest of the month. A once-a-month door that last
+    billed on 31 July is not 'due' on day 22, but it will buy again before
+    month-end — that drop is most of the country hole. Loaded cover that lasts
+    past month-end stays at 0. Hitting Expected already stays at 0.
     """
-    drop = pd.to_numeric(shops["typical_drop_mt"], errors="coerce").fillna(0)
-    remaining = pd.to_numeric(shops["remaining_mt"], errors="coerce").fillna(0)
-    ams = pd.to_numeric(shops.get("ams_3m"), errors="coerce").fillna(0)
-    cycle = pd.to_numeric(shops.get("cycle_days"), errors="coerce").replace(0, np.nan).fillna(30).clip(lower=1)
+    out = shops.copy()
+    drop = pd.to_numeric(out.get("typical_drop_mt"), errors="coerce").fillna(0)
+    remaining = pd.to_numeric(out.get("remaining_mt"), errors="coerce").fillna(0)
+    ams = pd.to_numeric(out.get("ams_3m"), errors="coerce").fillna(0)
+    cycle = pd.to_numeric(out.get("cycle_days"), errors="coerce").replace(0, np.nan).fillna(30).clip(lower=1)
+    days_since = pd.to_numeric(out.get("days_since_bill"), errors="coerce")
+    cover = pd.to_numeric(out.get("cover_left_days"), errors="coerce")
+    last_month = pd.to_numeric(out.get("last_month_mt"), errors="coerce").fillna(0)
     days = max(int(days_left), 0)
-    month = max(int(days_in_month), 1)
+    work_now = out["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT, ACTION_RECOVER})
+    cycle_elapsed = days_since.notna() & (days_since >= cycle * 0.9)
+    due_now = work_now | cycle_elapsed
+    until_cycle = (cycle - days_since.fillna(cycle)).clip(lower=0)
+    until_cover = cover.fillna(0).clip(lower=0)
+    days_until = np.maximum(until_cycle, until_cover)
+    first_in = pd.Series(np.where(due_now, 0.0, days_until), index=out.index)
+    loaded = (ams > 0) & (last_month >= LOADED_MONTHS * ams)
+    stocked = cover.fillna(0) > float(days)
     if open_mtd and days > 0:
-        n_orders = np.floor(np.maximum(days - 1, 0) / cycle) + 1.0
-        n_orders = n_orders.clip(lower=1, upper=3)
+        leftover = (float(days) - first_in).clip(lower=0)
+        n_orders = np.where(first_in <= days, 1.0 + np.floor(leftover / cycle), 0.0)
+        n_orders = np.minimum(n_orders, 3.0)
     else:
-        n_orders = pd.Series(1.0, index=shops.index)
-    already = shops["action"].eq(ACTION_LIFT)
-    n_orders = np.where(already, np.maximum(1.0, n_orders - 1.0), n_orders)
+        n_orders = np.where(due_now, 1.0, 0.0)
+    n_orders = pd.Series(np.where(loaded | stocked, 0.0, n_orders), index=out.index)
     closable = drop * n_orders
-    ams_rest = ams * (days / month) if open_mtd else ams
-    closable = np.minimum(closable, np.maximum(drop, ams_rest))
-    hole = remaining.where(remaining > 0, closable)
-    ask = pd.Series(np.minimum(hole, closable), index=shops.index)
-    ask = ask.where(shops["action"] != ACTION_HOLD, 0.0)
-    return ask.clip(lower=0)
+    ask = pd.Series(np.minimum(remaining.to_numpy(), closable.to_numpy()), index=out.index).clip(lower=0)
+    out["week_target_mt"] = ask
+    out["n_orders_left"] = n_orders
+    out["days_until_due"] = first_in
+    out["coming_due"] = (~work_now) & (ask > 0)
+    return out
 
 
 def _value_score(shops: pd.DataFrame) -> pd.Series:
@@ -776,7 +808,10 @@ def _value_score(shops: pd.DataFrame) -> pd.Series:
     score = score + (-trend.clip(upper=0) * pd.to_numeric(shops["ams_3m"], errors="coerce").fillna(0))
     score = score.where(~unvisited, score * 1.35)
     score = score.where(cover <= COVER_HOLD_DAYS, score * 0.1)
-    score = score.where(shops["action"] != ACTION_HOLD, 0.0)
+    hold = shops["action"].eq(ACTION_HOLD)
+    coming = shops["coming_due"].fillna(False) if "coming_due" in shops.columns else False
+    score = score.where(~hold, 0.0)
+    score = score.where(~(hold & coming), ask * 0.45)
     return score.fillna(0.0)
 
 
@@ -792,17 +827,22 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
         n_convert = int((g["action"] == ACTION_CONVERT).sum())
         n_lift = int((g["action"] == ACTION_LIFT).sum())
         n_lapse = int((g["action"] == ACTION_RECOVER).sum())
+        n_coming = int(g["coming_due"].fillna(False).sum()) if "coming_due" in g.columns else 0
         week = float(g["week_target_mt"].sum())
+        remaining = float(g["remaining_mt"].sum())
         n_doors = n_call + n_convert + n_lift + n_lapse
+        coming_bit = f", {n_coming} more come due before month-end" if n_coming else ""
         instruction = (
-            f"Push {name}: {n_doors} doors to work "
+            f"Push {name}: {n_doors} doors to work now "
             f"({n_call} due and unvisited, {n_convert} due but already visited, "
-            f"{n_lift} another visit, {n_lapse} lapsing). "
-            f"Ask {_kg_text(week)} for the rest of the month."
+            f"{n_lift} another visit, {n_lapse} lapsing){coming_bit}. "
+            f"Ask {_kg_text(week)} for the rest of the month "
+            f"({_kg_text(remaining)} still to Expected)."
         )
         row = {
             "grain_id": str(name),
             "n_doors": n_doors,
+            "n_coming": n_coming,
             "n_call": n_call,
             "n_convert": n_convert,
             "n_lift": n_lift,
@@ -834,8 +874,10 @@ def _units_with_work(df: pd.DataFrame) -> pd.DataFrame:
         + pd.to_numeric(df.get("n_convert"), errors="coerce").fillna(0)
         + pd.to_numeric(df.get("n_lift"), errors="coerce").fillna(0)
         + pd.to_numeric(df.get("n_lapse"), errors="coerce").fillna(0)
+        + pd.to_numeric(df.get("n_coming"), errors="coerce").fillna(0)
     )
-    return df.loc[work > 0].copy()
+    ask = pd.to_numeric(df.get("week_target_mt"), errors="coerce").fillna(0)
+    return df.loc[(work > 0) | (ask > 0)].copy()
 
 
 def _country_row(shops: pd.DataFrame, as_of: int, days: int, days_left: int, open_mtd: bool, source: str) -> dict[str, Any]:
@@ -857,6 +899,7 @@ def _country_row(shops: pd.DataFrame, as_of: int, days: int, days_left: int, ope
         "n_lapse": int((shops["action"] == ACTION_RECOVER).sum()),
         "n_hold": int((shops["action"] == ACTION_HOLD).sum()),
         "n_doors": int((shops["action"] != ACTION_HOLD).sum()),
+        "n_coming": int(shops["coming_due"].fillna(False).sum()) if "coming_due" in shops.columns else 0,
         "source": source,
     }
 
@@ -866,17 +909,29 @@ def _headline(country: dict[str, Any], open_mtd: bool, has_daily: bool) -> str:
     n_convert = int(country.get("n_convert") or 0)
     n_lift = int(country.get("n_lift") or 0)
     n_lapse = int(country.get("n_lapse") or 0)
+    n_coming = int(country.get("n_coming") or 0)
     week = float(country.get("week_target_mt") or 0)
+    billed = float(country.get("billed_mt") or 0)
+    expected = float(country.get("expected_mt") or 0)
+    remaining = float(country.get("remaining_mt") or 0)
+    coming_bit = f", {n_coming} come due before month-end" if n_coming else ""
+    hole = (
+        f"billed {_kg_text(billed)} vs {_kg_text(expected)} Expected "
+        f"({_kg_text(remaining)} still to go). "
+    )
     if not has_daily:
         return (
             f"No billed days in the warehouse — cycles fall back to monthly gaps. "
-            f"{n_call} due, {n_convert} due and already visited, {n_lift} another visit, {n_lapse} lapsing "
-            f"({_kg_text(week)} for the rest of the month)."
+            f"{hole}{n_call} due, {n_convert} due and already visited, {n_lift} another visit, "
+            f"{n_lapse} lapsing{coming_bit}. Ask {_kg_text(week)} for the rest of the month "
+            f"(drops that still fit — not the whole hole)."
         )
     when = f"Day {country.get('as_of_day')}/{country.get('days_in_month')}" if open_mtd else "Month closed"
     return (
-        f"{when}: {n_call} due and unvisited, {n_convert} due but already seen, "
-        f"{n_lift} another visit, {n_lapse} lapsing — {_kg_text(week)} to ask for the rest of the month."
+        f"{when}: {hole}{n_call} due and unvisited, {n_convert} due but already seen, "
+        f"{n_lift} another visit, {n_lapse} lapsing{coming_bit}. "
+        f"Ask {_kg_text(week)} for the rest of the month "
+        f"(drops that still fit — not the {_kg_text(remaining)} hole)."
     )
 
 
@@ -893,6 +948,7 @@ COUNTRY_VIEW = [
     ("as_of_day", "As of day"),
     ("days_left", "Days left"),
     ("n_doors", "Doors"),
+    ("n_coming", "Coming due"),
     ("n_call", "Due · unvisited"),
     ("n_convert", "Due · visited"),
     ("n_lift", "Another visit"),
@@ -906,6 +962,7 @@ SHOP_VIEW = [
     ("distributor", "Distributor"),
     ("dsr_name", "DSR"),
     ("action", "Action"),
+    ("coming_due", "Coming due"),
     ("week_target_mt", "Ask rest of month (KG)"),
     ("billed_mt", "Billed (KG)"),
     ("ams_3m", "AMS (KG)"),
@@ -943,9 +1000,9 @@ COUNTRY_PDF_COLS = [
     "AMS (KG)",
     "Still to Expected (KG)",
     "Ask rest of month (KG)",
-    "As of day",
     "Days left",
     "Doors",
+    "Coming due",
     "Due · unvisited",
     "Due · visited",
     "Another visit",
@@ -956,6 +1013,7 @@ DIST_PDF_COLS = [
     "Distributor",
     "City",
     "Doors",
+    "Coming due",
     "Due",
     "Due · visited",
     "Another visit",
@@ -970,6 +1028,7 @@ DSR_PDF_COLS = [
     "DSR",
     "City",
     "Doors",
+    "Coming due",
     "Due",
     "Due · visited",
     "Another visit",
@@ -984,6 +1043,7 @@ UNIT_VIEW_DIST = [
     ("grain_id", "Distributor"),
     ("city", "City"),
     ("n_doors", "Doors"),
+    ("n_coming", "Coming due"),
     ("n_call", "Due"),
     ("n_convert", "Due · visited"),
     ("n_lift", "Another visit"),
@@ -1000,6 +1060,7 @@ UNIT_VIEW_DSR = [
     ("city", "City"),
     ("distributor", "Distributor"),
     ("n_doors", "Doors"),
+    ("n_coming", "Coming due"),
     ("n_call", "Due"),
     ("n_convert", "Due · visited"),
     ("n_lift", "Another visit"),
@@ -1042,6 +1103,8 @@ def _present(df: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
         col = df[src]
         if label in kg_cols:
             out[label] = [_round_kg(v) for v in col]
+        elif src == "coming_due":
+            out[label] = ["Yes" if bool(v) and not (isinstance(v, float) and pd.isna(v)) else "" for v in col]
         elif label in {"Usual cycle (days)", "Days since bill", "Days overdue", "Cover left (days)"}:
             out[label] = [None if pd.isna(v) else int(round(float(v))) for v in col]
         elif label == "Trend vs prior 3m":
@@ -1139,6 +1202,9 @@ def _raw_shops_to_sql(df: pd.DataFrame, period: str) -> pd.DataFrame:
         "light_mt",
         "trend_pct",
         "last_month_mt",
+        "coming_due",
+        "days_until_due",
+        "n_orders_left",
     ]
     for col in cols:
         if col not in out.columns:
@@ -1166,6 +1232,7 @@ def _raw_units_to_sql(df: pd.DataFrame, period: str, grain: str) -> pd.DataFrame
         "n_lapse",
         "n_hold",
         "n_doors",
+        "n_coming",
         "ams_3m",
         "billed_mt",
         "expected_mt",
@@ -1261,6 +1328,7 @@ def _brief_to_sql(pack: ActionPack) -> dict[str, Any]:
         "n_lift": b.get("n_lift"),
         "n_lapse": b.get("n_lapse"),
         "n_doors": b.get("n_doors"),
+        "n_coming": b.get("n_coming"),
         "has_daily": int(pack.has_daily),
         "headline": pack.headline,
         "source": pack.source,

@@ -218,7 +218,9 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     assert "Billed (KG)" in pack.distributors.columns
     assert "Doors" in pack.distributors.columns
     assert "Doors" in pack.country.columns
+    assert "Coming due" in pack.country.columns
     assert "Lapsing" in pack.country.columns
+    assert "still to go" in pack.headline.lower()
     assert int(pack.calls.loc[pack.calls["Shop"] == "Due Mart", "Ask rest of month (KG)"].iloc[0]) == 1000
 
     assert "Due Mart" in set(pack.calls["Shop"].astype(str))
@@ -246,8 +248,10 @@ def test_dsr_instruction_names_counts_and_tonnes():
     assert "Push Amir" in str(row["Do this"])
     assert "rest of the month" in str(row["Do this"]).lower()
     assert "doors to work" in str(row["Do this"]).lower()
+    assert "still to expected" in str(row["Do this"]).lower()
     assert "KG" in str(row["Do this"])
     assert "Ask rest of month (KG)" in pack.dsrs.columns
+    assert "Coming due" in pack.dsrs.columns
     assert "Ask rest of month (KG)" in pack.country.columns
     assert "AMS (KG)" in pack.country.columns
 
@@ -362,6 +366,7 @@ def test_pdf_keeps_ask_rest_of_month_and_lapsing():
     assert "Ask rest of month (KG)" in country_cols
     assert "Lapsing" in country_cols
     assert "Doors" in country_cols
+    assert "Coming due" in country_cols
     assert "Ask rest of month (KG)" in dist_cols
     assert "Doors" in dist_cols
     assert "Ask rest of month (KG)" in dsr_cols
@@ -369,3 +374,47 @@ def test_pdf_keeps_ask_rest_of_month_and_lapsing():
     raw = pdf_bytes(pack)
     assert raw[:5] == b"%PDF-"
     assert len(raw) > 1000
+
+
+def test_next_drop_before_month_end_is_in_rest_of_month_ask():
+    """Fortnightly door billed on 12 Aug is not due today, but the next drop still fits."""
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    city, dist, dsr = "Karachi", "Eva Foods", "Amir"
+    extra_days = [_bill("MID1", "Mid Mart", city, dist, dsr, d, 1.0) for d in _cycle_dates(date(2026, 8, 12), 15, 20)]
+    shop_day = pd.concat([shop_day, pd.DataFrame(extra_days)], ignore_index=True)
+    shop_month = pd.concat([shop_month, pd.DataFrame(_months_from_days(extra_days))], ignore_index=True)
+    stores = pd.concat([stores, pd.DataFrame([_attrs("MID1", "Mid Mart")])], ignore_index=True)
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    raw = pack.raw_shops.set_index("store_id")
+    assert raw.loc["MID1", "action"] == ACTION_HOLD
+    assert bool(raw.loc["MID1", "coming_due"])
+    assert float(raw.loc["MID1", "week_target_mt"]) >= SHOP_FLOOR_MT
+    assert float(raw.loc["MID1", "week_target_mt"]) <= float(raw.loc["MID1", "remaining_mt"]) + 0.05
+    assert "comes due" in str(raw.loc["MID1", "instruction"]).lower()
+    assert int(pack.country.iloc[0]["Coming due"]) >= 1
+    work_ask = float(raw.loc[raw["action"] != ACTION_HOLD, "week_target_mt"].sum())
+    country_ask = float(pack.raw_shops["week_target_mt"].sum())
+    assert country_ask > work_ask
+
+
+def test_just_billed_inside_cycle_is_not_rest_of_month_ask():
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    city, dist, dsr = "Karachi", "Eva Foods", "Amir"
+    extra_days = [_bill("EARLY1", "Early Mart", city, dist, dsr, d, 1.0) for d in (
+        date(2026, 5, 8),
+        date(2026, 5, 23),
+        date(2026, 6, 7),
+        date(2026, 6, 22),
+        date(2026, 7, 7),
+        date(2026, 7, 22),
+        date(2026, 8, 20),
+    )]
+    shop_day = pd.concat([shop_day, pd.DataFrame(extra_days)], ignore_index=True)
+    shop_month = pd.concat([shop_month, pd.DataFrame(_months_from_days(extra_days))], ignore_index=True)
+    stores = pd.concat([stores, pd.DataFrame([_attrs("EARLY1", "Early Mart")])], ignore_index=True)
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    raw = pack.raw_shops.set_index("store_id")
+    assert raw.loc["EARLY1", "action"] == ACTION_HOLD
+    assert not bool(raw.loc["EARLY1", "coming_due"])
+    assert float(raw.loc["EARLY1", "week_target_mt"]) == 0.0
+    assert float(raw.loc["EARLY1", "remaining_mt"]) > 0.5
