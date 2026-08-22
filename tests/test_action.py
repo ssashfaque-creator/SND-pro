@@ -211,8 +211,11 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     assert "Hold Mart" in str(raw.loc["HOLD1", "instruction"])
     assert pack.source == "cycle"
     assert "Ask (KG)" in pack.calls.columns
+    assert "Billed (KG)" in pack.calls.columns
     assert "AMS (KG)" in pack.calls.columns
+    assert "Billed (KG)" in pack.dsrs.columns
     assert "AMS (KG)" in pack.dsrs.columns
+    assert "Billed (KG)" in pack.distributors.columns
     assert int(pack.calls.loc[pack.calls["Shop"] == "Due Mart", "Ask (KG)"].iloc[0]) == 1000
 
     assert "Due Mart" in set(pack.calls["Shop"].astype(str))
