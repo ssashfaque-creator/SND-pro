@@ -2,9 +2,11 @@
 
 Daily billed days teach each door’s replenishment cycle (days between drops) and
 typical drop size, shrunk shop → DSR → city so thin history borrows the parent.
-Last drop ÷ daily run-rate is remaining cover. A shop that took two months of
-stock last time is not due. A shop that usually buys every 15 days and is on
-day 16 with no bill is due — especially if nobody visited.
+Next-order size is a gradient-boosted model on billed-day sequences (fat last
+drop → smaller next; quiet / thin last drop → catch-up). Last drop ÷ daily
+run-rate is remaining cover. A shop that took two months of stock last time is
+not due. A shop that usually buys every 15 days and is on day 16 with no bill
+is due — especially if nobody visited.
 
 Expected stays the last-three-closed-month run-rate. This engine does not use
 day-of-month seasonality.
@@ -21,6 +23,7 @@ import pandas as pd
 
 from sndintel.io_utils import prior_periods, shift_period
 from sndintel.mtd import period_state
+from sndintel.nextdrop import attach_next_drop
 from sndintel.season import fit_seasonality, fit_shop_expected
 
 SHOP_FLOOR_MT = 0.25
@@ -123,6 +126,7 @@ def build_action_pack(
     shops["light_mt"] = shops["remaining_mt"]
     shops["should_have_mt"] = shops["expected_mt"]
     shops["behind_pace_mt"] = shops["light_mt"]
+    shops = attach_next_drop(shops, daily, as_of_ts, shop_month)
     shops = _attach_calls(shops, visits, period)
     shops = _classify_actions(shops, open_mtd)
     shops = _attach_rest_of_month(shops, days_left, open_mtd, days_in_month)
@@ -681,7 +685,11 @@ def _instruction(row: Any) -> str:
     cycle = getattr(row, "cycle_days", None)
     since = getattr(row, "days_since_bill", None)
     cover = getattr(row, "cover_left_days", None)
-    drop = float(getattr(row, "typical_drop_mt", 0) or 0)
+    pred = getattr(row, "next_drop_mt", None)
+    if pred is not None and pd.notna(pred) and float(pred) > 0:
+        drop = float(pred)
+    else:
+        drop = float(getattr(row, "typical_drop_mt", 0) or 0)
     last_drop = float(getattr(row, "last_drop_mt", 0) or 0)
     billed = float(getattr(row, "billed_mt", 0) or 0)
     expected = float(getattr(row, "expected_mt", 0) or 0)
@@ -764,7 +772,8 @@ def _attach_rest_of_month(
     past month-end stays at 0. Hitting Expected already stays at 0.
     """
     out = shops.copy()
-    drop = pd.to_numeric(out.get("typical_drop_mt"), errors="coerce").fillna(0)
+    drop = pd.to_numeric(out.get("next_drop_mt"), errors="coerce")
+    drop = drop.fillna(pd.to_numeric(out.get("typical_drop_mt"), errors="coerce")).fillna(0)
     remaining = pd.to_numeric(out.get("remaining_mt"), errors="coerce").fillna(0)
     ams = pd.to_numeric(out.get("ams_3m"), errors="coerce").fillna(0)
     cycle = pd.to_numeric(out.get("cycle_days"), errors="coerce").replace(0, np.nan).fillna(30).clip(lower=1)
@@ -972,6 +981,7 @@ SHOP_VIEW = [
     ("cover_left_days", "Cover left (days)"),
     ("last_drop_mt", "Last drop (KG)"),
     ("typical_drop_mt", "Typical drop (KG)"),
+    ("next_drop_mt", "Next order (KG)"),
     ("expected_mt", "Expected (KG)"),
     ("last_month_mt", "Last month (KG)"),
     ("trend_pct", "Trend vs prior 3m"),
@@ -986,6 +996,7 @@ SHOP_PDF_COLS = [
     "DSR",
     "Action",
     "Ask rest of month (KG)",
+    "Next order (KG)",
     "Billed (KG)",
     "AMS (KG)",
     "Days since bill",
@@ -1095,6 +1106,7 @@ def _present(df: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
         "AMS (KG)",
         "Last drop (KG)",
         "Typical drop (KG)",
+        "Next order (KG)",
     }
     for src, label in view:
         if src not in df.columns:
@@ -1202,6 +1214,8 @@ def _raw_shops_to_sql(df: pd.DataFrame, period: str) -> pd.DataFrame:
         "light_mt",
         "trend_pct",
         "last_month_mt",
+        "next_drop_mt",
+        "next_drop_model",
         "coming_due",
         "days_until_due",
         "n_orders_left",

@@ -21,7 +21,7 @@ GLOSSARY = [
     ),
     (
         "Usual cycle / typical drop",
-        "Median days between billed days and median billed-day volume, shrunk shop → DSR → city so a thin history borrows the beat. Store Y that bills every 15 days is due when it has been ~15 days with no bill. Volumes print in KG.",
+        "Median days between billed days and median billed-day volume, shrunk shop → DSR → city so a thin history borrows the beat. Store Y that bills every 15 days is due when it has been ~15 days with no bill. Typical drop is that median invoice — not the next order.",
     ),
     (
         "Cover left",
@@ -36,8 +36,12 @@ GLOSSARY = [
         "max(0, Expected − billed). What the door still owes the month, in KG.",
     ),
     (
+        "Next order",
+        "Predicted size of the next bill from a gradient-boosted model on every historical next-bill (XGBoost; HistGradientBoosting if XGBoost is missing). Features are last / prior drops, how fat the last drop was versus the shop’s own median and AMS, days overdue, leftover cover, MTD billed, and remaining-to-AMS. A fat last drop pulls the next order down; a thin last drop or a long quiet stretch pulls it up. Thin history falls back to the hierarchical median drop.",
+    ),
+    (
         "Ask rest of month",
-        "Typical drops that can still land before month-end, capped at remaining-to-Expected. Not the whole hole: day 22 with 9 days left cannot close 500 MT of full-month miss. Includes doors that are due now and doors that come due before month-end (once-a-month shops that last billed late last month). Zero when leftover cover lasts past month-end, or the door already hit Expected. Printed in KG.",
+        "Predicted next order × how many of those orders can still land before month-end, capped at remaining-to-Expected. Not the median invoice, and not the whole hole. Includes doors that are due now and doors that come due before month-end. Zero when leftover cover lasts past month-end, or the door already hit Expected. Printed in KG.",
     ),
     (
         "Coming due",
