@@ -129,8 +129,8 @@ def build_action_pack(
     shops["value_score"] = _value_score(shops)
     shops = shops.sort_values(["value_score", "week_target_mt", "days_overdue"], ascending=False)
 
-    dist = _roll_units(shops, "distributor", extra_city=True)
-    dsr = _roll_units(shops, "dsr_name", extra_city=True, extra_dist=True)
+    dist = _units_with_work(_roll_units(shops, "distributor", extra_city=True))
+    dsr = _units_with_work(_roll_units(shops, "dsr_name", extra_city=True, extra_dist=True))
     country = _country_row(shops, as_of, days_in_month, days_left, open_mtd, source)
     backtest = backtest_cycles(daily, shop_month, stores, period) if has_daily else pd.DataFrame()
     headline = _headline(country, open_mtd, has_daily)
@@ -647,17 +647,19 @@ def _classify_actions(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
     due = days_since.notna() & (days_since >= cycle * 0.9) & ~has_cover
     material = (remaining >= SHOP_FLOOR_MT) | (drop >= SHOP_FLOOR_MT) | (ams >= SHOP_FLOOR_MT)
     prior3 = pd.to_numeric(out.get("prior3_mt"), errors="coerce").fillna(0)
-    lapse = (days_since.fillna(0) >= (cycle * LAPSE_CYCLES)) & ~has_cover
+    unbilled = billed <= 0.005
+    lapse = (days_since.fillna(0) >= (cycle * LAPSE_CYCLES)) & unbilled & ~has_cover
     lapse = lapse | (
         (trend <= DECLINE_PCT)
         & (prior3 >= SHOP_FLOOR_MT)
-        & (billed <= 0)
+        & unbilled
         & (days_since.fillna(99) >= cycle)
         & ~has_cover
     )
-    short_month = (billed > 0) & (remaining >= SHOP_FLOOR_MT) & (billed < 0.5 * expected.clip(lower=SHOP_FLOOR_MT))
+    short_month = (~unbilled) & (remaining >= SHOP_FLOOR_MT) & (billed < 0.5 * expected.clip(lower=SHOP_FLOOR_MT))
     cycle_again = days_since.fillna(0) >= cycle * 0.8
-    stub = (billed > 0) & (drop > 0) & (billed < 0.4 * drop)
+    just_bought = days_since.fillna(0) < np.maximum(5.0, cycle * 0.5)
+    stub = (~unbilled) & (drop > 0) & (billed < 0.4 * drop) & ~just_bought
     light = short_month & ~has_cover & (cycle_again | stub)
 
     out["action"] = ACTION_HOLD
@@ -693,29 +695,40 @@ def _instruction(row: Any) -> str:
     if action == ACTION_CALL:
         return (
             f"Call {name}. Usually buys every {cycle_s}; it has been {since_s} with no bill. "
-            f"Close about {drop:.2f} MT. Not visited this month.{last_bit}"
+            f"Close about {_kg_text(drop)}. Not visited this month.{last_bit}"
         )
     if action == ACTION_CONVERT:
         return (
             f"{name} was visited and did not buy. Cycle is {cycle_s} and it has been {since_s}. "
-            f"Close {drop:.2f} MT."
+            f"Close {_kg_text(drop)}."
         )
     if action == ACTION_LIFT:
         return (
-            f"{name} billed only {billed:.2f} MT this month versus {expected:.2f} MT Expected. "
-            f"Usual drop {drop:.2f} MT every {cycle_s}; last drop {last_drop:.2f} MT {since_s} ago. "
+            f"{name} billed only {_kg_text(billed)} this month versus {_kg_text(expected)} Expected. "
+            f"Usual drop {_kg_text(drop)} every {cycle_s}; last drop {_kg_text(last_drop)} {since_s} ago. "
             f"Worth another visit."
         )
     if action == ACTION_RECOVER:
+        fading = pd.notna(trend) and float(trend) <= DECLINE_PCT
+        verb = "is fading" if fading else "has been quiet"
         trend_s = f" Last three months are {float(trend)*100:.0f}% versus the three before." if pd.notna(trend) else ""
         return (
-            f"{name} is fading — {since_s} since the last bill (usual cycle {cycle_s}).{trend_s} "
+            f"{name} {verb} — {since_s} since the last bill (usual cycle {cycle_s}).{trend_s} "
             f"Get this door back on the beat.{last_bit}"
         )
     if pd.notna(cover) and float(cover) > COVER_HOLD_DAYS:
-        why = f"Last drop {last_drop:.2f} MT" if last_drop else f"Last month {last_month:.1f} MT versus AMS {ams:.1f}"
+        why = f"Last drop {_kg_text(last_drop)}" if last_drop else f"Last month {_kg_text(last_month)} versus AMS {_kg_text(ams)}"
         return f"Hold {name}. {why} — {cover_s}. Do not pull the beat here.{last_bit}"
     return f"{name} is inside its {cycle_s} cycle ({since_s} since last bill). Leave it."
+
+
+def _kg_text(mt: Any) -> str:
+    try:
+        if mt is None or pd.isna(mt):
+            return "0 KG"
+        return f"{int(round(float(mt) * 1000)):,} KG"
+    except (TypeError, ValueError):
+        return "0 KG"
 
 
 def _ask_mt(shops: pd.DataFrame) -> pd.Series:
@@ -757,7 +770,7 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
         instruction = (
             f"Push {name}: {n_call} due and unvisited, {n_convert} due but already visited, "
             f"{n_lift} need another visit (light this month), {n_lapse} lapsing. "
-            f"Ask {week:.1f} MT this week."
+            f"Ask {_kg_text(week)} this week."
         )
         row = {
             "grain_id": str(name),
@@ -766,6 +779,7 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
             "n_lift": n_lift,
             "n_lapse": n_lapse,
             "n_hold": int((g["action"] == ACTION_HOLD).sum()),
+            "ams_3m": float(pd.to_numeric(g["ams_3m"], errors="coerce").fillna(0).sum()) if "ams_3m" in g.columns else 0.0,
             "billed_mt": float(g["billed_mt"].sum()),
             "expected_mt": float(g["expected_mt"].sum()),
             "should_have_mt": float(g["expected_mt"].sum()),
@@ -783,10 +797,23 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
     return pd.DataFrame(rows).sort_values(["value_score", "week_target_mt"], ascending=False).reset_index(drop=True)
 
 
+def _units_with_work(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    work = (
+        pd.to_numeric(df.get("n_call"), errors="coerce").fillna(0)
+        + pd.to_numeric(df.get("n_convert"), errors="coerce").fillna(0)
+        + pd.to_numeric(df.get("n_lift"), errors="coerce").fillna(0)
+        + pd.to_numeric(df.get("n_lapse"), errors="coerce").fillna(0)
+    )
+    return df.loc[work > 0].copy()
+
+
 def _country_row(shops: pd.DataFrame, as_of: int, days: int, days_left: int, open_mtd: bool, source: str) -> dict[str, Any]:
     return {
         "billed_mt": float(shops["billed_mt"].sum()),
         "expected_mt": float(shops["expected_mt"].sum()),
+        "ams_3m": float(pd.to_numeric(shops.get("ams_3m"), errors="coerce").fillna(0).sum()),
         "should_have_mt": float(shops["expected_mt"].sum()),
         "behind_pace_mt": float(shops["remaining_mt"].sum()),
         "remaining_mt": float(shops["remaining_mt"].sum()),
@@ -813,12 +840,12 @@ def _headline(country: dict[str, Any], open_mtd: bool, has_daily: bool) -> str:
     if not has_daily:
         return (
             f"No billed days in the warehouse — cycles fall back to monthly gaps. "
-            f"{n_call} due, {n_convert} due and already visited, {n_lift} another visit, {n_lapse} lapsing ({week:.0f} MT)."
+            f"{n_call} due, {n_convert} due and already visited, {n_lift} another visit, {n_lapse} lapsing ({_kg_text(week)})."
         )
     when = f"Day {country.get('as_of_day')}/{country.get('days_in_month')}" if open_mtd else "Month closed"
     return (
         f"{when}: {n_call} shops are due and unvisited, {n_convert} due but already seen, "
-        f"{n_lift} bought too little and need another visit, {n_lapse} are lapsing ({week:.0f} MT to ask)."
+        f"{n_lift} bought too little and need another visit, {n_lapse} are lapsing ({_kg_text(week)} to ask)."
     )
 
 
@@ -827,10 +854,11 @@ def _take_action(shops: pd.DataFrame, action: str, n: int) -> pd.DataFrame:
 
 
 COUNTRY_VIEW = [
-    ("billed_mt", "Billed (MT)"),
-    ("expected_mt", "Expected this month (MT)"),
-    ("remaining_mt", "Still to Expected (MT)"),
-    ("week_target_mt", "Ask this week (MT)"),
+    ("billed_mt", "Billed (KG)"),
+    ("expected_mt", "Expected this month (KG)"),
+    ("ams_3m", "AMS (KG)"),
+    ("remaining_mt", "Still to Expected (KG)"),
+    ("week_target_mt", "Ask this week (KG)"),
     ("as_of_day", "As of day"),
     ("days_left", "Days left"),
     ("n_call", "Due · unvisited"),
@@ -846,20 +874,34 @@ SHOP_VIEW = [
     ("distributor", "Distributor"),
     ("dsr_name", "DSR"),
     ("action", "Action"),
-    ("week_target_mt", "Ask (MT)"),
+    ("week_target_mt", "Ask (KG)"),
+    ("ams_3m", "AMS (KG)"),
     ("days_since_bill", "Days since bill"),
     ("cycle_days", "Usual cycle (days)"),
     ("days_overdue", "Days overdue"),
     ("cover_left_days", "Cover left (days)"),
-    ("last_drop_mt", "Last drop (MT)"),
-    ("typical_drop_mt", "Typical drop (MT)"),
-    ("billed_mt", "Billed (MT)"),
-    ("expected_mt", "Expected (MT)"),
-    ("last_month_mt", "Last month (MT)"),
+    ("last_drop_mt", "Last drop (KG)"),
+    ("typical_drop_mt", "Typical drop (KG)"),
+    ("billed_mt", "Billed (KG)"),
+    ("expected_mt", "Expected (KG)"),
+    ("last_month_mt", "Last month (KG)"),
     ("trend_pct", "Trend vs prior 3m"),
     ("last_bill_date", "Last billed"),
     ("call_status", "Call"),
     ("instruction", "Do this"),
+]
+
+SHOP_PDF_COLS = [
+    "Shop",
+    "City",
+    "DSR",
+    "Action",
+    "Ask (KG)",
+    "AMS (KG)",
+    "Days since bill",
+    "Usual cycle (days)",
+    "Cover left (days)",
+    "Do this",
 ]
 
 UNIT_VIEW_DIST = [
@@ -869,8 +911,9 @@ UNIT_VIEW_DIST = [
     ("n_convert", "Due · visited"),
     ("n_lift", "Another visit"),
     ("n_lapse", "Lapsing"),
-    ("week_target_mt", "Ask this week (MT)"),
-    ("remaining_mt", "Still to Expected (MT)"),
+    ("ams_3m", "AMS (KG)"),
+    ("week_target_mt", "Ask this week (KG)"),
+    ("remaining_mt", "Still to Expected (KG)"),
     ("instruction", "Do this"),
 ]
 
@@ -882,18 +925,18 @@ UNIT_VIEW_DSR = [
     ("n_convert", "Due · visited"),
     ("n_lift", "Another visit"),
     ("n_lapse", "Lapsing"),
-    ("week_target_mt", "Ask this week (MT)"),
+    ("ams_3m", "AMS (KG)"),
+    ("week_target_mt", "Ask this week (KG)"),
     ("instruction", "Do this"),
 ]
 
 BACKTEST_VIEW = [
     ("n_months", "Closed months tested"),
     ("cut_day", "Cut day"),
-    ("due_precision", "Due precision"),
-    ("baseline_precision", "Random precision"),
+    ("due_precision", "Due precision %"),
+    ("baseline_precision", "Random precision %"),
     ("n_loaded_hold", "Loaded left alone"),
     ("n_loaded_quiet", "Of those, stayed quiet"),
-    ("notes", "How to read"),
 ]
 
 
@@ -901,49 +944,41 @@ def _present(df: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=[label for _, label in view])
     out = {}
-    mt_int = {
-        "Billed (MT)",
-        "Expected this month (MT)",
-        "Still to Expected (MT)",
-        "Ask this week (MT)",
-        "Expected (MT)",
-        "Last month (MT)",
-        "Ask (MT)",
+    kg_cols = {
+        "Billed (KG)",
+        "Expected this month (KG)",
+        "Still to Expected (KG)",
+        "Ask this week (KG)",
+        "Expected (KG)",
+        "Last month (KG)",
+        "Ask (KG)",
+        "AMS (KG)",
+        "Last drop (KG)",
+        "Typical drop (KG)",
     }
     for src, label in view:
         if src not in df.columns:
             out[label] = [None] * len(df)
             continue
         col = df[src]
-        if label in mt_int:
-            out[label] = [_round_mt(v) for v in col]
-        elif label in {"Last drop (MT)", "Typical drop (MT)"}:
-            out[label] = [_round_drop(v) for v in col]
+        if label in kg_cols:
+            out[label] = [_round_kg(v) for v in col]
         elif label in {"Usual cycle (days)", "Days since bill", "Days overdue", "Cover left (days)"}:
             out[label] = [None if pd.isna(v) else int(round(float(v))) for v in col]
         elif label == "Trend vs prior 3m":
             out[label] = [None if pd.isna(v) else int(round(float(v) * 100)) for v in col]
-        elif label in {"Due precision", "Random precision"}:
-            out[label] = [None if pd.isna(v) else round(float(v) * 100) for v in col]
+        elif label in {"Due precision %", "Random precision %"}:
+            out[label] = [None if pd.isna(v) else int(round(float(v) * 100)) for v in col]
         else:
             out[label] = list(col)
     return pd.DataFrame(out)
 
 
-def _round_mt(value: Any) -> Any:
+def _round_kg(value: Any) -> Any:
     try:
         if value is None or pd.isna(value):
             return None
-        return int(round(float(value)))
-    except (TypeError, ValueError):
-        return None
-
-
-def _round_drop(value: Any) -> Any:
-    try:
-        if value is None or pd.isna(value):
-            return None
-        return round(float(value), 2)
+        return int(round(float(value) * 1000))
     except (TypeError, ValueError):
         return None
 
@@ -974,7 +1009,7 @@ def _present_units(df: pd.DataFrame, grain: str) -> pd.DataFrame:
 def _present_backtest(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=[l for _, l in BACKTEST_VIEW])
-    if "How to read" in df.columns or "Due precision" in df.columns:
+    if "Due precision %" in df.columns or "Due precision" in df.columns:
         return df
     return _present(df, BACKTEST_VIEW)
 
@@ -1051,6 +1086,7 @@ def _raw_units_to_sql(df: pd.DataFrame, period: str, grain: str) -> pd.DataFrame
         "n_lift",
         "n_lapse",
         "n_hold",
+        "ams_3m",
         "billed_mt",
         "expected_mt",
         "should_have_mt",
@@ -1069,8 +1105,14 @@ def _raw_units_to_sql(df: pd.DataFrame, period: str, grain: str) -> pd.DataFrame
 def _backtest_to_sql(df: pd.DataFrame, period: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    if "Due precision" in df.columns:
+    if "Due precision %" in df.columns or "Due precision" in df.columns:
         row = df.iloc[0]
+        due = row.get("Due precision %")
+        if due is None:
+            due = row.get("Due precision")
+        rnd = row.get("Random precision %")
+        if rnd is None:
+            rnd = row.get("Random precision")
         return pd.DataFrame(
             [
                 {
@@ -1078,8 +1120,8 @@ def _backtest_to_sql(df: pd.DataFrame, period: str) -> pd.DataFrame:
                     "cut_day": row.get("Cut day"),
                     "n_months": row.get("Closed months tested"),
                     "n_shops": None,
-                    "curve_precision_at_50": (row.get("Due precision") or 0) / 100.0 if row.get("Due precision") is not None else None,
-                    "calendar_precision_at_50": (row.get("Random precision") or 0) / 100.0 if row.get("Random precision") is not None else None,
+                    "curve_precision_at_50": (due or 0) / 100.0 if due is not None else None,
+                    "calendar_precision_at_50": (rnd or 0) / 100.0 if rnd is not None else None,
                     "curve_catch_mt": None,
                     "calendar_catch_mt": None,
                     "n_backloaded_hold": row.get("Loaded left alone"),
@@ -1129,6 +1171,7 @@ def _brief_to_sql(pack: ActionPack) -> dict[str, Any]:
         "days_left": pack.days_left,
         "billed_mt": b.get("billed_mt"),
         "expected_mt": b.get("expected_mt"),
+        "ams_3m": b.get("ams_3m"),
         "should_have_mt": b.get("should_have_mt"),
         "behind_pace_mt": b.get("behind_pace_mt"),
         "remaining_mt": b.get("remaining_mt"),

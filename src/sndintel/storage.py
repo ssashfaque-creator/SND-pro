@@ -438,6 +438,7 @@ CREATE TABLE IF NOT EXISTS action_units (
     n_lift INTEGER,
     n_lapse INTEGER,
     n_hold INTEGER,
+    ams_3m REAL,
     billed_mt REAL,
     expected_mt REAL,
     should_have_mt REAL,
@@ -474,6 +475,7 @@ CREATE TABLE IF NOT EXISTS action_brief (
     days_left INTEGER,
     billed_mt REAL,
     expected_mt REAL,
+    ams_3m REAL,
     should_have_mt REAL,
     behind_pace_mt REAL,
     remaining_mt REAL,
@@ -589,7 +591,9 @@ def init_db(path: Optional[Path] = None) -> Path:
         ):
             _ensure_column(conn, "action_shops", col, ddl)
         _ensure_column(conn, "action_units", "n_lapse", "INTEGER")
+        _ensure_column(conn, "action_units", "ams_3m", "REAL")
         _ensure_column(conn, "action_brief", "n_lapse", "INTEGER")
+        _ensure_column(conn, "action_brief", "ams_3m", "REAL")
     return db_path
 
 

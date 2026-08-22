@@ -11,7 +11,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.worksheet import Worksheet
 
-from sndintel.action import ActionPack
+from sndintel.action import SHOP_PDF_COLS, ActionPack
 from sndintel.briefing import NAVY, SLATE, _excel_value, _sheet_table
 
 GLOSSARY = [
@@ -21,23 +21,27 @@ GLOSSARY = [
     ),
     (
         "Usual cycle / typical drop",
-        "Median days between billed days and median billed-day tonnes, shrunk shop → DSR → city so a thin history borrows the beat. Store Y that bills every 15 days is due when it has been ~15 days with no bill.",
+        "Median days between billed days and median billed-day volume, shrunk shop → DSR → city so a thin history borrows the beat. Store Y that bills every 15 days is due when it has been ~15 days with no bill. Volumes print in KG.",
     ),
     (
         "Cover left",
         "Last drop ÷ daily run-rate, minus days since that bill. If last month was ≥1.6× AMS (two months of stock), leftover cover uses last-month volume instead — that door is less likely to buy now.",
     ),
     (
+        "AMS",
+        "Average of the three closed calendar months before this period (May + June + July when scoring August). Full-month run-rate, in KG. On every table so you can see the book next to the ask.",
+    ),
+    (
         "Still to Expected",
-        "max(0, Expected − billed). What the door still owes the month.",
+        "max(0, Expected − billed). What the door still owes the month, in KG.",
     ),
     (
         "Ask this week",
-        "Typical drop for Due / Due · visited / Lapsing. Remaining-to-Expected for Another visit. Zero on Hold.",
+        "Typical drop for Due / Due · visited / Lapsing. Remaining-to-Expected for Another visit. Zero on Hold. Printed in KG so a 140 KG order does not round to 0.",
     ),
     (
         "Due / Due · visited / Another visit / Lapsing / Hold",
-        "Due = cycle has elapsed, cover is gone, nobody visited. Due · visited = same, but the beat already called and still no bill. Another visit = billed this month but too little, and the cycle says they should have bought again. Lapsing = two cycles quiet, or declining last-3 vs prior-3 and unbilled this cycle. Hold = leftover cover — do not pull the beat.",
+        "Due = cycle has elapsed, cover is gone, nobody visited. Due · visited = same, but the beat already called and still no bill. Another visit = billed this month but too little, and the cycle says they should have bought again (not a drop from yesterday). Lapsing = two cycles with no bill this month, or declining last-3 vs prior-3 and unbilled this cycle. Hold = leftover cover — do not pull the beat.",
     ),
     (
         "Backtest",
@@ -51,12 +55,12 @@ def how_to_read(pack: ActionPack, detailed: bool = False) -> list[str]:
     if detailed:
         return [
             f"{day}. Full lists — every AMS > 0 distributor, DSR, and shop the engine scored.",
-            "Distributors ranked by this-week ask tonnes (not Gap tons).",
+            "Distributors ranked by this-week ask KG (not Gap tons).",
             "DSRs ranked the same way.",
             "Every shop with an action. Do this names the door and why it is due, light, lapsing, or hold.",
         ]
     return [
-        f"{day}. Country: billed vs Expected vs still-to-Expected vs this week's ask.",
+        f"{day}. Country: billed vs AMS vs Expected vs this week's ask, all in KG.",
         "One distributor push list — how many doors are due, need another visit, or are lapsing.",
         "One DSR push list — ride-with names, not nested under the distributors.",
         "Due — cycle elapsed, no leftover cover, not visited this month.",
@@ -164,9 +168,9 @@ def write_excel(pack: ActionPack, path: Path | str | BytesIO, detailed: bool = F
     _cover(wb, pack, detailed=detailed)
     for sheet, heading, note, df in iter_action_sheets(pack, detailed=detailed):
         kwargs: dict[str, Any] = {}
-        if sheet.startswith("02") and df is not None and not df.empty and "Ask this week (MT)" in df.columns:
+        if sheet.startswith("02") and df is not None and not df.empty and "Ask this week (KG)" in df.columns:
             cat = "Distributor" if "Distributor" in df.columns else "DSR"
-            kwargs = dict(bar_col="Ask this week (MT)", cat_col=cat)
+            kwargs = dict(bar_col="Ask this week (KG)", cat_col=cat)
         _sheet_table(wb, sheet, heading, note, df, **kwargs)
     if path is not None:
         wb.save(path)
@@ -293,9 +297,11 @@ def _pdf_table(df: pd.DataFrame, style) -> Any:
     if df is None or df.empty:
         return Paragraph("No rows at this layer.", style)
     show = df.copy()
-    if "Do this" in show.columns:
+    if "Shop" in show.columns and any(c in show.columns for c in SHOP_PDF_COLS):
+        keep = [c for c in SHOP_PDF_COLS if c in show.columns]
+        show = show[keep]
+    elif "Do this" in show.columns:
         keep = [c for c in show.columns if c != "Do this"]
-        # Instruction is the point of the pack — keep it, but wrap.
         keep = keep[:8] + (["Do this"] if "Do this" in show.columns else [])
         show = show[keep]
     elif len(show.columns) > 10:

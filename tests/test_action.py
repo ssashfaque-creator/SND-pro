@@ -206,9 +206,14 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
 
     assert "Due Mart" in str(raw.loc["DUE1", "instruction"])
     assert "not visited" in str(raw.loc["DUE1", "instruction"]).lower()
+    assert "KG" in str(raw.loc["DUE1", "instruction"])
     assert "another visit" in str(raw.loc["LITE1", "instruction"]).lower()
     assert "Hold Mart" in str(raw.loc["HOLD1", "instruction"])
     assert pack.source == "cycle"
+    assert "Ask (KG)" in pack.calls.columns
+    assert "AMS (KG)" in pack.calls.columns
+    assert "AMS (KG)" in pack.dsrs.columns
+    assert int(pack.calls.loc[pack.calls["Shop"] == "Due Mart", "Ask (KG)"].iloc[0]) == 1000
 
     assert "Due Mart" in set(pack.calls["Shop"].astype(str))
     assert "Visited Mart" in set(pack.converts["Shop"].astype(str))
@@ -234,6 +239,9 @@ def test_dsr_instruction_names_counts_and_tonnes():
     assert row["DSR"] == "Amir"
     assert "Push Amir" in str(row["Do this"])
     assert "this week" in str(row["Do this"]).lower()
+    assert "KG" in str(row["Do this"])
+    assert "Ask this week (KG)" in pack.dsrs.columns
+    assert "AMS (KG)" in pack.country.columns
 
 
 def test_action_workbook_has_due_another_visit_and_lapsing():
@@ -260,11 +268,47 @@ def test_action_workbook_has_due_another_visit_and_lapsing():
     wb_d = load_workbook(BytesIO(detailed))
     assert "04 Shops" in wb_d.sheetnames
     assert pack.backtest is not None
-    if not pack.backtest.empty and "Due precision" in pack.backtest.columns:
-        due_p = pack.backtest.iloc[0]["Due precision"]
-        rnd = pack.backtest.iloc[0]["Random precision"]
-        assert due_p is None or rnd is None or float(due_p) >= float(rnd) - 5
+    if not pack.backtest.empty:
+        due_col = "Due precision %" if "Due precision %" in pack.backtest.columns else "Due precision"
+        rnd_col = "Random precision %" if "Random precision %" in pack.backtest.columns else "Random precision"
+        if due_col in pack.backtest.columns and rnd_col in pack.backtest.columns:
+            due_p = pack.backtest.iloc[0][due_col]
+            rnd = pack.backtest.iloc[0][rnd_col]
+            assert due_p is None or rnd is None or float(due_p) >= float(rnd) - 5
+
+    assert (pack.dsrs["Due"] + pack.dsrs["Due · visited"] + pack.dsrs["Another visit"] + pack.dsrs["Lapsing"]).gt(0).all()
 
 
 def test_period_key_stable():
     assert period_key(2026, 8) == "2026-08"
+
+
+def test_billed_this_month_is_not_lapsing():
+    """An 8-day cycle that last billed on 5 Aug is another visit on the 22nd, not lapsing."""
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    city, dist, dsr = "Karachi", "Eva Foods", "Amir"
+    extra_days = []
+    for d in _cycle_dates(date(2026, 8, 5), 8, 16):
+        extra_days.append(_bill("AGAIN1", "Again Mart", city, dist, dsr, d, 1.0))
+    shop_day = pd.concat([shop_day, pd.DataFrame(extra_days)], ignore_index=True)
+    shop_month = pd.concat([shop_month, pd.DataFrame(_months_from_days(extra_days))], ignore_index=True)
+    stores = pd.concat([stores, pd.DataFrame([_attrs("AGAIN1", "Again Mart")])], ignore_index=True)
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    raw = pack.raw_shops.set_index("store_id")
+    assert raw.loc["AGAIN1", "action"] == ACTION_LIFT
+    assert raw.loc["AGAIN1", "action"] != ACTION_RECOVER
+
+
+def test_yesterdays_stub_is_not_another_visit():
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    city, dist, dsr = "Karachi", "Eva Foods", "Amir"
+    extra_days = []
+    for d in _cycle_dates(date(2026, 7, 25), 15, 16):
+        extra_days.append(_bill("STUB1", "Stub Mart", city, dist, dsr, d, 1.0))
+    extra_days.append(_bill("STUB1", "Stub Mart", city, dist, dsr, date(2026, 8, 21), 0.05))
+    shop_day = pd.concat([shop_day, pd.DataFrame(extra_days)], ignore_index=True)
+    shop_month = pd.concat([shop_month, pd.DataFrame(_months_from_days(extra_days))], ignore_index=True)
+    stores = pd.concat([stores, pd.DataFrame([_attrs("STUB1", "Stub Mart")])], ignore_index=True)
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    raw = pack.raw_shops.set_index("store_id")
+    assert raw.loc["STUB1", "action"] == ACTION_HOLD
