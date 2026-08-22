@@ -16,7 +16,7 @@ from sndintel.action import (
     SHOP_FLOOR_MT,
     build_action_pack,
 )
-from sndintel.action_report import excel_bytes, iter_action_sheets
+from sndintel.action_report import excel_bytes, iter_action_sheets, pdf_bytes, pdf_columns
 from sndintel.io_utils import period_key, shift_period
 
 
@@ -210,13 +210,16 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     assert "another visit" in str(raw.loc["LITE1", "instruction"]).lower()
     assert "Hold Mart" in str(raw.loc["HOLD1", "instruction"])
     assert pack.source == "cycle"
-    assert "Ask (KG)" in pack.calls.columns
+    assert "Ask rest of month (KG)" in pack.calls.columns
     assert "Billed (KG)" in pack.calls.columns
     assert "AMS (KG)" in pack.calls.columns
     assert "Billed (KG)" in pack.dsrs.columns
     assert "AMS (KG)" in pack.dsrs.columns
     assert "Billed (KG)" in pack.distributors.columns
-    assert int(pack.calls.loc[pack.calls["Shop"] == "Due Mart", "Ask (KG)"].iloc[0]) == 1000
+    assert "Doors" in pack.distributors.columns
+    assert "Doors" in pack.country.columns
+    assert "Lapsing" in pack.country.columns
+    assert int(pack.calls.loc[pack.calls["Shop"] == "Due Mart", "Ask rest of month (KG)"].iloc[0]) == 1000
 
     assert "Due Mart" in set(pack.calls["Shop"].astype(str))
     assert "Visited Mart" in set(pack.converts["Shop"].astype(str))
@@ -241,9 +244,11 @@ def test_dsr_instruction_names_counts_and_tonnes():
     row = pack.dsrs.iloc[0]
     assert row["DSR"] == "Amir"
     assert "Push Amir" in str(row["Do this"])
-    assert "this week" in str(row["Do this"]).lower()
+    assert "rest of the month" in str(row["Do this"]).lower()
+    assert "doors to work" in str(row["Do this"]).lower()
     assert "KG" in str(row["Do this"])
-    assert "Ask this week (KG)" in pack.dsrs.columns
+    assert "Ask rest of month (KG)" in pack.dsrs.columns
+    assert "Ask rest of month (KG)" in pack.country.columns
     assert "AMS (KG)" in pack.country.columns
 
 
@@ -315,3 +320,54 @@ def test_yesterdays_stub_is_not_another_visit():
     pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
     raw = pack.raw_shops.set_index("store_id")
     assert raw.loc["STUB1", "action"] == ACTION_HOLD
+
+
+def test_another_visit_ask_is_next_drop_not_the_expected_hole():
+    """A hypermarket that billed a stub still owes ~7 MT. Ask is one more drop, not the hole."""
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    city, dist, dsr = "Karachi", "Eva Foods", "Amir"
+    extra_days = []
+    for d, vol in (
+        (date(2026, 5, 6), 4.0),
+        (date(2026, 5, 21), 4.0),
+        (date(2026, 6, 6), 4.0),
+        (date(2026, 6, 21), 4.0),
+        (date(2026, 7, 6), 4.0),
+        (date(2026, 7, 21), 4.0),
+        (date(2026, 8, 6), 0.4),
+    ):
+        extra_days.append(_bill("HOLE1", "Hole Mart", city, dist, dsr, d, vol))
+    shop_day = pd.concat([shop_day, pd.DataFrame(extra_days)], ignore_index=True)
+    shop_month = pd.concat([shop_month, pd.DataFrame(_months_from_days(extra_days))], ignore_index=True)
+    stores = pd.concat([stores, pd.DataFrame([_attrs("HOLE1", "Hole Mart")])], ignore_index=True)
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    raw = pack.raw_shops.set_index("store_id")
+    assert raw.loc["HOLE1", "action"] == ACTION_LIFT
+    remaining = float(raw.loc["HOLE1", "remaining_mt"])
+    drop = float(raw.loc["HOLE1", "typical_drop_mt"])
+    ask = float(raw.loc["HOLE1", "week_target_mt"])
+    assert remaining > 6.0
+    assert ask <= drop + 0.05
+    assert ask < remaining - 1.0
+    assert ask >= SHOP_FLOOR_MT
+
+
+def test_pdf_keeps_ask_rest_of_month_and_lapsing():
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    country_cols = pdf_columns(pack.country)
+    dist_cols = pdf_columns(pack.distributors)
+    dsr_cols = pdf_columns(pack.dsrs)
+    shop_cols = pdf_columns(pack.calls)
+    assert "Ask rest of month (KG)" in country_cols
+    assert "Lapsing" in country_cols
+    assert "Doors" in country_cols
+    assert "Ask rest of month (KG)" in dist_cols
+    assert "Doors" in dist_cols
+    assert "Ask rest of month (KG)" in dsr_cols
+    assert "Ask rest of month (KG)" in shop_cols
+    raw = pdf_bytes(pack)
+    assert raw[:5] == b"%PDF-"
+    text = raw.decode("latin-1", errors="ignore")
+    assert "Ask rest of month" in text
+    assert "Lapsing" in text

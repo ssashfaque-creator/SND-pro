@@ -125,7 +125,7 @@ def build_action_pack(
     shops["behind_pace_mt"] = shops["light_mt"]
     shops = _attach_calls(shops, visits, period)
     shops = _classify_actions(shops, open_mtd)
-    shops["week_target_mt"] = _ask_mt(shops)
+    shops["week_target_mt"] = _ask_mt(shops, days_left, open_mtd, days_in_month)
     shops["value_score"] = _value_score(shops)
     shops = shops.sort_values(["value_score", "week_target_mt", "days_overdue"], ascending=False)
 
@@ -523,7 +523,7 @@ def _shop_frame(
         return pd.DataFrame()
     out = expected.copy()
     out["billed_mt"] = out["store_id"].map(billed).fillna(0.0)
-    out = out[(out["ams_3m"] > 0) | (out["expected_mt"] >= SHOP_FLOOR_MT)]
+    out = out[pd.to_numeric(out["ams_3m"], errors="coerce").fillna(0) > 0]
     attrs = _latest_attrs(shop_month, stores, period)
     if not attrs.empty:
         out = out.merge(attrs, on="store_id", how="left")
@@ -731,10 +731,36 @@ def _kg_text(mt: Any) -> str:
         return "0 KG"
 
 
-def _ask_mt(shops: pd.DataFrame) -> pd.Series:
+def _ask_mt(
+    shops: pd.DataFrame,
+    days_left: int = 0,
+    open_mtd: bool = True,
+    days_in_month: int = 31,
+) -> pd.Series:
+    """What those doors can still close before month-end — not the whole Expected hole.
+
+    Another visit already used one drop this month, so the ask is the next
+    typical drop (or two if another cycle still fits). A fat typical-drop prior
+    cannot ask for a full month of AMS when only a stub of days remains.
+    """
     drop = pd.to_numeric(shops["typical_drop_mt"], errors="coerce").fillna(0)
-    light = pd.to_numeric(shops["remaining_mt"], errors="coerce").fillna(0)
-    ask = drop.where(shops["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_RECOVER}), light)
+    remaining = pd.to_numeric(shops["remaining_mt"], errors="coerce").fillna(0)
+    ams = pd.to_numeric(shops.get("ams_3m"), errors="coerce").fillna(0)
+    cycle = pd.to_numeric(shops.get("cycle_days"), errors="coerce").replace(0, np.nan).fillna(30).clip(lower=1)
+    days = max(int(days_left), 0)
+    month = max(int(days_in_month), 1)
+    if open_mtd and days > 0:
+        n_orders = np.floor(np.maximum(days - 1, 0) / cycle) + 1.0
+        n_orders = n_orders.clip(lower=1, upper=3)
+    else:
+        n_orders = pd.Series(1.0, index=shops.index)
+    already = shops["action"].eq(ACTION_LIFT)
+    n_orders = np.where(already, np.maximum(1.0, n_orders - 1.0), n_orders)
+    closable = drop * n_orders
+    ams_rest = ams * (days / month) if open_mtd else ams
+    closable = np.minimum(closable, np.maximum(drop, ams_rest))
+    hole = remaining.where(remaining > 0, closable)
+    ask = pd.Series(np.minimum(hole, closable), index=shops.index)
     ask = ask.where(shops["action"] != ACTION_HOLD, 0.0)
     return ask.clip(lower=0)
 
@@ -767,13 +793,16 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
         n_lift = int((g["action"] == ACTION_LIFT).sum())
         n_lapse = int((g["action"] == ACTION_RECOVER).sum())
         week = float(g["week_target_mt"].sum())
+        n_doors = n_call + n_convert + n_lift + n_lapse
         instruction = (
-            f"Push {name}: {n_call} due and unvisited, {n_convert} due but already visited, "
-            f"{n_lift} need another visit (light this month), {n_lapse} lapsing. "
-            f"Ask {_kg_text(week)} this week."
+            f"Push {name}: {n_doors} doors to work "
+            f"({n_call} due and unvisited, {n_convert} due but already visited, "
+            f"{n_lift} another visit, {n_lapse} lapsing). "
+            f"Ask {_kg_text(week)} for the rest of the month."
         )
         row = {
             "grain_id": str(name),
+            "n_doors": n_doors,
             "n_call": n_call,
             "n_convert": n_convert,
             "n_lift": n_lift,
@@ -827,6 +856,7 @@ def _country_row(shops: pd.DataFrame, as_of: int, days: int, days_left: int, ope
         "n_lift": int((shops["action"] == ACTION_LIFT).sum()),
         "n_lapse": int((shops["action"] == ACTION_RECOVER).sum()),
         "n_hold": int((shops["action"] == ACTION_HOLD).sum()),
+        "n_doors": int((shops["action"] != ACTION_HOLD).sum()),
         "source": source,
     }
 
@@ -840,12 +870,13 @@ def _headline(country: dict[str, Any], open_mtd: bool, has_daily: bool) -> str:
     if not has_daily:
         return (
             f"No billed days in the warehouse — cycles fall back to monthly gaps. "
-            f"{n_call} due, {n_convert} due and already visited, {n_lift} another visit, {n_lapse} lapsing ({_kg_text(week)})."
+            f"{n_call} due, {n_convert} due and already visited, {n_lift} another visit, {n_lapse} lapsing "
+            f"({_kg_text(week)} for the rest of the month)."
         )
     when = f"Day {country.get('as_of_day')}/{country.get('days_in_month')}" if open_mtd else "Month closed"
     return (
-        f"{when}: {n_call} shops are due and unvisited, {n_convert} due but already seen, "
-        f"{n_lift} bought too little and need another visit, {n_lapse} are lapsing ({_kg_text(week)} to ask)."
+        f"{when}: {n_call} due and unvisited, {n_convert} due but already seen, "
+        f"{n_lift} another visit, {n_lapse} lapsing — {_kg_text(week)} to ask for the rest of the month."
     )
 
 
@@ -858,9 +889,10 @@ COUNTRY_VIEW = [
     ("expected_mt", "Expected this month (KG)"),
     ("ams_3m", "AMS (KG)"),
     ("remaining_mt", "Still to Expected (KG)"),
-    ("week_target_mt", "Ask this week (KG)"),
+    ("week_target_mt", "Ask rest of month (KG)"),
     ("as_of_day", "As of day"),
     ("days_left", "Days left"),
+    ("n_doors", "Doors"),
     ("n_call", "Due · unvisited"),
     ("n_convert", "Due · visited"),
     ("n_lift", "Another visit"),
@@ -874,7 +906,7 @@ SHOP_VIEW = [
     ("distributor", "Distributor"),
     ("dsr_name", "DSR"),
     ("action", "Action"),
-    ("week_target_mt", "Ask (KG)"),
+    ("week_target_mt", "Ask rest of month (KG)"),
     ("billed_mt", "Billed (KG)"),
     ("ams_3m", "AMS (KG)"),
     ("days_since_bill", "Days since bill"),
@@ -896,7 +928,7 @@ SHOP_PDF_COLS = [
     "City",
     "DSR",
     "Action",
-    "Ask (KG)",
+    "Ask rest of month (KG)",
     "Billed (KG)",
     "AMS (KG)",
     "Days since bill",
@@ -905,16 +937,60 @@ SHOP_PDF_COLS = [
     "Do this",
 ]
 
+COUNTRY_PDF_COLS = [
+    "Billed (KG)",
+    "Expected this month (KG)",
+    "AMS (KG)",
+    "Still to Expected (KG)",
+    "Ask rest of month (KG)",
+    "As of day",
+    "Days left",
+    "Doors",
+    "Due · unvisited",
+    "Due · visited",
+    "Another visit",
+    "Lapsing",
+]
+
+DIST_PDF_COLS = [
+    "Distributor",
+    "City",
+    "Doors",
+    "Due",
+    "Due · visited",
+    "Another visit",
+    "Lapsing",
+    "AMS (KG)",
+    "Billed (KG)",
+    "Ask rest of month (KG)",
+    "Do this",
+]
+
+DSR_PDF_COLS = [
+    "DSR",
+    "City",
+    "Doors",
+    "Due",
+    "Due · visited",
+    "Another visit",
+    "Lapsing",
+    "AMS (KG)",
+    "Billed (KG)",
+    "Ask rest of month (KG)",
+    "Do this",
+]
+
 UNIT_VIEW_DIST = [
     ("grain_id", "Distributor"),
     ("city", "City"),
+    ("n_doors", "Doors"),
     ("n_call", "Due"),
     ("n_convert", "Due · visited"),
     ("n_lift", "Another visit"),
     ("n_lapse", "Lapsing"),
     ("ams_3m", "AMS (KG)"),
     ("billed_mt", "Billed (KG)"),
-    ("week_target_mt", "Ask this week (KG)"),
+    ("week_target_mt", "Ask rest of month (KG)"),
     ("remaining_mt", "Still to Expected (KG)"),
     ("instruction", "Do this"),
 ]
@@ -923,13 +999,14 @@ UNIT_VIEW_DSR = [
     ("grain_id", "DSR"),
     ("city", "City"),
     ("distributor", "Distributor"),
+    ("n_doors", "Doors"),
     ("n_call", "Due"),
     ("n_convert", "Due · visited"),
     ("n_lift", "Another visit"),
     ("n_lapse", "Lapsing"),
     ("ams_3m", "AMS (KG)"),
     ("billed_mt", "Billed (KG)"),
-    ("week_target_mt", "Ask this week (KG)"),
+    ("week_target_mt", "Ask rest of month (KG)"),
     ("instruction", "Do this"),
 ]
 
@@ -951,10 +1028,9 @@ def _present(df: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
         "Billed (KG)",
         "Expected this month (KG)",
         "Still to Expected (KG)",
-        "Ask this week (KG)",
+        "Ask rest of month (KG)",
         "Expected (KG)",
         "Last month (KG)",
-        "Ask (KG)",
         "AMS (KG)",
         "Last drop (KG)",
         "Typical drop (KG)",
@@ -1089,6 +1165,7 @@ def _raw_units_to_sql(df: pd.DataFrame, period: str, grain: str) -> pd.DataFrame
         "n_lift",
         "n_lapse",
         "n_hold",
+        "n_doors",
         "ams_3m",
         "billed_mt",
         "expected_mt",
@@ -1183,6 +1260,7 @@ def _brief_to_sql(pack: ActionPack) -> dict[str, Any]:
         "n_convert": b.get("n_convert"),
         "n_lift": b.get("n_lift"),
         "n_lapse": b.get("n_lapse"),
+        "n_doors": b.get("n_doors"),
         "has_daily": int(pack.has_daily),
         "headline": pack.headline,
         "source": pack.source,

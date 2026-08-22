@@ -782,7 +782,7 @@ def _page_this_week(data, period, mtd, ledger):
     st.markdown("##### 1. Country this week")
     _strategy_table(pack.country, height=140)
     st.markdown("##### 2. Push these distributors")
-    st.caption("One list. Ranked by this-week ask KG — not Gap tons. Idle distributors (no due / another visit / lapsing doors) are hidden.")
+    st.caption("One list. Ranked by rest-of-month ask KG — not Gap tons. Doors is the work count (Due can be 0 when the beat already called). Idle distributors are hidden.")
     _strategy_table(pack.distributors, height=320)
     st.markdown("##### 3. Push these DSRs")
     st.caption("One national list. A DSR can appear even if its distributor is not above.")

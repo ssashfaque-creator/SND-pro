@@ -307,10 +307,10 @@ def actions(limit: int = typer.Option(15, help="How many call-list shops to prin
     if pack.dsrs is not None and not pack.dsrs.empty:
         table = Table(title="DSRs to push")
         table.add_column("DSR")
-        table.add_column("Ask this week", justify="right")
+        table.add_column("Ask rest of month", justify="right")
         table.add_column("Do this")
         for _, row in pack.dsrs.head(8).iterrows():
-            table.add_row(str(row.get("DSR") or ""), str(row.get("Ask this week (KG)") or ""), str(row.get("Do this") or "")[:80])
+            table.add_row(str(row.get("DSR") or ""), str(row.get("Ask rest of month (KG)") or ""), str(row.get("Do this") or "")[:80])
         console.print(table)
     if pack.calls is not None and not pack.calls.empty:
         table = Table(title="Due and unvisited")
@@ -322,7 +322,7 @@ def actions(limit: int = typer.Option(15, help="How many call-list shops to prin
             table.add_row(
                 str(row.get("Shop") or ""),
                 str(row.get("DSR") or ""),
-                str(row.get("Ask (KG)") or ""),
+                str(row.get("Ask rest of month (KG)") or ""),
                 str(row.get("Do this") or "")[:90],
             )
         console.print(table)
@@ -331,14 +331,14 @@ def actions(limit: int = typer.Option(15, help="How many call-list shops to prin
         table.add_column("Shop")
         table.add_column("Ask", justify="right")
         for _, row in pack.lifts.head(min(limit, 8)).iterrows():
-            table.add_row(str(row.get("Shop") or ""), str(row.get("Ask (KG)") or ""))
+            table.add_row(str(row.get("Shop") or ""), str(row.get("Ask rest of month (KG)") or ""))
         console.print(table)
     if pack.lapses is not None and not pack.lapses.empty:
         table = Table(title="Lapsing")
         table.add_column("Shop")
         table.add_column("Ask", justify="right")
         for _, row in pack.lapses.head(min(limit, 8)).iterrows():
-            table.add_row(str(row.get("Shop") or ""), str(row.get("Ask (KG)") or ""))
+            table.add_row(str(row.get("Shop") or ""), str(row.get("Ask rest of month (KG)") or ""))
         console.print(table)
 
 

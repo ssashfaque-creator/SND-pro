@@ -11,7 +11,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.worksheet import Worksheet
 
-from sndintel.action import SHOP_PDF_COLS, ActionPack
+from sndintel.action import COUNTRY_PDF_COLS, DIST_PDF_COLS, DSR_PDF_COLS, SHOP_PDF_COLS, ActionPack
 from sndintel.briefing import NAVY, SLATE, _excel_value, _sheet_table
 
 GLOSSARY = [
@@ -36,8 +36,8 @@ GLOSSARY = [
         "max(0, Expected − billed). What the door still owes the month, in KG.",
     ),
     (
-        "Ask this week",
-        "Typical drop for Due / Due · visited / Lapsing. Remaining-to-Expected for Another visit. Zero on Hold. Printed in KG so a 140 KG order does not round to 0.",
+        "Ask rest of month",
+        "What those named doors can still close before month-end: typical drop × orders that still fit, capped at remaining-to-Expected. Another visit already used one drop this month, so the ask is the next drop — not the whole Expected hole. Zero on Hold. Printed in KG.",
     ),
     (
         "Due / Due · visited / Another visit / Lapsing / Hold",
@@ -55,13 +55,13 @@ def how_to_read(pack: ActionPack, detailed: bool = False) -> list[str]:
     if detailed:
         return [
             f"{day}. Full lists — every AMS > 0 distributor, DSR, and shop the engine scored.",
-            "Distributors ranked by this-week ask KG (not Gap tons).",
+            "Distributors ranked by rest-of-month ask KG (not Gap tons).",
             "DSRs ranked the same way.",
             "Every shop with an action. Do this names the door and why it is due, light, lapsing, or hold.",
         ]
     return [
-        f"{day}. Country: billed vs AMS vs Expected vs this week's ask, all in KG.",
-        "One distributor push list — how many doors are due, need another visit, or are lapsing.",
+        f"{day}. Country: billed vs AMS vs Expected vs rest-of-month ask, all in KG. Doors is the work list (Due + Due visited + Another visit + Lapsing) — Due can be 0 when the beat already called.",
+        "One distributor push list — how many doors to work, and the KG those doors can still close before month-end.",
         "One DSR push list — ride-with names, not nested under the distributors.",
         "Due — cycle elapsed, no leftover cover, not visited this month.",
         "Due · visited — same clock, already called, still no bill.",
@@ -83,7 +83,7 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
             (
                 "02 Distributors",
                 "Every distributor to push",
-                "AMS = 0 is hidden. Ranked by this-week ask tonnes.",
+                "AMS = 0 is hidden. Ranked by rest-of-month ask KG.",
                 pack.all_distributors,
             ),
             (
@@ -115,7 +115,7 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
         (
             "02 Distributors",
             "Push these distributors",
-            "One list. Ranked by this-week ask. Instruction names how many doors are due, need another visit, or are lapsing.",
+            "One list. Ranked by rest-of-month ask. Doors is the work count — Due can be 0 when those shops were already visited.",
             pack.distributors,
         ),
         (
@@ -127,7 +127,7 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
         (
             "04 Due",
             "Due and unvisited",
-            "Usual cycle has elapsed, leftover cover is gone, nobody visited this month. Ask is the typical drop.",
+            "Usual cycle has elapsed, leftover cover is gone, nobody visited this month. Ask rest of month is the typical drop (or two if another cycle still fits).",
             pack.calls,
         ),
         (
@@ -168,9 +168,9 @@ def write_excel(pack: ActionPack, path: Path | str | BytesIO, detailed: bool = F
     _cover(wb, pack, detailed=detailed)
     for sheet, heading, note, df in iter_action_sheets(pack, detailed=detailed):
         kwargs: dict[str, Any] = {}
-        if sheet.startswith("02") and df is not None and not df.empty and "Ask this week (KG)" in df.columns:
+        if sheet.startswith("02") and df is not None and not df.empty and "Ask rest of month (KG)" in df.columns:
             cat = "Distributor" if "Distributor" in df.columns else "DSR"
-            kwargs = dict(bar_col="Ask this week (KG)", cat_col=cat)
+            kwargs = dict(bar_col="Ask rest of month (KG)", cat_col=cat)
         _sheet_table(wb, sheet, heading, note, df, **kwargs)
     if path is not None:
         wb.save(path)
@@ -290,6 +290,23 @@ def _html_table(df: pd.DataFrame) -> str:
     return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
 
 
+def pdf_columns(df: pd.DataFrame) -> list[str]:
+    """Keep Ask / AMS / Billed / Lapsing on the PDF instead of the first eight fields."""
+    if df is None or df.empty:
+        return []
+    if "Shop" in df.columns:
+        wanted = SHOP_PDF_COLS
+    elif "Distributor" in df.columns and "DSR" not in df.columns:
+        wanted = DIST_PDF_COLS
+    elif "DSR" in df.columns:
+        wanted = DSR_PDF_COLS
+    elif "Due · unvisited" in df.columns or "Ask rest of month (KG)" in df.columns:
+        wanted = COUNTRY_PDF_COLS
+    else:
+        wanted = list(df.columns)
+    return [c for c in wanted if c in df.columns]
+
+
 def _pdf_table(df: pd.DataFrame, style) -> Any:
     from reportlab.lib import colors
     from reportlab.platypus import Paragraph, Table, TableStyle
@@ -297,15 +314,9 @@ def _pdf_table(df: pd.DataFrame, style) -> Any:
     if df is None or df.empty:
         return Paragraph("No rows at this layer.", style)
     show = df.copy()
-    if "Shop" in show.columns and any(c in show.columns for c in SHOP_PDF_COLS):
-        keep = [c for c in SHOP_PDF_COLS if c in show.columns]
+    keep = pdf_columns(show)
+    if keep:
         show = show[keep]
-    elif "Do this" in show.columns:
-        keep = [c for c in show.columns if c != "Do this"]
-        keep = keep[:8] + (["Do this"] if "Do this" in show.columns else [])
-        show = show[keep]
-    elif len(show.columns) > 10:
-        show = show.iloc[:, :10]
     header = [Paragraph(f"<b>{_xml(str(c))}</b>", style) for c in show.columns]
     data = [header]
     for _, rec in show.head(40).iterrows():
