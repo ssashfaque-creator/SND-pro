@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from calendar import monthrange
+from datetime import date
+
 import pandas as pd
 
 from sndintel.hierarchy import build_hierarchy_pack
@@ -362,4 +365,111 @@ def test_expected_drop_size_matches_expected_sales_recipe_not_current_shops():
     row = report.cities[report.cities["City"] == "Larkana"].iloc[0]
     remarks = str(row["Remarks"])
     assert "vs expected 2.20" in remarks or "vs expected 2.2" in remarks
+
+
+def _day_row(store_id: str, day: date, vol: float, city: str = "Karachi") -> dict:
+    return {
+        "store_id": store_id,
+        "store_name": store_id,
+        "city": city,
+        "sale_date": day.isoformat(),
+        "year": day.year,
+        "month": day.month,
+        "day": day.day,
+        "period": f"{day.year:04d}-{day.month:02d}",
+        "volume_mt": vol,
+    }
+
+
+def _shaped_month(period: str, shape: str, store_id: str = "N1") -> list[dict]:
+    year, month = int(period[:4]), int(period[5:7])
+    last = monthrange(year, month)[1]
+    rows = []
+    if shape == "front":
+        for d in range(1, 11):
+            rows.append(_day_row(store_id, date(year, month, d), 8.0))
+        tail = list(range(11, last + 1))
+        each = 20.0 / len(tail)
+        for d in tail:
+            rows.append(_day_row(store_id, date(year, month, d), each))
+    else:
+        head = list(range(1, 21))
+        each = 20.0 / len(head)
+        for d in head:
+            rows.append(_day_row(store_id, date(year, month, d), each))
+        tail = list(range(21, last + 1))
+        each = 80.0 / len(tail)
+        for d in tail:
+            rows.append(_day_row(store_id, date(year, month, d), each))
+    return rows
+
+
+def test_national_front_load_raises_expected_by_day_20():
+    days = []
+    for per in ("2026-05", "2026-06", "2026-07"):
+        days.extend(_shaped_month(per, "front"))
+    frac, src = intra_month_fraction(20, 31, None, open_mtd=True, shop_day=pd.DataFrame(days), period="2026-08")
+    assert src == "national_day_curve"
+    assert frac > (20 / 31) + 0.08
+    assert frac > 0.75
+
+
+def test_national_back_load_lowers_expected_by_day_20():
+    days = []
+    for per in ("2026-05", "2026-06", "2026-07"):
+        days.extend(_shaped_month(per, "back"))
+    frac, src = intra_month_fraction(20, 31, None, open_mtd=True, shop_day=pd.DataFrame(days), period="2026-08")
+    assert src == "national_day_curve"
+    assert frac < (20 / 31) - 0.08
+    assert frac < 0.40
+
+
+def test_thin_daily_does_not_invent_a_national_curve():
+    days = [
+        _day_row("N1", date(2026, 5, 31), 100.0),
+        _day_row("N1", date(2026, 6, 30), 100.0),
+        _day_row("N1", date(2026, 7, 31), 100.0),
+    ]
+    frac, src = intra_month_fraction(20, 31, None, open_mtd=True, shop_day=pd.DataFrame(days), period="2026-08")
+    assert src == "elapsed_days"
+    assert abs(frac - 20 / 31) < 1e-9
+
+
+def test_current_month_daily_does_not_leak_into_the_curve():
+    days = []
+    for per in ("2026-05", "2026-06", "2026-07"):
+        days.extend(_shaped_month(per, "back"))
+    for d in range(1, 22):
+        days.append(_day_row("N1", date(2026, 8, d), 50.0))
+    frac, src = intra_month_fraction(20, 31, None, open_mtd=True, shop_day=pd.DataFrame(days), period="2026-08")
+    assert src == "national_day_curve"
+    assert frac < 0.40
+
+
+def test_hierarchy_applies_one_national_curve_to_every_city():
+    rows = []
+    for city, sid in (("Karachi", "K1"), ("Lahore", "L1")):
+        for per in ("2026-05", "2026-06", "2026-07"):
+            rows.append(_shop_month(sid, per, 100.0, city))
+        rows.append(_shop_month(sid, "2026-08", 20.0, city))
+    sm = pd.DataFrame(rows)
+    stores = sm.drop_duplicates("store_id")[
+        ["store_id", "store_name", "distributor", "dsr_name", "zone", "city", "section"]
+    ]
+    day_rows = []
+    for per in ("2026-05", "2026-06", "2026-07"):
+        day_rows.extend(_shaped_month(per, "front", "K1"))
+        day_rows.extend(_shaped_month(per, "front", "L1"))
+    ledger = pd.DataFrame(
+        [
+            {"period": "2026-08", "status": "mtd_open", "as_of_day": 10, "days_in_month": 31},
+        ]
+    )
+    pack = build_hierarchy_pack(sm, stores, ledger=ledger, shop_day=pd.DataFrame(day_rows))
+    assert pack.national["intra_month_source"] == "national_day_curve"
+    khi = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Karachi")].iloc[0]
+    lhr = pack.units[(pack.units["grain"] == "city") & (pack.units["grain_id"] == "Lahore")].iloc[0]
+    calendar = 100.0 * (10 / 31)
+    assert float(khi["expected_mt"]) > calendar + 20
+    assert abs(float(khi["expected_mt"]) - float(lhr["expected_mt"])) < 1.0
 

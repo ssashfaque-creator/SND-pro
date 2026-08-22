@@ -16,9 +16,9 @@ unvisited / unbilled partition that hole.
 Residuals are shrunk with empirical Bayes so a 0.02 MT shop cannot outrank
 Eva Foods on a percentage, and scored with a robust z.
 
-Intra-month day shape is learned from mid-month MTD cuts when they exist.
-Month-end totals cannot teach day 20. If those cuts are missing, open MTD
-uses elapsed calendar days of the recent run-rate.
+Open-MTD Expected uses the country’s usual billed share by that calendar
+day, learned from Outlet Date Wise (one national curve). Thin daily history
+falls back to mid-month MTD cuts, then elapsed calendar days.
 """
 
 from __future__ import annotations
@@ -414,7 +414,15 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
             f"{label}: the country is on its recent run-rate ({vol:.1f} vs {expected:.1f} MT). "
             "Focus on units that are off their own Expected."
         )
-    if intra_src == "learned_mtd_cuts":
+    if intra_src == "national_day_curve":
+        weather += (
+            f" Open MTD Expected is the recent run-rate × the country’s usual billed share "
+            f"by day {national.get('as_of_day')} "
+            f"({float(national.get('intra_month_frac') or 0)*100:.0f}% of a full month), "
+            "learned from Outlet Date Wise across closed months — one national curve, "
+            "applied at every grain."
+        )
+    elif intra_src == "learned_mtd_cuts":
         weather += (
             f" Open MTD is paced from mid-month cuts already in your warehouse "
             f"(day {national.get('as_of_day')}: {float(national.get('intra_month_frac') or 0)*100:.0f}% of a full month)."
@@ -423,8 +431,8 @@ def situation_brief(national: dict[str, Any], cities: pd.DataFrame) -> dict[str,
         weather += (
             f" Typical {label[:7] if label else 'month'} is learned from "
             f"{int(national.get('n_history_periods') or 0)} months on file. "
-            "No mid-month MTD cuts are stored, so the open month is elapsed calendar days "
-            "of that learned typical month — not a loading curve we specified."
+            "Daily billed days are too thin for a national day curve, so the open month "
+            "is elapsed calendar days of that learned typical month."
         )
     elif intra_src == "empirical_mtd_curve":
         weather += " Open MTD is paced off your own historical intra-month billing curve."

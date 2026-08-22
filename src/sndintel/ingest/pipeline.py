@@ -722,6 +722,10 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
         insights.to_sql("insights", conn, if_exists="append", index=False)
     replace_table(conn, "kpi_snapshots", kpis)
 
+    try:
+        shop_day_df = read_sql(conn, "SELECT * FROM shop_day")
+    except Exception:
+        shop_day_df = pd.DataFrame()
     pack = build_hierarchy_pack(
         shop_month,
         stores_df,
@@ -730,6 +734,7 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
         facts=facts_df,
         mtd_obs=read_sql(conn, "SELECT * FROM mtd_observations"),
         visits=visits_df,
+        shop_day=shop_day_df,
     )
     replace_table(conn, "unit_scorecards", pack.units)
     replace_table(conn, "focus_targets", pack.targets)

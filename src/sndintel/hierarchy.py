@@ -4,8 +4,9 @@ Not a canned strategy. Every row is computed from the warehouse:
 
 * Expected is recent run-rate at every grain: last three closed months (same
   window as AMS), blended with the last-six-month median, paced if MTD is
-  open. Calendar-month seasonality is not applied. Children add to the parent
-  Expected. Last year is one input, not the call.
+  open using the national billed-by-day curve (one country shape). Calendar-month
+  seasonality is not applied. Children add to the parent Expected. Last year
+  is one input, not the call.
 * Gap = hole versus that Expected. From drop / unvisited / unbilled
   partition it.
 * National hole = billed versus national Expected (additive after reconcile).
@@ -159,6 +160,7 @@ def build_hierarchy_pack(
     facts: pd.DataFrame | None = None,
     mtd_obs: pd.DataFrame | None = None,
     visits: pd.DataFrame | None = None,
+    shop_day: pd.DataFrame | None = None,
 ) -> HierarchyPack:
     period = latest_period(shop_month)
     if not period or shop_month is None or shop_month.empty:
@@ -170,6 +172,8 @@ def build_hierarchy_pack(
         mtd.get("days_in_month"),
         mtd_obs,
         open_mtd=bool(mtd.get("open")),
+        shop_day=shop_day,
+        period=period,
     )
     pace = float(intra_frac)
     factor = (1.0 / pace) if pace > 1e-9 else 1.0

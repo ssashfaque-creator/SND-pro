@@ -8,12 +8,15 @@ with the last-six-month median, then paced if MTD is open. Children still
 add to the parent Expected.
 
 A 12-month index is stored for diagnostics. It is not applied to Expected.
-Day-of-month pace is unchanged: learned MTD cuts when present, otherwise
-elapsed calendar days.
+Open-MTD pace is the country’s usual billed share by that calendar day,
+learned from Outlet Date Wise across closed months. One national curve
+is applied at every grain — stores and cities are too thin to fit their
+own day shape. Fallback is learned MTD snapshot cuts, then elapsed days.
 """
 
 from __future__ import annotations
 
+from calendar import monthrange
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +24,9 @@ import numpy as np
 import pandas as pd
 
 from sndintel.io_utils import prior_periods
+
+NATIONAL_DAY_MIN_MONTHS = 2
+NATIONAL_DAY_MIN_DAYS = 8
 
 
 def _finite(value: Any, default: float = 1.0) -> float:
@@ -722,22 +728,99 @@ def scale_children_expected(children: pd.DataFrame, parents: pd.DataFrame, intra
     return out
 
 
+def elapsed_month_frac(as_of_day: int | float, days_in_month: int | float) -> float:
+    """Straight calendar share: day 20 of 31 is 20/31."""
+    as_of = float(as_of_day)
+    days = float(days_in_month)
+    if days <= 0:
+        return 1.0
+    return min(max(as_of / days, 0.02), 1.0)
+
+
 def intra_month_fraction(
     as_of_day: int | float | None,
     days_in_month: int | float | None,
     observations: pd.DataFrame | None = None,
     open_mtd: bool = False,
+    shop_day: pd.DataFrame | None = None,
+    period: str | None = None,
 ) -> tuple[float, str]:
-    """Fraction of a full month billed by as_of_day — learned, never a shipped knot curve."""
+    """Fraction of a full month billed by as_of_day.
+
+    Prefer the national Outlet Date Wise curve (one country shape, applied
+    everywhere). Then mid-month MTD snapshots. Then elapsed calendar days.
+    """
     if not open_mtd or not as_of_day or not days_in_month:
         return 1.0, "closed"
     as_of = int(as_of_day)
     days = int(days_in_month)
+    nat = national_day_frac(shop_day, period, as_of, days)
+    if nat is not None:
+        return nat, "national_day_curve"
     emp = _empirical_mtd_frac(observations, as_of, days)
     if emp is not None:
         return emp, "learned_mtd_cuts"
-    # No mid-month history: elapsed calendar days. Not a loading curve we invented.
-    return min(max(as_of / days, 0.02), 1.0), "elapsed_days"
+    return elapsed_month_frac(as_of, days), "elapsed_days"
+
+
+def national_day_frac(
+    shop_day: pd.DataFrame | None,
+    period: str | None,
+    as_of_day: int,
+    days_in_month: int,
+) -> float | None:
+    """Median share of a closed month the country had billed by this calendar day."""
+    curve = fit_national_day_curve(shop_day, period)
+    if not curve:
+        return None
+    day = int(min(max(as_of_day, 1), max(days_in_month, 1)))
+    return float(curve[day - 1])
+
+
+def fit_national_day_curve(shop_day: pd.DataFrame | None, period: str | None) -> list[float] | None:
+    """31-day cumulative billed share for the country. Median across closed months."""
+    daily = _national_daily(shop_day, period)
+    if daily.empty:
+        return None
+    months = []
+    for per, g in daily.groupby("period"):
+        days_used = int(g["day"].nunique())
+        if days_used < NATIONAL_DAY_MIN_DAYS:
+            continue
+        year, month = int(str(per)[:4]), int(str(per)[5:7])
+        last = monthrange(year, month)[1]
+        by_day = g.groupby(g["day"].astype(int))["volume_mt"].sum()
+        vols = np.array([float(by_day.get(int(d), 0.0) or 0.0) for d in range(1, last + 1)], dtype=float)
+        total = float(vols.sum())
+        if total <= 0:
+            continue
+        cum = np.cumsum(vols) / total
+        # Stretch to 31: days after this month’s last day stay at 1.0.
+        padded = np.ones(31, dtype=float)
+        padded[:last] = np.clip(cum, 0.0, 1.0)
+        months.append(padded)
+    if len(months) < NATIONAL_DAY_MIN_MONTHS:
+        return None
+    stacked = np.vstack(months)
+    med = np.median(stacked, axis=0)
+    med = np.maximum.accumulate(np.clip(med, 0.02, 1.0))
+    med[-1] = 1.0
+    return [float(x) for x in med]
+
+
+def _national_daily(shop_day: pd.DataFrame | None, period: str | None) -> pd.DataFrame:
+    if shop_day is None or shop_day.empty or not period:
+        return pd.DataFrame()
+    out = shop_day.copy()
+    out["volume_mt"] = pd.to_numeric(out.get("volume_mt"), errors="coerce").fillna(0.0)
+    out["period"] = out["period"].astype(str)
+    out = out[out["period"] < str(period)]
+    if "day" not in out.columns or out["day"].isna().all():
+        sale = pd.to_datetime(out.get("sale_date"), errors="coerce")
+        out["day"] = sale.dt.day
+    out["day"] = pd.to_numeric(out["day"], errors="coerce")
+    out = out[out["day"].notna() & (out["day"] >= 1) & (out["day"] <= 31) & (out["volume_mt"] > 0)]
+    return out[["period", "day", "volume_mt"]] if not out.empty else pd.DataFrame()
 
 
 def _empirical_mtd_frac(obs: pd.DataFrame | None, as_of: int, days: int) -> float | None:

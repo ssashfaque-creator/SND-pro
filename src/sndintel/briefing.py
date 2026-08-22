@@ -29,7 +29,8 @@ from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibl
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
 from sndintel.io_utils import prior_periods, shift_period
-from sndintel.season import fit_seasonality, fit_shop_expected, reconcile_expected
+from sndintel.mtd import period_state
+from sndintel.season import elapsed_month_frac, fit_seasonality, fit_shop_expected, reconcile_expected
 
 
 SITUATION_LABEL = {
@@ -50,9 +51,9 @@ DRIVER_LABEL = {
 GLOSSARY = [
     ("Billed this period", "Secondary volume in the month being scored (MTD if the month is still open)."),
     ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. This is always a full-month run-rate, even when billed is MTD."),
-    ("vs AMS", "This period minus AMS × fraction of the month elapsed. Negative = behind the recent run-rate. On day 20 that is billed − AMS × (20 ÷ days in month), not billed − AMS. The AMS column itself stays the full-month number."),
+    ("vs AMS", "This period minus AMS × elapsed calendar days (day 20 of 31 is billed − AMS × 20/31). Negative = behind the recent run-rate. The AMS column itself stays the full-month number. Expected can use a different intra-month fraction when Outlet Date Wise teaches the country’s usual billed-by-day shape."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month). Zero means no August last year — it does not mean Expected should be zero."),
-    ("Expected this month", "Recent run-rate: mean of the three calendar months immediately before this period (same window as AMS), blended with the last-six-month median, paced if MTD is open. Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
+    ("Expected this month", "Recent run-rate: mean of the three calendar months immediately before this period (same window as AMS), blended with the last-six-month median, paced if MTD is open. The pace is the country’s usual billed share by that calendar day (Outlet Date Wise, one national curve — not a per-store or per-city shape). Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
     ("Gap", "The hole versus this unit’s own Expected, as a positive number — volume that comes back if the unit billed its recent run-rate. Country Gap is the country miss versus Expected. Zero means billed at or above Expected, not that AMS is irrelevant."),
     ("From drop size (MT)", "Share of the gap explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than Expected. The three From columns add to Gap when the unit is behind."),
     ("From unvisited shops (MT)", "Share of the gap from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of Expected."),
@@ -73,7 +74,7 @@ GLOSSARY = [
 CALCULATION_NOTES = [
     (
         "Expected this month",
-        "Mean of the three calendar months immediately before this period (same window as AMS, missing months as 0), blended with the last-six-month median. Calendar-month seasonality is not used: an empty August last year does not zero out a city that has been billing 40 MT/month recently. The same recipe runs at country, city, distributor, DSR, and shop. Children’s Expecteds are then scaled so they add to the parent Expected. If the month is still open, Expected is that full-month run-rate × the intra-month fraction (elapsed days, or learned MTD cuts when those exist).",
+        "Mean of the three calendar months immediately before this period (same window as AMS, missing months as 0), blended with the last-six-month median. Calendar-month seasonality is not used: an empty August last year does not zero out a city that has been billing 40 MT/month recently. The same recipe runs at country, city, distributor, DSR, and shop. Children’s Expecteds are then scaled so they add to the parent Expected. If the month is still open, Expected is that full-month run-rate × the country’s usual billed share by this calendar day (national Outlet Date Wise curve). Thin daily history falls back to learned MTD cuts, then elapsed calendar days.",
     ),
     (
         "Gap",
@@ -89,7 +90,7 @@ CALCULATION_NOTES = [
     ),
     (
         "vs AMS",
-        "Billed minus (AMS of the last three calendar months × fraction of the month elapsed). Negative = behind the recent run-rate. AMS in the table is always the full-month run-rate.",
+        "Billed minus (AMS of the last three calendar months × elapsed calendar days). Negative = behind the recent run-rate. AMS in the table is always the full-month run-rate. This stays calendar even when Expected uses the national billed-by-day curve.",
     ),
     (
         "Visit % and Strike %",
@@ -97,7 +98,7 @@ CALCULATION_NOTES = [
     ),
     (
         "Open MTD",
-        "Billed is month-to-date. Expected is paced. AMS in the table is still the full-month last-three-month run-rate; vs AMS applies the elapsed fraction. Last year is the full closed same month.",
+        "Billed is month-to-date. Expected is paced from the national billed-by-day curve (or elapsed days if daily history is thin). AMS in the table is still the full-month last-three-month run-rate; vs AMS applies elapsed calendar days. Last year is the full closed same month.",
     ),
     (
         "Rounding and lists",
@@ -306,22 +307,29 @@ def build_strategy_pack(
     sit = _situation_row(situation, national, nat_row)
     label = sit.get("label") or period
     kpis = _kpis(nat_row, units, sit)
+    mtd = period_state(ledger, period)
+    if mtd.get("open") and mtd.get("as_of_day") and mtd.get("days_in_month"):
+        ams_pace = elapsed_month_frac(mtd["as_of_day"], mtd["days_in_month"])
+    elif mtd.get("open"):
+        ams_pace = pace
+    else:
+        ams_pace = 1.0
 
     cities = _grain(units, "city")
     dists = _grain(units, "distributor")
     dsrs = _grain(units, "dsr")
     if not cities.empty:
         cities["city"] = cities["grain_id"]
-        cities = _attach_ams(cities, shop_month, period, ["city"], ledger, pace)
+        cities = _attach_ams(cities, shop_month, period, ["city"], ledger, ams_pace)
     if not dists.empty:
         dists["city"] = dists["parent_id"]
         dists["distributor"] = dists["grain_id"]
-        dists = _attach_ams(dists, shop_month, period, ["city", "distributor"], ledger, pace)
+        dists = _attach_ams(dists, shop_month, period, ["city", "distributor"], ledger, ams_pace)
         dists = _drop_zero_ams(dists)
     if not dsrs.empty:
         dsrs["city"] = dsrs["parent_id"]
         dsrs["dsr_name"] = dsrs["grain_id"]
-        dsrs = _attach_ams(dsrs, shop_month, period, ["city", "dsr_name"], ledger, pace)
+        dsrs = _attach_ams(dsrs, shop_month, period, ["city", "dsr_name"], ledger, ams_pace)
         dsrs = _drop_zero_ams(dsrs)
 
     cities = _sort_focus(cities)
@@ -330,7 +338,7 @@ def build_strategy_pack(
 
     nat_grain = _grain(units, "national")
     if not nat_grain.empty:
-        nat_grain = _attach_national_ams(nat_grain, shop_month, period, ledger, pace)
+        nat_grain = _attach_national_ams(nat_grain, shop_month, period, ledger, ams_pace)
         nat_grain["grain_id"] = "Country"
         nat_grain["city"] = "Country"
         nat_grain["zone"] = ""
@@ -362,7 +370,7 @@ def build_strategy_pack(
         lagging_dist_names = [str(x) for x in all_lag_dist["grain_id"].tolist()]
 
     shops = score_shops(shop_month, cities, period, pace)
-    shops = _attach_ams(shops, shop_month, period, ["store_id"], ledger, pace)
+    shops = _attach_ams(shops, shop_month, period, ["store_id"], ledger, ams_pace)
     shops = _attach_shop_calls(shops, visits, period)
     hole_floor = SHOP_RECOVERABLE_FLOOR
 

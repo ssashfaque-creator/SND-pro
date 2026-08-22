@@ -17,7 +17,7 @@ from sndintel.briefing import NAVY, SLATE, _excel_value, _sheet_table
 GLOSSARY = [
     (
         "Expected this month",
-        "Same recipe as the scorecard: last three closed calendar months blended with the last-six-month median. Day-of-month seasonality is not used.",
+        "Same full-month recipe as the scorecard: last three closed calendar months blended with the last-six-month median. The scorecard paces that run-rate by the national billed-by-day curve when the month is open; this pack still uses the full-month number so remaining-to-Expected is what the door still owes.",
     ),
     (
         "Usual cycle / typical drop",

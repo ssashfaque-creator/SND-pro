@@ -449,7 +449,8 @@ def _page_strategy(data, _latest, period, mtd, ledger):
     st.title("Briefing")
     st.caption(
         f"**{mtd['label'] or period}** · expected is the recent run-rate (last three closed months), "
-        "paced if the month is still open. An empty August last year does not zero Expected."
+        "paced if the month is still open by the country’s usual billed share through that day. "
+        "An empty August last year does not zero Expected."
     )
     if mtd["open"]:
         st.info(banner_text(ledger, period))
