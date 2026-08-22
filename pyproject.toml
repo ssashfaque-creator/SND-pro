@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sndintel"
+version = "0.2.0"
+description = "Secondary sales intelligence for FMCG store-SKU execution data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "openpyxl>=3.1",
+  "scikit-learn>=1.4",
+  "xgboost>=2.0",
+  "streamlit>=1.36",
+  "plotly>=5.22",
+  "watchdog>=4.0",
+  "fastapi>=0.111",
+  "uvicorn>=0.30",
+  "typer>=0.12",
+  "rich>=13.7",
+  "joblib>=1.4",
+  "python-dateutil>=2.9",
+  "reportlab>=4.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2", "httpx>=0.27"]
+
+[project.scripts]
+snd-intel = "sndintel.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
