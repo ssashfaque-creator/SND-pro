@@ -12,6 +12,7 @@ import pandas as pd
 
 from sndintel.config import DATA_DIR, DB_PATH, PROCESSED_DIR, ensure_dirs
 from sndintel.features import add_calendar_panel, build_features, latest_period, rebuild_shop_month
+from sndintel.action import build_action_pack, persist_action_pack
 from sndintel.ingest.daily import overlay_store_attrs
 from sndintel.ingest.shops import parse_shop_master
 from sndintel.ingest.ssrs import ParseReport, collapse_sales_facts, parse_sales_file
@@ -62,11 +63,36 @@ def _sales_label(paths: list[Path]) -> str:
 def _parse_sales_paths(paths: list[Path]) -> tuple[pd.DataFrame, ParseReport | None]:
     frames: list[pd.DataFrame] = []
     reports: list[ParseReport] = []
+    dailies: list[pd.DataFrame] = []
     for path in paths:
         df, report = parse_sales_file(path)
         frames.append(df)
         reports.append(report)
-    return combine_sales_frames(frames), merge_sales_reports(reports)
+        daily = getattr(report, "daily", None)
+        if daily is not None and not daily.empty:
+            dailies.append(daily)
+    merged = merge_sales_reports(reports)
+    if merged is not None:
+        merged.daily = combine_daily_frames(dailies)
+    return combine_sales_frames(frames), merged
+
+
+def combine_daily_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    parts = [frame.copy() for frame in frames if frame is not None and not frame.empty]
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    out["store_id"] = out["store_id"].astype(str).str.strip()
+    out["sale_date"] = pd.to_datetime(out["sale_date"], errors="coerce")
+    out = out.loc[out["sale_date"].notna()].copy()
+    key = ["store_id", "sale_date"]
+    extra = [c for c in out.columns if c not in key]
+    agg = {c: "last" for c in extra}
+    if "volume_mt" in agg:
+        agg["volume_mt"] = "sum"
+    grouped = out.groupby(key, as_index=False, sort=False).agg(agg)
+    grouped = grouped.loc[pd.to_numeric(grouped["volume_mt"], errors="coerce").fillna(0) > 0].copy()
+    return grouped.reset_index(drop=True)
 
 
 def combine_sales_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
@@ -121,6 +147,10 @@ def _clear_billed_sales(conn) -> None:
     conn.execute("DELETE FROM sales_facts")
     conn.execute("DELETE FROM period_ledger")
     conn.execute("DELETE FROM mtd_observations")
+    try:
+        conn.execute("DELETE FROM shop_day")
+    except Exception:
+        pass
 
 
 def clear_billed_sales(db_path: Optional[str | Path] = None) -> dict:
@@ -146,6 +176,11 @@ def clear_billed_sales(db_path: Optional[str | Path] = None) -> dict:
             "situation_brief",
             "exec_summary",
             "kpi_snapshots",
+            "shop_day",
+            "action_shops",
+            "action_units",
+            "action_backtest",
+            "action_brief",
         ):
             conn.execute(f"DELETE FROM {table}")
     return {
@@ -357,6 +392,27 @@ def run_pipeline(
                         ),
                     )
 
+            daily = getattr(sales_report, "daily", None) if sales_report else None
+            if daily is not None and not daily.empty:
+                daily = overlay_store_attrs(daily, live_book)
+                daily = _prepare_shop_day(daily, label)
+                day_periods = sorted(daily["period"].dropna().astype(str).unique().tolist())
+                if replace_sales:
+                    try:
+                        conn.execute("DELETE FROM shop_day")
+                    except Exception:
+                        pass
+                elif day_periods:
+                    placeholders = ", ".join("?" * len(day_periods))
+                    try:
+                        conn.execute(
+                            f"DELETE FROM shop_day WHERE period IN ({placeholders})",
+                            tuple(day_periods),
+                        )
+                    except Exception:
+                        pass
+                upsert_dataframe(conn, "shop_day", daily[SHOP_DAY_COLS], ["store_id", "sale_date"])
+
         if not visits.empty:
             if visits["period"].isna().all() or (visits["period"].astype(str) == "None").all():
                 fallback = open_period or (max(touched_periods) if touched_periods else None)
@@ -495,6 +551,44 @@ SALES_FACT_COLS = [
     "source_file",
     "ingested_at",
 ]
+
+
+SHOP_DAY_COLS = [
+    "store_id",
+    "sale_date",
+    "period",
+    "year",
+    "month",
+    "day",
+    "volume_mt",
+    "distributor",
+    "dsr_name",
+    "section",
+    "store_name",
+    "city",
+    "source_file",
+    "ingested_at",
+]
+
+
+def _prepare_shop_day(daily: pd.DataFrame, source_file: str) -> pd.DataFrame:
+    out = daily.copy()
+    out["sale_date"] = pd.to_datetime(out["sale_date"], errors="coerce")
+    out = out.loc[out["sale_date"].notna()].copy()
+    out["year"] = out["sale_date"].dt.year.astype(int) if "year" not in out.columns or out["year"].isna().any() else out["year"]
+    out["month"] = out["sale_date"].dt.month.astype(int)
+    out["day"] = out["sale_date"].dt.day.astype(int)
+    if "period" not in out.columns or out["period"].isna().any():
+        from sndintel.io_utils import period_key
+
+        out["period"] = [period_key(int(y), int(m)) for y, m in zip(out["year"], out["month"])]
+    out["sale_date"] = out["sale_date"].dt.strftime("%Y-%m-%d")
+    out["source_file"] = source_file
+    out["ingested_at"] = utcnow()
+    for col in SHOP_DAY_COLS:
+        if col not in out.columns:
+            out[col] = None
+    return out[SHOP_DAY_COLS]
 
 
 SHOP_MONTH_COLS = [
@@ -664,6 +758,20 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
         plays.to_sql("strategy_plays", conn, if_exists="append", index=False)
 
     exec_meta = _write_national_exec(conn, shop_month, visits_df, ledger, pack.period)
+
+    try:
+        shop_day = read_sql(conn, "SELECT * FROM shop_day")
+    except Exception:
+        shop_day = pd.DataFrame()
+    actions = build_action_pack(
+        shop_month,
+        stores_df,
+        shop_day=shop_day,
+        visits=visits_df,
+        ledger=ledger,
+        period=period,
+    )
+    persist_action_pack(conn, actions)
 
     return {
         "latest_period": period,

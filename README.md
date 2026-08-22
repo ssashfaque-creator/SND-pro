@@ -80,6 +80,7 @@ snd-intel demo
 # Your own files
 snd-intel ingest path/to/Shop_SKU_Wise_Execution_Report.xlsx --shops path/to/shop_master.xlsx
 snd-intel brief
+snd-intel actions
 snd-intel dashboard
 snd-intel export-excel SND_intelligence_brief.xlsx
 

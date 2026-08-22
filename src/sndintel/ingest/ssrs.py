@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -127,6 +127,7 @@ class ParseReport:
     column_map: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     params: dict = field(default_factory=dict)
+    daily: Any = None
 
 
 def parse_sales_file(path: str | Path) -> tuple[pd.DataFrame, ParseReport]:

@@ -367,6 +367,117 @@ CREATE TABLE IF NOT EXISTS kpi_snapshots (
     run_rate_yoy_pct REAL,
     PRIMARY KEY (period, grain, grain_id)
 );
+
+CREATE TABLE IF NOT EXISTS shop_day (
+    store_id TEXT NOT NULL,
+    sale_date TEXT NOT NULL,
+    period TEXT NOT NULL,
+    year INTEGER,
+    month INTEGER,
+    day INTEGER,
+    volume_mt REAL NOT NULL,
+    distributor TEXT,
+    dsr_name TEXT,
+    section TEXT,
+    store_name TEXT,
+    city TEXT,
+    source_file TEXT,
+    ingested_at TEXT,
+    PRIMARY KEY (store_id, sale_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shop_day_period ON shop_day(period);
+CREATE INDEX IF NOT EXISTS idx_shop_day_store ON shop_day(store_id);
+CREATE INDEX IF NOT EXISTS idx_shop_day_dsr ON shop_day(dsr_name);
+
+CREATE TABLE IF NOT EXISTS action_shops (
+    period TEXT NOT NULL,
+    store_id TEXT NOT NULL,
+    store_name TEXT,
+    city TEXT,
+    distributor TEXT,
+    dsr_name TEXT,
+    section TEXT,
+    action TEXT,
+    instruction TEXT,
+    billed_mt REAL,
+    expected_mt REAL,
+    ams_3m REAL,
+    should_have_mt REAL,
+    behind_pace_mt REAL,
+    remaining_mt REAL,
+    week_target_mt REAL,
+    typical_drop_mt REAL,
+    typical_bill_day REAL,
+    pace_frac REAL,
+    last_bill_date TEXT,
+    days_since_bill INTEGER,
+    call_status TEXT,
+    visits INTEGER,
+    value_score REAL,
+    PRIMARY KEY (period, store_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_shops_action ON action_shops(action, value_score DESC);
+
+CREATE TABLE IF NOT EXISTS action_units (
+    period TEXT NOT NULL,
+    grain TEXT NOT NULL,
+    grain_id TEXT NOT NULL,
+    city TEXT,
+    distributor TEXT,
+    n_call INTEGER,
+    n_convert INTEGER,
+    n_lift INTEGER,
+    n_hold INTEGER,
+    billed_mt REAL,
+    expected_mt REAL,
+    should_have_mt REAL,
+    behind_pace_mt REAL,
+    remaining_mt REAL,
+    week_target_mt REAL,
+    instruction TEXT,
+    value_score REAL,
+    PRIMARY KEY (period, grain, grain_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_units_grain ON action_units(grain, value_score DESC);
+
+CREATE TABLE IF NOT EXISTS action_backtest (
+    period TEXT NOT NULL,
+    cut_day INTEGER NOT NULL,
+    n_months INTEGER,
+    n_shops INTEGER,
+    curve_precision_at_50 REAL,
+    calendar_precision_at_50 REAL,
+    curve_catch_mt REAL,
+    calendar_catch_mt REAL,
+    n_backloaded_hold INTEGER,
+    n_backloaded_ok INTEGER,
+    remaining_mae_mt REAL,
+    notes TEXT,
+    PRIMARY KEY (period, cut_day)
+);
+
+CREATE TABLE IF NOT EXISTS action_brief (
+    period TEXT PRIMARY KEY,
+    as_of_day INTEGER,
+    days_in_month INTEGER,
+    days_left INTEGER,
+    billed_mt REAL,
+    expected_mt REAL,
+    should_have_mt REAL,
+    behind_pace_mt REAL,
+    remaining_mt REAL,
+    week_target_mt REAL,
+    n_call INTEGER,
+    n_convert INTEGER,
+    n_lift INTEGER,
+    has_daily INTEGER,
+    headline TEXT,
+    source TEXT,
+    metrics_json TEXT
+);
 """
 
 

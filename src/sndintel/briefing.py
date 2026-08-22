@@ -1544,8 +1544,8 @@ def _sheet_table(
     headers = list(df.columns)
     for i, name in enumerate(headers, start=1):
         width = min(max(len(str(name)) + 2, 12), 28)
-        if name in {"What to do", "Shop", "Remarks"}:
-            width = 56 if name == "Remarks" else 48
+        if name in {"What to do", "Shop", "Remarks", "Do this"}:
+            width = 56 if name in {"Remarks", "Do this"} else 48
         ws.column_dimensions[get_column_letter(i)].width = width
     if "Remarks" in headers:
         for r in range(start + 1, start + 1 + len(df)):

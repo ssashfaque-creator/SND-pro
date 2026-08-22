@@ -98,6 +98,7 @@ def parse_outlet_date_wise(path: str | Path) -> tuple[pd.DataFrame, ParseReport]
     long["period"] = [period_key(y, m) for y, m in zip(long["year"], long["month"])]
     long["store_id"] = long["store_id"].astype(str).str.strip()
     long["store_name"] = long["store_name"].fillna("").map(cell_str)
+    long["day"] = long["sale_date"].dt.day.astype(int)
     monthly = (
         long.groupby(["store_id", "period"], as_index=False)
         .agg(
@@ -123,6 +124,9 @@ def parse_outlet_date_wise(path: str | Path) -> tuple[pd.DataFrame, ParseReport]
     report.params["n_date_columns"] = str(n_dates)
     report.params["report_name"] = "Outlet Date Wise Sale"
     report.n_clean_rows = len(monthly)
+    report.daily = long[
+        ["store_id", "store_name", "sale_date", "year", "month", "day", "period", "volume_mt"]
+    ].copy()
     return monthly, report
 
 
@@ -138,12 +142,12 @@ def overlay_store_attrs(facts: pd.DataFrame, stores: pd.DataFrame | None) -> pd.
         st["_live"] = pd.to_numeric(st["in_universe"], errors="coerce").fillna(0)
         st = st.sort_values("_live", ascending=False)
     st = st.drop_duplicates("store_id", keep="first")
-    cols = [c for c in ("store_id", "distributor", "dsr_name", "section", "store_name") if c in st.columns]
+    cols = [c for c in ("store_id", "distributor", "dsr_name", "section", "store_name", "city") if c in st.columns]
     geo = st[cols]
     out = facts.copy()
     out["store_id"] = out["store_id"].astype(str).str.strip()
     merged = out.merge(geo, on="store_id", how="left", suffixes=("", "_m"))
-    for col in ("distributor", "dsr_name", "section", "store_name"):
+    for col in ("distributor", "dsr_name", "section", "store_name", "city"):
         master = f"{col}_m"
         if master in merged.columns:
             merged[col] = merged[master].combine_first(merged[col]) if col in merged.columns else merged[master]

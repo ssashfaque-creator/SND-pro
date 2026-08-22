@@ -274,6 +274,60 @@ def check_sales(
     )
 
 
+@app.command()
+def actions(limit: int = typer.Option(15, help="How many call-list shops to print")):
+    """Print this week's call / convert / lift lists from the warehouse."""
+    init_db()
+    from sndintel.action import build_action_pack, load_action_pack
+    from sndintel.features import latest_period
+
+    with connect() as conn:
+        try:
+            pack = load_action_pack(conn)
+        except Exception:
+            pack = None
+        if pack is None or not pack.headline:
+            shop_month = read_sql(conn, "SELECT * FROM shop_month")
+            stores = read_sql(conn, "SELECT * FROM stores")
+            try:
+                shop_day = read_sql(conn, "SELECT * FROM shop_day")
+            except Exception:
+                shop_day = pd.DataFrame()
+            try:
+                visits = read_sql(conn, "SELECT * FROM shop_visits")
+            except Exception:
+                visits = pd.DataFrame()
+            ledger = read_sql(conn, "SELECT * FROM period_ledger")
+            period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+    if not pack.headline:
+        console.print("No action list yet. Ingest Outlet Date Wise and run [bold]snd-intel rescore[/].")
+        raise typer.Exit(1)
+    console.print(f"[bold]{pack.headline}[/]")
+    if pack.dsrs is not None and not pack.dsrs.empty:
+        table = Table(title="DSRs to push")
+        table.add_column("DSR")
+        table.add_column("This week", justify="right")
+        table.add_column("Do this")
+        for _, row in pack.dsrs.head(8).iterrows():
+            table.add_row(str(row.get("DSR") or ""), str(row.get("This week (MT)") or ""), str(row.get("Do this") or "")[:80])
+        console.print(table)
+    if pack.calls is not None and not pack.calls.empty:
+        table = Table(title="Call these shops")
+        table.add_column("Shop")
+        table.add_column("DSR")
+        table.add_column("This week", justify="right")
+        table.add_column("Do this")
+        for _, row in pack.calls.head(limit).iterrows():
+            table.add_row(
+                str(row.get("Shop") or ""),
+                str(row.get("DSR") or ""),
+                str(row.get("This week (MT)") or ""),
+                str(row.get("Do this") or "")[:90],
+            )
+        console.print(table)
+
+
 @app.command("serve-api")
 def serve_api(port: int = 8080):
     """Serve the JSON API so a later ReAct agent can query insights deterministically."""

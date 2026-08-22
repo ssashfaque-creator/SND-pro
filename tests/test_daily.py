@@ -57,6 +57,8 @@ def test_daily_parser_sums_days_to_months_and_skips_totals(tmp_path):
     _write_daily(path)
     df, report = parse_sales_file(path)
     assert report.strategy == "outlet_date_wise"
+    assert report.daily is not None and not report.daily.empty
+    assert report.daily["sale_date"].notna().all()
     assert report.params.get("execution_date") == "21/08/2026"
     assert report.params.get("execution_time") == "19:04:50"
     assert "Grand Total" not in set(df["store_id"])
@@ -106,6 +108,10 @@ def test_daily_pipeline_maps_and_tags_open_mtd(tmp_path):
         facts = read_sql(conn, "SELECT * FROM sales_facts")
         sm = read_sql(conn, "SELECT * FROM shop_month")
         ledger = read_sql(conn, "SELECT * FROM period_ledger")
+        days = read_sql(conn, "SELECT * FROM shop_day")
+    assert not days.empty
+    assert set(days["store_id"]) <= set(facts["store_id"])
+    assert abs(float(days[days["store_id"] == "T0000100100100009849"]["volume_mt"].sum()) - float(facts[facts["store_id"] == "T0000100100100009849"]["volume_mt"].sum())) < 1e-6
     bm = facts[facts["store_id"] == "T0000100100100009849"]
     assert set(bm["distributor"]) == {"S.M Traders (F.B Area)"}
     may = float(bm.loc[bm["period"] == "2026-05", "volume_mt"].sum())

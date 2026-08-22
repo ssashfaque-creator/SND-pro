@@ -14,6 +14,10 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from sndintel.action import build_action_pack, load_action_pack
+from sndintel.action_report import GLOSSARY as ACTION_GLOSSARY
+from sndintel.action_report import excel_bytes as action_excel_bytes
+from sndintel.action_report import pdf_bytes as action_pdf_bytes
 from sndintel.briefing import (
     CALCULATION_NOTES,
     GLOSSARY,
@@ -147,6 +151,20 @@ def load_all():
             data["exec_summary"] = read_sql(conn, "SELECT * FROM exec_summary")
         except Exception:
             data["exec_summary"] = pd.DataFrame()
+        try:
+            data["action_brief"] = read_sql(conn, "SELECT * FROM action_brief")
+            data["action_shops"] = read_sql(conn, "SELECT * FROM action_shops")
+            data["action_units"] = read_sql(conn, "SELECT * FROM action_units")
+            data["action_backtest"] = read_sql(conn, "SELECT * FROM action_backtest")
+        except Exception:
+            data["action_brief"] = pd.DataFrame()
+            data["action_shops"] = pd.DataFrame()
+            data["action_units"] = pd.DataFrame()
+            data["action_backtest"] = pd.DataFrame()
+        try:
+            data["shop_day"] = read_sql(conn, "SELECT * FROM shop_day")
+        except Exception:
+            data["shop_day"] = pd.DataFrame()
     return data
 
 
@@ -180,7 +198,7 @@ def main():
     st.sidebar.caption("Secondary sales · shop × SKU · Pakistan S&D")
     page = st.sidebar.radio(
         "Workspace",
-        ["Strategy", "Report", "Upload files", "Focus", "People", "Mix", "Shops", "Warehouse"],
+        ["Strategy", "This week", "Report", "Upload files", "Focus", "People", "Mix", "Shops", "Warehouse"],
         index=1 if empty else 0,
     )
     st.sidebar.divider()
@@ -207,6 +225,8 @@ def main():
 
     if page == "Strategy":
         _page_strategy(data, latest, period, mtd, ledger)
+    elif page == "This week":
+        _page_this_week(data, period, mtd, ledger)
     elif page == "Report":
         _page_report(data, latest, period, mtd, ledger)
     elif page == "Focus":
@@ -665,7 +685,7 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
     cfg = {}
     for col in df.columns:
         name = str(col)
-        if name == "Remarks":
+        if name in {"Remarks", "Do this"}:
             cfg[col] = st.column_config.TextColumn(name, width="large")
         elif name == "Drop size (MT)":
             cfg[col] = st.column_config.NumberColumn(name, format="%.2f")
@@ -684,6 +704,101 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
         height=min(max(height, 160), 80 + row_h * min(n, 12)),
         column_config=cfg,
     )
+
+
+def _page_this_week(data, period, mtd, ledger):
+    st.title("This week")
+    st.caption(
+        f"**{mtd['label'] or period}** · Exact call, convert, and lift-drop instructions from each "
+        "shop’s own billed-day shape. Expected is still the last-three-closed-month run-rate — "
+        "the curve only times it through the month. Rebuild scorecards after an Outlet Date Wise upload."
+    )
+    if mtd.get("open"):
+        st.info(banner_text(ledger, period))
+    pack = None
+    brief = data.get("action_brief", pd.DataFrame())
+    if brief is not None and not brief.empty:
+        with connect() as conn:
+            pack = load_action_pack(conn, period)
+    if pack is None or not pack.headline:
+        shop_month = data.get("shop_month", pd.DataFrame())
+        if shop_month is None or shop_month.empty:
+            st.warning("No scorecards yet. Upload Outlet Date Wise and rebuild.")
+            _rescore_button()
+            return
+        pack = build_action_pack(
+            shop_month,
+            data.get("stores"),
+            shop_day=data.get("shop_day"),
+            visits=data.get("visits"),
+            ledger=ledger,
+            period=period,
+        )
+    if not pack.headline and pack.country.empty:
+        st.warning("No action list yet. Rebuild after daily sales are in the warehouse.")
+        _rescore_button()
+        return
+
+    st.markdown(f"**{pack.headline}**")
+    if pack.source == "calendar":
+        st.caption("Daily billed days were not found — lists use calendar pace. Upload Outlet Date Wise to time the month.")
+    else:
+        st.caption("Delivery curve learned from billed days, shrunk shop → DSR → city → country.")
+
+    left, right = st.columns(2)
+    with left:
+        st.download_button(
+            "Download this week (Excel)",
+            action_excel_bytes(pack),
+            file_name=f"SND_this_week_{period}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+    with right:
+        st.download_button(
+            "Download this week (PDF)",
+            action_pdf_bytes(pack),
+            file_name=f"SND_this_week_{period}.pdf",
+            mime="application/pdf",
+        )
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "Download detailed action pack (Excel)",
+            action_excel_bytes(pack, detailed=True),
+            file_name=f"SND_this_week_{period}_detailed.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with d2:
+        st.download_button(
+            "Download detailed action pack (PDF)",
+            action_pdf_bytes(pack, detailed=True),
+            file_name=f"SND_this_week_{period}_detailed.pdf",
+            mime="application/pdf",
+        )
+
+    st.markdown("##### 1. Country this week")
+    _strategy_table(pack.country, height=140)
+    st.markdown("##### 2. Push these distributors")
+    st.caption("One list. Ranked by this-week tonnes — not Gap tons.")
+    _strategy_table(pack.distributors, height=320)
+    st.markdown("##### 3. Push these DSRs")
+    st.caption("One national list. A DSR can appear even if its distributor is not above.")
+    _strategy_table(pack.dsrs, height=320)
+    st.markdown("##### 4. Call these shops")
+    st.caption("Unvisited doors behind their own curve. This week is the tonnes ask.")
+    _strategy_table(pack.calls, height=420)
+    st.markdown("##### 5. Convert — visited, not billed")
+    _strategy_table(pack.converts, height=280)
+    st.markdown("##### 6. Lift drop — billed, behind curve")
+    _strategy_table(pack.lifts, height=280)
+    st.markdown("##### 7. Backtest")
+    st.caption("Walk-forward at day 15 of closed months. Curve precision@50 should beat calendar pace.")
+    _strategy_table(pack.backtest, height=160)
+    with st.expander("How to read this pack", expanded=False):
+        for term, meaning in ACTION_GLOSSARY:
+            st.markdown(f"**{term}.** {meaning}")
+    _rescore_button()
 
 
 def _page_report(data, _latest, period, mtd, ledger):
