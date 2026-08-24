@@ -140,7 +140,7 @@ python -m pip install -e .
 snd-intel app
 ```
 
-After this version is installed you can also run `snd-intel apply-zip` (picks the newest `SND-pro*.zip` in Downloads). Check **Warehouse** — it should show version **0.5.0**.
+After this version is installed you can also run `snd-intel apply-zip` (picks the newest `SND-pro*.zip` in Downloads). Check **Warehouse** — it should show version **0.6.0**. The app opens on **This week → Monday dispatch**.
 
 Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates) and leave **Replace all billed sales** ticked so Shop SKU Wise rows go away. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
 

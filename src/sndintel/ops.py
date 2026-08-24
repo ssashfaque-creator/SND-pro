@@ -120,6 +120,39 @@ def build_dsr_beat_pack(action: ActionPack, per_dsr: int | None = None) -> OpsPa
     return OpsPack(period=action.period, label=action.label, kind="dsr", headline=headline, sheets=sheets)
 
 
+def beat_owner_options(df: pd.DataFrame) -> list[str]:
+    """Picker labels: display name · city · distributor so two Shahids never collide."""
+    if df is None or df.empty:
+        return []
+    labels = []
+    for _, row in df.iterrows():
+        dsr = str(row.get("DSR") or "").strip()
+        city = str(row.get("City") or "").strip()
+        dist = str(row.get("Distributor") or "").strip()
+        if not dsr:
+            continue
+        labels.append(f"{dsr} · {city} · {dist}".strip(" ·"))
+    return sorted(set(labels))
+
+
+def filter_beat_by_owner(df: pd.DataFrame, owner: str | None) -> pd.DataFrame:
+    """Keep one DSR's doors. `owner` is `Name · City · Distributor` from beat_owner_options."""
+    if df is None or df.empty or not owner:
+        return df if df is not None else pd.DataFrame()
+    parts = [p.strip() for p in str(owner).split("·")]
+    dsr = parts[0] if parts else ""
+    city = parts[1] if len(parts) > 1 else ""
+    dist = parts[2] if len(parts) > 2 else ""
+    out = df.copy()
+    if "DSR" in out.columns and dsr:
+        out = out[out["DSR"].astype(str).str.strip() == dsr]
+    if "City" in out.columns and city:
+        out = out[out["City"].astype(str).str.strip() == city]
+    if "Distributor" in out.columns and dist:
+        out = out[out["Distributor"].astype(str).str.strip() == dist]
+    return out
+
+
 def build_friday_pack(outcomes: pd.DataFrame, action: ActionPack | None = None) -> OpsPack:
     """Close the loop on the list we printed, not a new ranking."""
     if outcomes is None or outcomes.empty:

@@ -4,9 +4,11 @@ import pandas as pd
 
 from sndintel.action import ACTION_CALL, ACTION_CONVERT, persist_action_pack
 from sndintel.ops import (
+    beat_owner_options,
     build_dsr_beat_pack,
     build_friday_pack,
     build_monday_pack,
+    filter_beat_by_owner,
     load_outcomes,
     score_closed_loop,
 )
@@ -85,6 +87,41 @@ def test_dsr_beat_pack_caps_per_person():
     beat = build_dsr_beat_pack(pack)
     listed = beat.sheets[0][3]
     assert len(listed) == DSR_DAY_CAP
+
+
+def test_beat_filter_keeps_two_people_with_the_same_name_apart():
+    from sndintel.action import ActionPack
+
+    rows = []
+    for city, dist, n in (("Karachi", "Eva", 5), ("Lahore", "Punjab", 5)):
+        for i in range(n):
+            rows.append(
+                {
+                    "store_id": f"{city[:1]}{i}",
+                    "store_name": f"{city} shop {i}",
+                    "dsr_name": "Shahid",
+                    "city": city,
+                    "distributor": dist,
+                    "action": ACTION_CALL,
+                    "week_target_mt": 1.0,
+                    "value_score": n - i,
+                    "instruction": "Call",
+                    "next_drop_mt": 0.4,
+                    "days_since_bill": 18,
+                    "cover_left_days": 0,
+                }
+            )
+    pack = ActionPack(period="2026-08", label="August 2026", raw_shops=pd.DataFrame(rows), headline="test")
+    beat = build_dsr_beat_pack(pack, per_dsr=12)
+    table = beat.sheets[0][3]
+    owners = beat_owner_options(table)
+    assert owners == ["Shahid · Karachi · Eva", "Shahid · Lahore · Punjab"]
+    karachi = filter_beat_by_owner(table, owners[0])
+    lahore = filter_beat_by_owner(table, owners[1])
+    assert set(karachi["City"]) == {"Karachi"}
+    assert set(lahore["City"]) == {"Lahore"}
+    assert len(karachi) == 5
+    assert len(lahore) == 5
 
 
 def test_monday_pack_has_capacity_and_whales():

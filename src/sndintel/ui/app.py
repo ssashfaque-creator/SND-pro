@@ -34,10 +34,12 @@ from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
 from sndintel.ops import (
+    beat_owner_options,
     build_dsr_beat_pack,
     build_friday_pack,
     build_monday_pack,
     excel_bytes as ops_excel_bytes,
+    filter_beat_by_owner,
     load_outcomes,
     pdf_bytes as ops_pdf_bytes,
 )
@@ -208,7 +210,7 @@ def main():
     page = st.sidebar.radio(
         "Workspace",
         ["Strategy", "This week", "Report", "Upload files", "Focus", "People", "Mix", "Shops", "Warehouse"],
-        index=1 if empty else 0,
+        index=1,
     )
     st.sidebar.divider()
     st.sidebar.markdown(f"**Warehouse** `{DB_PATH}`")
@@ -747,11 +749,41 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
     )
 
 
+def _ops_downloads(pack, period: str, stem: str, key_prefix: str):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Excel",
+            ops_excel_bytes(pack),
+            file_name=f"SND_{stem}_{period}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_xlsx",
+        )
+    with c2:
+        st.download_button(
+            "PDF",
+            ops_pdf_bytes(pack),
+            file_name=f"SND_{stem}_{period}.pdf",
+            mime="application/pdf",
+            key=f"{key_prefix}_pdf",
+        )
+
+
+def _render_ops_sheets(sheets, height: int = 280):
+    if not sheets:
+        st.caption("No rows at this layer.")
+        return
+    for _sheet, heading, note, df in sheets:
+        st.markdown(f"**{heading}**")
+        if note:
+            st.caption(note)
+        _strategy_table(df, height=height)
+
+
 def _page_this_week(data, period, mtd, ledger):
     st.title("This week")
     st.caption(
-        f"**{mtd['label'] or period}** · Which doors are due to order, bought too little, or are fading. "
-        "Each shop’s usual days-between-bills and leftover cover from the last drop decide the action. "
+        f"**{mtd['label'] or period}** · Monday dispatch is the operating view. "
         "Expected is still the last-three-closed-month run-rate — no day-of-month seasonality. "
         "Rebuild scorecards after an Outlet Date Wise upload."
     )
@@ -787,38 +819,6 @@ def _page_this_week(data, period, mtd, ledger):
     else:
         st.caption("Purchase cycle and leftover cover learned from billed days, shrunk shop → DSR → city.")
 
-    left, right = st.columns(2)
-    with left:
-        st.download_button(
-            "Download this week (Excel)",
-            action_excel_bytes(pack),
-            file_name=f"SND_this_week_{period}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
-    with right:
-        st.download_button(
-            "Download this week (PDF)",
-            action_pdf_bytes(pack),
-            file_name=f"SND_this_week_{period}.pdf",
-            mime="application/pdf",
-        )
-    d1, d2 = st.columns(2)
-    with d1:
-        st.download_button(
-            "Download detailed action pack (Excel)",
-            action_excel_bytes(pack, detailed=True),
-            file_name=f"SND_this_week_{period}_detailed.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    with d2:
-        st.download_button(
-            "Download detailed action pack (PDF)",
-            action_pdf_bytes(pack, detailed=True),
-            file_name=f"SND_this_week_{period}_detailed.pdf",
-            mime="application/pdf",
-        )
-
     units = data.get("units", pd.DataFrame())
     visits = data.get("visits", pd.DataFrame())
     monday = build_monday_pack(pack, units, visits)
@@ -826,86 +826,106 @@ def _page_this_week(data, period, mtd, ledger):
     with connect() as conn:
         outcomes = load_outcomes(conn, period)
     friday = build_friday_pack(outcomes, pack)
-    st.markdown("##### Operating packs")
-    st.caption("Monday = NSM dispatch. DSR beat = capacity-capped call lists. Friday = listed → visited → billed against the previous list.")
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.download_button(
-            "Monday NSM (Excel)",
-            ops_excel_bytes(monday),
-            file_name=f"SND_monday_{period}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+    view = st.radio(
+        "View",
+        ["Monday dispatch", "DSR beat lists", "Friday close", "Full this-week lists"],
+        horizontal=True,
+        index=0,
+        key="this_week_view",
+    )
+
+    if view == "Monday dispatch":
+        st.caption(
+            "Where the tons are, who is overloaded vs not converting, which whales close the month. "
+            "Do not send coverage actions into a 100% visit city."
         )
-        st.download_button(
-            "Monday NSM (PDF)",
-            ops_pdf_bytes(monday),
-            file_name=f"SND_monday_{period}.pdf",
-            mime="application/pdf",
-        )
-    with m2:
-        st.download_button(
-            "DSR beat lists (Excel)",
-            ops_excel_bytes(beat),
-            file_name=f"SND_dsr_beat_{period}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.download_button(
-            "DSR beat lists (PDF)",
-            ops_pdf_bytes(beat),
-            file_name=f"SND_dsr_beat_{period}.pdf",
-            mime="application/pdf",
-        )
-    with m3:
-        st.download_button(
-            "Friday close (Excel)",
-            ops_excel_bytes(friday),
-            file_name=f"SND_friday_{period}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.download_button(
-            "Friday close (PDF)",
-            ops_pdf_bytes(friday),
-            file_name=f"SND_friday_{period}.pdf",
-            mime="application/pdf",
-        )
-    if monday.warnings:
         for warning in monday.warnings:
             st.warning(warning)
-    st.caption(friday.headline)
-    if friday.sheets:
-        st.markdown("##### Friday close")
-        st.caption("This is whether last week’s list moved volume — not a new ranking. Score the warehouse twice in the same month to fill it.")
-        for _sheet, heading, note, df in friday.sheets:
-            st.markdown(f"**{heading}**")
-            if note:
-                st.caption(note)
-            _strategy_table(df, height=220)
+        _render_ops_sheets(monday.sheets, height=280)
+        with st.expander("Download Monday NSM pack"):
+            _ops_downloads(monday, period, "monday", "monday")
+    elif view == "DSR beat lists":
+        st.caption(beat.headline)
+        beat_df = beat.sheets[0][3] if beat.sheets else pd.DataFrame()
+        owners = beat_owner_options(beat_df)
+        pick = st.selectbox("DSR", ["All DSRs"] + owners, key="beat_dsr")
+        shown = beat_df if pick == "All DSRs" else filter_beat_by_owner(beat_df, pick)
+        st.caption(f"{len(shown)} doors on this list. Waiting-list doors stay in Full this-week lists.")
+        _strategy_table(shown, height=480)
+        with st.expander("Download DSR beat lists"):
+            _ops_downloads(beat, period, "dsr_beat", "beat")
+    elif view == "Friday close":
+        st.caption(
+            "This is whether last week’s list moved volume — not a new ranking. "
+            "Score the warehouse twice in the same month to fill it."
+        )
+        st.markdown(f"**{friday.headline}**")
+        _render_ops_sheets(friday.sheets, height=240)
+        with st.expander("Download Friday close"):
+            _ops_downloads(friday, period, "friday", "friday")
+    else:
+        left, right = st.columns(2)
+        with left:
+            st.download_button(
+                "Download this week (Excel)",
+                action_excel_bytes(pack),
+                file_name=f"SND_this_week_{period}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="full_week_xlsx",
+            )
+        with right:
+            st.download_button(
+                "Download this week (PDF)",
+                action_pdf_bytes(pack),
+                file_name=f"SND_this_week_{period}.pdf",
+                mime="application/pdf",
+                key="full_week_pdf",
+            )
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Download detailed action pack (Excel)",
+                action_excel_bytes(pack, detailed=True),
+                file_name=f"SND_this_week_{period}_detailed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="full_week_detail_xlsx",
+            )
+        with d2:
+            st.download_button(
+                "Download detailed action pack (PDF)",
+                action_pdf_bytes(pack, detailed=True),
+                file_name=f"SND_this_week_{period}_detailed.pdf",
+                mime="application/pdf",
+                key="full_week_detail_pdf",
+            )
+        st.markdown("##### 1. Country this week")
+        _strategy_table(pack.country, height=140)
+        st.markdown("##### 2. Push these distributors")
+        st.caption("Ranked by rest-of-month ask KG. Doors = due now. Coming due = cycle lands before month-end. Ask is those drops, not the whole Expected hole.")
+        _strategy_table(pack.distributors, height=320)
+        st.markdown("##### 3. Push these DSRs")
+        st.caption("One national list. A DSR can appear even if its distributor is not above.")
+        _strategy_table(pack.dsrs, height=320)
+        st.markdown("##### 4. Due — cycle elapsed, not visited")
+        st.caption("Usually buys every N days; it has been N days with no bill. Nobody visited this month.")
+        _strategy_table(pack.calls, height=420)
+        st.markdown("##### 5. Due · visited — called, still no bill")
+        _strategy_table(pack.converts, height=280)
+        st.markdown("##### 6. Another visit — bought too little this month")
+        st.caption("Billed once (or a stub) and still short of Expected. Cycle says they should have bought again.")
+        _strategy_table(pack.lifts, height=280)
+        st.markdown("##### 7. Lapsing — quiet too long or declining")
+        st.caption("Two cycles with no bill, or last-three months down versus the three before. Unvisited doors rank first.")
+        _strategy_table(pack.lapses, height=280)
+        st.markdown("##### 8. Backtest")
+        st.caption("At day 15 of closed months: did shops marked due actually bill in the next 14 days?")
+        _strategy_table(pack.backtest, height=160)
+        with st.expander("How to read this pack", expanded=False):
+            for term, meaning in ACTION_GLOSSARY:
+                st.markdown(f"**{term}.** {meaning}")
 
-    st.markdown("##### 1. Country this week")
-    _strategy_table(pack.country, height=140)
-    st.markdown("##### 2. Push these distributors")
-    st.caption("Ranked by rest-of-month ask KG. Doors = due now. Coming due = cycle lands before month-end. Ask is those drops, not the whole Expected hole.")
-    _strategy_table(pack.distributors, height=320)
-    st.markdown("##### 3. Push these DSRs")
-    st.caption("One national list. A DSR can appear even if its distributor is not above.")
-    _strategy_table(pack.dsrs, height=320)
-    st.markdown("##### 4. Due — cycle elapsed, not visited")
-    st.caption("Usually buys every N days; it has been N days with no bill. Nobody visited this month.")
-    _strategy_table(pack.calls, height=420)
-    st.markdown("##### 5. Due · visited — called, still no bill")
-    _strategy_table(pack.converts, height=280)
-    st.markdown("##### 6. Another visit — bought too little this month")
-    st.caption("Billed once (or a stub) and still short of Expected. Cycle says they should have bought again.")
-    _strategy_table(pack.lifts, height=280)
-    st.markdown("##### 7. Lapsing — quiet too long or declining")
-    st.caption("Two cycles with no bill, or last-three months down versus the three before. Unvisited doors rank first.")
-    _strategy_table(pack.lapses, height=280)
-    st.markdown("##### 8. Backtest")
-    st.caption("At day 15 of closed months: did shops marked due actually bill in the next 14 days?")
-    _strategy_table(pack.backtest, height=160)
-    with st.expander("How to read this pack", expanded=False):
-        for term, meaning in ACTION_GLOSSARY:
-            st.markdown(f"**{term}.** {meaning}")
     _rescore_button()
 
 
@@ -1270,7 +1290,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.4.0, the ZIP did not land.\n"
+        f"- App version **{__version__}**. If this is still 0.5.0, the ZIP did not land.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
