@@ -27,6 +27,16 @@ from sndintel.config import (
 )
 from sndintel.identity import dsr_display_name, dsr_unit_id
 
+
+def _num(df: pd.DataFrame, name: str) -> pd.Series:
+    """Numeric column as a Series. DataFrame.get is None when the column is missing."""
+    if df is None:
+        return pd.Series(dtype=float)
+    if name not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    return pd.to_numeric(df[name], errors="coerce")
+
+
 LABEL_OVERLOADED = "Overloaded"
 LABEL_NOT_WORKING = "Not working the beat"
 LABEL_NOT_CONVERTING = "Not converting"
@@ -50,19 +60,20 @@ def score_dsr_capacity_from_units(
     feasible = days_done * rate
     out = dsrs.copy()
     if "dsr_name" not in out.columns:
-        out["dsr_name"] = out.get("grain_id", "").map(dsr_display_name)
-    universe = pd.to_numeric(out.get("universe"), errors="coerce").fillna(0)
-    visited = pd.to_numeric(out.get("visited"), errors="coerce")
-    billed = pd.to_numeric(out.get("billed"), errors="coerce").fillna(0)
-    visit_rate = pd.to_numeric(out.get("visit_rate"), errors="coerce")
+        names = out["grain_id"] if "grain_id" in out.columns else pd.Series("", index=out.index)
+        out["dsr_name"] = names.map(dsr_display_name)
+    universe = _num(out, "universe").fillna(0)
+    visited = _num(out, "visited")
+    billed = _num(out, "billed").fillna(0)
+    visit_rate = _num(out, "visit_rate")
     visit_rate = visit_rate.where(visit_rate.notna(), visited / universe.replace(0, np.nan))
     visited = visited.fillna(visit_rate.fillna(0) * universe)
     strike_v = np.where(visited.fillna(0) > 0, billed / visited.replace(0, np.nan), np.nan)
     span = universe / feasible if feasible else np.inf
-    vol = pd.to_numeric(out.get("volume_mt"), errors="coerce").fillna(0)
-    exp = pd.to_numeric(out.get("expected_mt"), errors="coerce").fillna(0)
+    vol = _num(out, "volume_mt").fillna(0)
+    exp = _num(out, "expected_mt").fillna(0)
     drop_now = vol / billed.replace(0, np.nan)
-    exp_drop = pd.to_numeric(out.get("expected_drop_size_mt"), errors="coerce")
+    exp_drop = _num(out, "expected_drop_size_mt")
     drop_index = drop_now / exp_drop.replace(0, np.nan)
     remaining = (exp - vol).clip(lower=0)
     labels, whys = [], []
@@ -178,17 +189,17 @@ def whale_shops(shops: pd.DataFrame, n: int = WHALE_N, floor_mt: float | None = 
         return shops if shops is not None else pd.DataFrame()
     floor = float(floor_mt if floor_mt is not None else WHALE_AMS_MT)
     out = shops.copy()
-    ams = pd.to_numeric(out.get("ams_3m"), errors="coerce").fillna(0)
-    exp = pd.to_numeric(out.get("expected_mt"), errors="coerce").fillna(0)
-    last = pd.to_numeric(out.get("last_drop_mt"), errors="coerce")
-    if last is None or last.isna().all():
-        last = pd.to_numeric(out.get("ly_mt"), errors="coerce")
-    last = last.fillna(0) if last is not None else 0
-    rec = pd.to_numeric(out.get("recoverable_mt"), errors="coerce")
-    if rec is None or rec.isna().all():
-        rec = pd.to_numeric(out.get("remaining_mt"), errors="coerce")
-    rec = rec.fillna(0) if rec is not None else pd.Series(0.0, index=out.index)
-    ask = pd.to_numeric(out.get("week_target_mt"), errors="coerce").fillna(0)
+    ams = _num(out, "ams_3m").fillna(0)
+    exp = _num(out, "expected_mt").fillna(0)
+    last = _num(out, "last_drop_mt")
+    if last.isna().all():
+        last = _num(out, "ly_mt")
+    last = last.fillna(0)
+    rec = _num(out, "recoverable_mt")
+    if rec.isna().all():
+        rec = _num(out, "remaining_mt")
+    rec = rec.fillna(0)
+    ask = _num(out, "week_target_mt").fillna(0)
     whale = (ams >= floor) | (exp >= floor) | (last >= floor)
     hole = rec > 0.05
     picked = out.loc[whale & hole].copy()
@@ -232,32 +243,32 @@ def score_dsr_capacity(
     for did, g in work.groupby("dsr_id"):
         universe = int(g["store_id"].nunique()) if "store_id" in g.columns else int(len(g))
         visited = int((g.get("call_status", pd.Series(dtype=str)) != "Unvisited").sum()) if "call_status" in g.columns else universe
-        billed_n = int((pd.to_numeric(g.get("billed_mt"), errors="coerce").fillna(0) > 0.005).sum()) if "billed_mt" in g.columns else 0
+        billed_n = int((_num(g, "billed_mt").fillna(0) > 0.005).sum()) if "billed_mt" in g.columns else 0
         if billed_n == 0 and "volume_mt" in g.columns:
-            billed_n = int((pd.to_numeric(g["volume_mt"], errors="coerce").fillna(0) > 0.005).sum())
-        cycle = pd.to_numeric(g.get("cycle_days"), errors="coerce").replace(0, np.nan).fillna(30)
+            billed_n = int((_num(g, "volume_mt").fillna(0) > 0.005).sum())
+        cycle = _num(g, "cycle_days").replace(0, np.nan).fillna(30)
         required_freq = float((days_done / cycle.clip(lower=7)).sum())
         span_unique = universe / feasible_mtd if feasible_mtd else np.inf
         span_freq = required_freq / feasible_mtd if feasible_mtd else np.inf
         visit_rate = visited / universe if universe else np.nan
         strike_of_visits = billed_n / visited if visited else np.nan
-        billed_mt = float(pd.to_numeric(g.get("billed_mt"), errors="coerce").fillna(0).sum()) if "billed_mt" in g.columns else float(
-            pd.to_numeric(g.get("volume_mt"), errors="coerce").fillna(0).sum()
+        billed_mt = float(_num(g, "billed_mt").fillna(0).sum()) if "billed_mt" in g.columns else float(
+            _num(g, "volume_mt").fillna(0).sum()
         )
-        expected = float(pd.to_numeric(g.get("expected_mt"), errors="coerce").fillna(0).sum())
-        ams = float(pd.to_numeric(g.get("ams_3m"), errors="coerce").fillna(0).sum()) if "ams_3m" in g.columns else expected
+        expected = float(_num(g, "expected_mt").fillna(0).sum())
+        ams = float(_num(g, "ams_3m").fillna(0).sum()) if "ams_3m" in g.columns else expected
         billed_shops = max(billed_n, 1)
         drop_now = billed_mt / billed_shops if billed_n else np.nan
-        exp_drop = expected / max(int((pd.to_numeric(g.get("expected_mt"), errors="coerce").fillna(0) > 0).sum()), 1)
+        exp_drop = expected / max(int((_num(g, "expected_mt").fillna(0) > 0).sum()), 1)
         if "typical_drop_mt" in g.columns:
-            typ = pd.to_numeric(g["typical_drop_mt"], errors="coerce")
+            typ = _num(g, "typical_drop_mt")
             if typ.notna().any():
                 exp_drop = float(typ.median())
         drop_index = (drop_now / exp_drop) if exp_drop and drop_now == drop_now and exp_drop == exp_drop and exp_drop > 0 else np.nan
-        remaining = float(pd.to_numeric(g.get("remaining_mt"), errors="coerce").fillna(0).sum()) if "remaining_mt" in g.columns else max(
+        remaining = float(_num(g, "remaining_mt").fillna(0).sum()) if "remaining_mt" in g.columns else max(
             0.0, expected - billed_mt
         )
-        ask = float(pd.to_numeric(g.get("week_target_mt"), errors="coerce").fillna(0).sum()) if "week_target_mt" in g.columns else remaining
+        ask = float(_num(g, "week_target_mt").fillna(0).sum()) if "week_target_mt" in g.columns else remaining
         label, why = _label(
             span_unique=span_unique,
             visit_rate=visit_rate,
@@ -375,7 +386,7 @@ def apply_city_driver_priority(shops: pd.DataFrame) -> pd.DataFrame:
         return shops if shops is not None else pd.DataFrame()
     out = shops.copy()
     if "value_score" not in out.columns:
-        out["value_score"] = pd.to_numeric(out.get("week_target_mt"), errors="coerce").fillna(0)
+        out["value_score"] = _num(out, "week_target_mt").fillna(0)
     if "call_status" not in out.columns:
         return out
     visit_rate = (
