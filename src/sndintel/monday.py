@@ -88,7 +88,7 @@ def present_action_row(name: str, name_label: str, buckets: dict[str, float], ex
         name_label: name,
         "Expected this month (MT)": round(float(buckets.get("expected_mt") or 0), 1),
         "AMS (MT)": round(float(buckets.get("ams_3m") or 0), 1),
-        "Still to Expected (MT)": round(float(buckets.get("remaining_mt") or 0), 1),
+        "Billed (MT)": round(float(buckets.get("billed_mt") or 0), 1),
         "Ask rest of month (MT)": ask_mt,
         "Doors to visit": count_ask(buckets.get("n_doors"), doors_mt),
         "Unvisited": count_ask(buckets.get("n_call"), unvis),
@@ -195,7 +195,7 @@ def _sort_stores(shops: pd.DataFrame) -> pd.DataFrame:
     return work.drop(columns=["_ask", "_dsr_id", "_dsr_ask"], errors="ignore")
 
 
-def city_driver_table(units: pd.DataFrame) -> pd.DataFrame:
+def city_driver_table(units: pd.DataFrame, shops: pd.DataFrame | None = None) -> pd.DataFrame:
     if units is None or units.empty:
         return pd.DataFrame()
     cities = units[units["grain"] == "city"].copy()
@@ -211,10 +211,16 @@ def city_driver_table(units: pd.DataFrame) -> pd.DataFrame:
         parts.sort(key=lambda x: abs(x[1]), reverse=True)
         driver.append(parts[0][0] if parts[0][1] else "on expected")
     ams = pd.to_numeric(cities.get("ams_3m"), errors="coerce")
+    if shops is not None and not shops.empty and "city" in shops.columns:
+        shop_ams = pd.to_numeric(shops.get("ams_3m"), errors="coerce").fillna(0)
+        rolled = shops.assign(_city=shops["city"].astype(str), _ams=shop_ams).groupby("_city")["_ams"].sum()
+        from_shops = cities["grain_id"].astype(str).map(rolled)
+        empty = ams.isna() | (pd.to_numeric(ams, errors="coerce").fillna(0) <= 0)
+        ams = ams.where(~empty, from_shops)
     out = pd.DataFrame(
         {
             "City": cities["grain_id"].astype(str),
-            "AMS (MT)": ams.round(1),
+            "AMS (MT)": pd.to_numeric(ams, errors="coerce").fillna(0).round(1),
             "Billed (MT)": pd.to_numeric(cities.get("volume_mt"), errors="coerce").round(1),
             "Expected (MT)": pd.to_numeric(cities.get("expected_mt"), errors="coerce").round(1),
             "Gap (MT)": rec.round(1),

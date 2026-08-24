@@ -76,6 +76,14 @@ def parse_outlet_date_wise(path: str | Path) -> tuple[pd.DataFrame, ParseReport]
     body = body.loc[keep]
     store_id = store_id.loc[keep]
     store_name = store_name.loc[keep]
+    report.daily_dates = sorted(
+        {
+            (d.isoformat() if hasattr(d, "isoformat") else str(d)[:10])
+            for d in date_cols.values()
+            if d is not None
+        }
+    )
+    report.daily_store_ids = store_id.astype(str).str.strip().drop_duplicates().tolist()
     if body.empty:
         report.warnings.append("No POP codes in the Outlet Date Wise sheet")
         return pd.DataFrame(columns=SALES_COLUMNS), report

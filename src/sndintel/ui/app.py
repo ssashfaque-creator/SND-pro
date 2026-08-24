@@ -292,7 +292,7 @@ def _page_upload(empty: bool):
             type=["xlsx", "xls", "xlsm", "csv"],
             key="sales",
             accept_multiple_files=True,
-            help="Split a large daily file by shops or by date range and drop every part here in one go.",
+            help="Split a large daily file by shops or by date range. Later files override overlapping shop-days; other days stay.",
         )
         visits = st.file_uploader(
             "Shop visit calls (csv / xlsx) — MTD visits, weekly with sales",
@@ -304,14 +304,18 @@ def _page_upload(empty: bool):
 
     st.markdown(
         "- **Universe** can stay in the warehouse. Re-upload only when shops/DSRs move.\n"
-        "- **Sales:** drop several Outlet Date Wise files together (shop split or date split). Same POP + month is added across files. Do not upload the same rows twice.\n"
-        "- Shop SKU Wise still parses if that is what you have.\n"
-        "- Every later week: **sales + visit calls**. Closed months stay unless you tick replace-all below."
+        "- **Outlet Date Wise:** days in these files **replace** the same shop-days already stored "
+        "(a later file that includes 20 Aug overrides an earlier incomplete 20 Aug). "
+        "Days and shops not in the file stay. Shop-split files in one drop are combined. "
+        "Do not tick replace-all for a weekly MTD refresh.\n"
+        "- **Shop SKU Wise:** months in the file replace those months (August-only keeps July).\n"
+        "- Every later week: **sales + visit calls**. Tick replace-all only to wipe billed history "
+        "(for example switching from Shop SKU Wise to Outlet Date Wise)."
     )
     replace_sales = st.checkbox(
         "Replace all billed sales (keep universe and visits)",
-        value=True,
-        help="On: wipe previous billed rows, then load these files. Use this when switching from Shop SKU Wise to Outlet Date Wise, or when the split set is the full history. Off: only months present in these files are replaced (August-only MTD refresh keeps July).",
+        value=False,
+        help="Off (default): Outlet Date Wise overrides overlapping shop-days and rebuilds those months from the warehouse; other days stay. Shop SKU Wise still replaces each month the file contains. On: wipe every billed row first, then load only these files.",
     )
 
     st.divider()
@@ -440,12 +444,19 @@ def _page_upload(empty: bool):
             st.exception(exc)
             return
     st.cache_data.clear()
+    overlay_note = ""
+    if result.get("ingest_mode") == "daily_overlay" and not result.get("replace_sales"):
+        n_days = len(result.get("overridden_dates") or [])
+        overlay_note = (
+            f"Daily overlay: {n_days} billed day(s) in these files replaced matching warehouse shop-days; "
+            "other days stayed. "
+        )
     st.success(
         f"Scored {result.get('n_sales_rows')} fact rows · {result.get('n_sales_files') or 0} sales file(s) · "
         f"latest {result.get('latest_period')} · "
         f"{result.get('n_cities', 0)} cities · universe {result.get('n_universe') or '—'} · "
         f"visits {result.get('n_visits') or '—'}. "
-        f"{'Replaced all billed sales. ' if result.get('replace_sales') else ''}"
+        f"{'Replaced all billed sales. ' if result.get('replace_sales') else overlay_note}"
         f"Months: {', '.join(result.get('replaced_periods') or []) or '—'}"
     )
     if result.get("open_mtd_period"):
@@ -822,7 +833,7 @@ def _page_this_week(data, period, mtd, ledger):
 
     units = data.get("units", pd.DataFrame())
     visits = data.get("visits", pd.DataFrame())
-    monday = build_monday_pack(pack, units, visits)
+    monday = build_monday_pack(pack, units, visits, exec_summary=_exec_row(data, period))
     beat = build_dsr_beat_pack(pack)
     with connect() as conn:
         outcomes = load_outcomes(conn, period)
@@ -1291,7 +1302,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.6.1, curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.6.2, curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"

@@ -60,19 +60,24 @@ class OpsPack:
     headline: str = ""
     sheets: list[tuple[str, str, str, pd.DataFrame]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    exec_situation: list[str] = field(default_factory=list)
+    exec_focus: list[dict[str, str]] = field(default_factory=list)
+    exec_error: str = ""
+    exec_model: str = ""
 
 
 def build_monday_pack(
     action: ActionPack,
     units: pd.DataFrame | None = None,
     visits: pd.DataFrame | None = None,
+    exec_summary: dict[str, Any] | None = None,
 ) -> OpsPack:
     """NSM Monday: summary (country → cities → DSR → dist → stores) then city/store detail."""
     shops = action.raw_shops if action.raw_shops is not None and not action.raw_shops.empty else pd.DataFrame()
     warnings = visit_quality_warnings(units, visits, action.period)
     cap = score_dsr_capacity(shops, action.as_of_day, action.days_in_month, action.days_left) if not shops.empty else pd.DataFrame()
     whales = whale_shops(shops, n=MONDAY_WHALES) if not shops.empty else pd.DataFrame()
-    drivers = city_driver_table(units) if units is not None else pd.DataFrame()
+    drivers = city_driver_table(units, shops) if units is not None else pd.DataFrame()
     headline = action.headline or f"{action.label}: Monday dispatch"
     work = operating_shops(shops)
     city_actions = city_action_table(shops)
@@ -158,7 +163,15 @@ def build_monday_pack(
                 store_table(part),
             )
         )
-    return OpsPack(period=action.period, label=action.label, kind="monday", headline=headline, sheets=sheets, warnings=warnings)
+    pack = OpsPack(period=action.period, label=action.label, kind="monday", headline=headline, sheets=sheets, warnings=warnings)
+    if exec_summary:
+        from sndintel.briefing import _parse_exec_focus, _parse_exec_list
+
+        pack.exec_situation = _parse_exec_list(exec_summary.get("situation_json") or exec_summary.get("situation"))
+        pack.exec_focus = _parse_exec_focus(exec_summary.get("focus_json") or exec_summary.get("focus"))
+        pack.exec_model = str(exec_summary.get("model") or "")
+        pack.exec_error = str(exec_summary.get("error") or "")
+    return pack
 
 
 def build_dsr_beat_pack(action: ActionPack, per_dsr: int | None = None) -> OpsPack:
@@ -417,6 +430,9 @@ def excel_bytes(pack: OpsPack) -> bytes:
         row += 1
     used: set[str] = {"00 Cover"}
     key_to_sheet: dict[str, str] = {}
+    if pack.kind == "monday":
+        _excel_monday_exec(wb, pack)
+        used.add("00 Exec")
     for sheet, heading, note, df in pack.sheets:
         name = _unique_sheet(sheet, used)
         _sheet_table(wb, name, heading, note, df)
@@ -437,6 +453,58 @@ def _unique_sheet(title: str, used: set[str]) -> str:
         name = (base[: 31 - len(suffix)] + suffix).strip()
         i += 1
     return name
+
+
+def _excel_monday_exec(wb, pack: OpsPack) -> None:
+    from openpyxl.styles import Alignment, Font
+
+    from sndintel.briefing import NAVY, SLATE
+
+    ws = wb.create_sheet("00 Exec", 1)
+    ws["A1"] = "Executive summary"
+    ws["A1"].font = Font(name="Calibri", size=16, bold=True, color=NAVY)
+    ws["A2"] = pack.label or pack.period
+    ws["A2"].font = Font(name="Calibri", size=11, italic=True, color=SLATE)
+    if pack.exec_model and pack.exec_situation:
+        ws["A3"] = f"Written from this period’s scorecards ({pack.exec_model})."
+        ws["A3"].font = Font(name="Calibri", size=9, color=SLATE)
+    row = 5
+    ws.cell(row, 1, "Summary of current situation").font = Font(name="Calibri", size=13, bold=True, color=NAVY)
+    row += 1
+    paragraphs = pack.exec_situation or [
+        pack.exec_error
+        or "No national executive summary is stored for this period. Paste an OpenAI key on Upload files and rebuild."
+    ]
+    for para in paragraphs:
+        ws.cell(row, 1, para)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[row].height = 48
+        row += 1
+    row += 1
+    ws.cell(row, 1, "Key focus areas").font = Font(name="Calibri", size=13, bold=True, color=NAVY)
+    row += 1
+    if pack.exec_focus:
+        for i, item in enumerate(pack.exec_focus, start=1):
+            title = item.get("title") or f"Focus {i}"
+            why = item.get("why") or ""
+            do = item.get("do") or ""
+            ws.cell(row, 1, f"{i}. {title}").font = Font(name="Calibri", size=11, bold=True, color=NAVY)
+            row += 1
+            if why:
+                ws.cell(row, 1, why)
+                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+                ws.cell(row, 1).alignment = Alignment(wrap_text=True)
+                row += 1
+            if do:
+                ws.cell(row, 1, f"Do this week. {do}")
+                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+                ws.cell(row, 1).alignment = Alignment(wrap_text=True)
+                row += 1
+            row += 1
+    else:
+        ws.cell(row, 1, "Focus areas appear here after the national executive summary is generated.")
+    ws.column_dimensions["A"].width = 110
 
 
 def _excel_monday_links(wb, pack: OpsPack, key_to_sheet: dict[str, str]) -> None:
@@ -519,13 +587,14 @@ def _monday_pdf(pack: OpsPack) -> bytes:
     from sndintel.action_report import _xml
 
     buf = BytesIO()
+    pagesize = landscape(A4)
     doc = SimpleDocTemplate(
         buf,
-        pagesize=landscape(A4),
+        pagesize=pagesize,
         leftMargin=10 * mm,
         rightMargin=10 * mm,
         topMargin=12 * mm,
-        bottomMargin=12 * mm,
+        bottomMargin=14 * mm,
         title=f"SND Intelligence · Monday NSM pack · {pack.label}",
     )
     styles = getSampleStyleSheet()
@@ -533,14 +602,18 @@ def _monday_pdf(pack: OpsPack) -> bytes:
     h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=12, textColor=colors.HexColor("#0F172A"), spaceBefore=10, spaceAfter=4)
     h3 = ParagraphStyle("h3", parent=styles["Heading2"], fontSize=10, textColor=colors.HexColor("#1D4ED8"), spaceBefore=8, spaceAfter=3)
     body = ParagraphStyle("b", parent=styles["Normal"], fontSize=7.5, textColor=colors.HexColor("#334155"), leading=10)
+    exec_body = ParagraphStyle("eb", parent=styles["Normal"], fontSize=10, textColor=colors.HexColor("#0F172A"), leading=14, spaceAfter=8)
     link = ParagraphStyle("lnk", parent=body, textColor=colors.HexColor("#1D4ED8"), leading=10)
     city_anchor = {k[2:]: anchor_id("city", k[2:]) for k, *_ in pack.sheets if str(k).startswith("C ")}
     dist_anchor = {k[2:]: anchor_id("dist", k[2:]) for k, *_ in pack.sheets if str(k).startswith("S ")}
-    story = [
-        Paragraph("SND Intelligence · Monday NSM pack", body),
-        Paragraph(_xml(pack.headline or pack.label), title),
-        Paragraph(_xml(EXPECTED_FORMULA), body),
-    ]
+    story = _monday_exec_flowables(pack, title, h2, exec_body, body)
+    story.extend(
+        [
+            Paragraph("SND Intelligence · Monday NSM pack", body),
+            Paragraph(_xml(pack.headline or pack.label), title),
+            Paragraph(_xml(EXPECTED_FORMULA), body),
+        ]
+    )
     for warning in pack.warnings:
         story.append(Paragraph(_xml(warning), body))
     story.append(Paragraph("Contents", h2))
@@ -589,8 +662,94 @@ def _monday_pdf(pack: OpsPack) -> bytes:
             story.append(Paragraph(f'<a name="{dest}"/>{_xml(heading)}', h3))
             story.append(Paragraph(_xml(note), body))
             story.append(_pdf_table(df, body, max_rows=None))
-    doc.build(story)
+
+    def _on_page(canvas, doc_):
+        canvas.saveState()
+        canvas.setFillColor(colors.HexColor("#1D4ED8"))
+        canvas.setFont("Helvetica", 8)
+        text = "Top of report"
+        x = pagesize[0] / 2
+        y = 6 * mm
+        canvas.drawCentredString(x, y, text)
+        width = canvas.stringWidth(text, "Helvetica", 8)
+        canvas.linkRect("top", "top", (x - width / 2 - 4, y - 3, x + width / 2 + 4, y + 11), relative=0, thickness=0)
+        canvas.setFillColor(colors.HexColor("#64748B"))
+        canvas.setFont("Helvetica", 7)
+        canvas.drawRightString(pagesize[0] - 10 * mm, y, f"Page {doc_.page}")
+        canvas.restoreState()
+
+    def _on_first(canvas, doc_):
+        canvas.bookmarkPage("top")
+        _on_page(canvas, doc_)
+
+    doc.build(story, onFirstPage=_on_first, onLaterPages=_on_page)
     return buf.getvalue()
+
+
+def _monday_exec_flowables(pack: OpsPack, title, h2, exec_body, body) -> list:
+    from reportlab.platypus import PageBreak, Paragraph, Spacer
+
+    from sndintel.action_report import _xml
+
+    story = [
+        Paragraph('<a name="top"/>SND Intelligence · Monday NSM pack', body),
+        Paragraph("Executive summary", title),
+        Paragraph(_xml(pack.label or pack.period or "This period"), exec_body),
+    ]
+    if pack.exec_model and pack.exec_situation:
+        story.append(
+            Paragraph(
+                f"Written from this period’s scorecards ({_xml(pack.exec_model)}). "
+                "Every figure matches the tables that follow. Nothing here is estimated by the model.",
+                body,
+            )
+        )
+    story.append(Paragraph("Summary of current situation", h2))
+    if pack.exec_situation:
+        for para in pack.exec_situation:
+            story.append(Paragraph(_xml(para), exec_body))
+            story.append(Spacer(1, 6))
+    elif pack.exec_error:
+        story.append(
+            Paragraph(
+                "The national executive summary was not generated. "
+                f"{_xml(pack.exec_error)} "
+                "Paste an OpenAI key on Upload files and rebuild scorecards.",
+                exec_body,
+            )
+        )
+    else:
+        story.append(
+            Paragraph(
+                "No national executive summary is stored for this period. "
+                "Paste an OpenAI API key on Upload files, then upload data or rebuild scorecards. "
+                "The same key used for the national pack is reused here.",
+                exec_body,
+            )
+        )
+    story.append(PageBreak())
+    story.append(Paragraph("Key focus areas", h2))
+    if pack.exec_focus:
+        for i, item in enumerate(pack.exec_focus, start=1):
+            title_t = _xml(item.get("title") or f"Focus {i}")
+            why = _xml(item.get("why") or "")
+            do = _xml(item.get("do") or "")
+            bits = [f"<b>{i}. {title_t}</b>"]
+            if why:
+                bits.append(why)
+            if do:
+                bits.append(f"<b>Do this week.</b> {do}")
+            story.append(Paragraph("<br/>".join(bits), exec_body))
+            story.append(Spacer(1, 8))
+    else:
+        story.append(
+            Paragraph(
+                "Focus areas appear here after the national executive summary is generated on Upload files.",
+                exec_body,
+            )
+        )
+    story.append(PageBreak())
+    return story
 
 
 def _pdf_table(df: pd.DataFrame, style, max_rows: int | None = 40, link_col: str | None = None, link_map: dict[str, str] | None = None):

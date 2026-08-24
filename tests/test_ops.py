@@ -188,6 +188,10 @@ def test_monday_pack_has_capacity_and_whales():
     assert "06 Highlighted stores" in by_key
     drivers = by_key["02 City drivers"][3]
     assert list(drivers.columns[:2]) == ["City", "AMS (MT)"]
+    assert float(drivers.iloc[0]["AMS (MT)"]) == 18.0
+    country = by_key["01 Country"][3]
+    assert "Billed (MT)" in country.columns
+    assert "Still to Expected (MT)" not in country.columns
     who = by_key["04 Who to push"][3]
     assert "Span ×" not in who.columns
     assert "Day cap" not in who.columns
@@ -198,6 +202,35 @@ def test_monday_pack_has_capacity_and_whales():
     summary_keys = [s[0] for s in monday_summary_sheets(monday.sheets)]
     assert summary_keys.index("05 Highlighted distributors") < summary_keys.index("06 Highlighted stores")
     assert any("Karachi" in w for w in monday.warnings)
+
+
+def test_city_driver_ams_fills_from_shops_when_units_lack_it():
+    from sndintel.monday import city_driver_table
+
+    units = pd.DataFrame(
+        [
+            {
+                "grain": "city",
+                "grain_id": "Karachi",
+                "volume_mt": 10,
+                "expected_mt": 20,
+                "isolated_mt": -10,
+                "from_unbilled_mt": 8,
+                "from_unvisited_mt": 1,
+                "from_drop_size_mt": 1,
+                "visit_rate": 0.9,
+                "strike_rate": 0.4,
+            }
+        ]
+    )
+    shops = pd.DataFrame(
+        [
+            {"city": "Karachi", "ams_3m": 12.0},
+            {"city": "Karachi", "ams_3m": 6.0},
+        ]
+    )
+    out = city_driver_table(units, shops)
+    assert float(out.iloc[0]["AMS (MT)"]) == 18.0
 
 
 def test_action_buckets_add_back_to_ask():
@@ -221,6 +254,8 @@ def test_action_buckets_add_back_to_ask():
     assert country.iloc[0]["Unvisited"] == count_ask(1, 1.0)
     assert country.iloc[0]["Coming due"] == count_ask(1, 0.2)
     assert "Doors to visit" in country.columns
+    assert "Billed (MT)" in country.columns
+    assert abs(float(country.iloc[0]["Billed (MT)"]) - 1.9) < 1e-9
     assert fmt_kg(67.665) == "67,665"
 
 
@@ -265,15 +300,26 @@ def test_monday_pdf_has_internal_destinations():
         ]
     )
     pack = ActionPack(period="2026-08", label="August 2026", headline="Karachi is the hole", raw_shops=shops, as_of_day=21, days_in_month=31, days_left=10)
-    monday = build_monday_pack(pack)
+    monday = build_monday_pack(
+        pack,
+        exec_summary={
+            "model": "gpt-4.1",
+            "situation": ["Country billed 10 MT against 20 expected. Karachi is the hole."],
+            "focus": [{"title": "Karachi · 10 MT", "why": "Unbilled shops", "do": "Convert the due list"}],
+        },
+    )
     raw = pdf_bytes(monday)
     assert raw.startswith(b"%PDF")
     assert len(raw) > 800
+    assert b"Top of report" in raw
+    assert b"Summary of current situation" in raw
+    assert b"Key focus areas" in raw
     xls = __import__("sndintel.ops", fromlist=["excel_bytes"]).excel_bytes(monday)
     from openpyxl import load_workbook
     from io import BytesIO
 
     wb = load_workbook(BytesIO(xls))
+    assert "00 Exec" in wb.sheetnames
     assert "01 Country" in wb.sheetnames
     assert any(n.startswith("C ") for n in wb.sheetnames)
     assert any(n.startswith("S ") for n in wb.sheetnames)

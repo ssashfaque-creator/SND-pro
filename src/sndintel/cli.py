@@ -73,7 +73,7 @@ def ingest(
     replace_sales: bool = typer.Option(
         False,
         "--replace-sales",
-        help="Wipe previous billed sales; keep universe and visits",
+        help="Wipe previous billed sales; keep universe and visits. Without this flag, Outlet Date Wise overrides overlapping shop-days and leaves the rest.",
     ),
 ):
     """Clean a sales export, merge the live universe and visits, and write insights."""
@@ -474,12 +474,15 @@ def export_ops(
             units = read_sql(conn, "SELECT * FROM unit_scorecards")
         except Exception:
             units = pd.DataFrame()
+        from sndintel.narrative import load_exec_summary_row
+
+        exec_row = load_exec_summary_row(conn, pack.period if pack is not None else None)
         outcomes = load_outcomes(conn, pack.period)
     if not pack.headline:
         console.print("No action list yet. Ingest Outlet Date Wise and run [bold]snd-intel rescore[/].")
         raise typer.Exit(1)
     if kind == "monday":
-        ops = build_monday_pack(pack, units, visits)
+        ops = build_monday_pack(pack, units, visits, exec_summary=exec_row)
     elif kind == "dsr":
         ops = build_dsr_beat_pack(pack)
     else:

@@ -128,6 +128,8 @@ class ParseReport:
     warnings: list[str] = field(default_factory=list)
     params: dict = field(default_factory=dict)
     daily: Any = None
+    daily_dates: list[str] = field(default_factory=list)
+    daily_store_ids: list[str] = field(default_factory=list)
 
 
 def parse_sales_file(path: str | Path) -> tuple[pd.DataFrame, ParseReport]:
