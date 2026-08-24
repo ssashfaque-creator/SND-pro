@@ -8,6 +8,28 @@ from pathlib import Path
 
 SKIP_NAMES = {".venv", ".git", "data", "__pycache__", ".pytest_cache", "warehouse.db"}
 
+ZIP_URL = "https://github.com/{repo}/archive/refs/heads/{branch}.zip"
+
+
+def zip_url(repo: str | None = None, branch: str | None = None) -> str:
+    from sndintel.config import APP_BRANCH, GITHUB_REPO
+
+    return ZIP_URL.format(repo=repo or GITHUB_REPO, branch=branch or APP_BRANCH)
+
+
+def mac_update_commands(repo: str | None = None, branch: str | None = None) -> str:
+    """Same curl + rsync + .venv flow that already works on the Mac."""
+    url = zip_url(repo, branch)
+    return (
+        "rm -rf /tmp/sndintel-dl\n"
+        "mkdir -p /tmp/sndintel-dl\n"
+        f'curl -L --fail "{url}" -o /tmp/sndintel-dl/app.zip\n'
+        "unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl\n"
+        'SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name \'SND-pro-*\' | head -1)"\n'
+        'rsync -a --delete --exclude \'.venv\' "$SRC/" ~/sndintel/\n'
+        "cd ~/sndintel && source .venv/bin/activate && pip install -e . && snd-intel app\n"
+    )
+
 
 def find_download_zip(downloads: Path | None = None) -> Path | None:
     folder = Path(downloads or Path.home() / "Downloads")

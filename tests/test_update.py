@@ -3,7 +3,7 @@
 import zipfile
 from pathlib import Path
 
-from sndintel.update import apply_code_zip, find_download_zip
+from sndintel.update import apply_code_zip, find_download_zip, mac_update_commands, zip_url
 
 
 def test_apply_zip_replaces_src_and_keeps_venv(tmp_path):
@@ -43,3 +43,13 @@ def test_find_download_zip_picks_newest(tmp_path):
     os.utime(older, (time.time() - 100, time.time() - 100))
     os.utime(newer, (time.time(), time.time()))
     assert find_download_zip(tmp_path) == newer
+
+
+def test_mac_update_commands_use_curl_and_keep_venv():
+    text = mac_update_commands()
+    assert "curl -L --fail" in text
+    assert zip_url() in text
+    assert "cursor/actionable-ops-layer-2f34.zip" in text
+    assert "source .venv/bin/activate && pip install -e . && snd-intel app" in text
+    assert 'exclude \'.venv\'' in text
+    assert "Downloads" not in text

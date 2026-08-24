@@ -1290,30 +1290,20 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.5.0, the ZIP did not land.\n"
+        f"- App version **{__version__}**. If this is still 0.6.0, curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
     )
-    with st.expander("Update the app on this Mac (no git)"):
+    with st.expander("Update the app on this Mac (curl, keep .venv)", expanded=True):
+        from sndintel.update import mac_update_commands, zip_url
+
         st.markdown(
-            "1. In the browser, while logged into GitHub, download "
-            "[this ZIP](https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/actionable-ops-layer-2f34.zip).\n"
-            "2. Paste this in Terminal:"
+            "Same method as before: `curl` the branch ZIP, `rsync` over `~/sndintel`, "
+            "keep `.venv`, `pip install -e .`. Warehouse stays in Application Support. "
+            f"URL: `{zip_url()}`"
         )
-        st.code(
-            'ZIP="$(ls -t "$HOME/Downloads"/SND-pro*.zip | head -1)"\n'
-            "mkdir -p /tmp/sndintel-dl/unpacked\n"
-            "rm -rf /tmp/sndintel-dl/unpacked\n"
-            'unzip -o "$ZIP" -d /tmp/sndintel-dl/unpacked\n'
-            "SRC=\"$(find /tmp/sndintel-dl/unpacked -maxdepth 2 -type d -name 'SND-pro-*' | head -1)\"\n"
-            'rsync -a --delete --exclude ".venv" --exclude "data" "$SRC/" "$HOME/sndintel/"\n'
-            "cd \"$HOME/sndintel\"\n"
-            "source .venv/bin/activate\n"
-            "python -m pip install -e .\n"
-            "snd-intel app",
-            language="bash",
-        )
+        st.code(mac_update_commands().rstrip(), language="bash")
     ledger = data.get("ledger", pd.DataFrame())
     if not ledger.empty:
         st.subheader("Months on file")
