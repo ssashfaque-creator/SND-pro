@@ -36,6 +36,7 @@ from sndintel.briefing import (
     iter_report_sheets,
     row_tone,
 )
+from sndintel.config import EXPECTED_FORMULA
 
 NAVY = colors.HexColor("#0F172A")
 SLATE = colors.HexColor("#475569")
@@ -140,7 +141,11 @@ def write_pdf(pack: StrategyPack, path: Path | str | BytesIO, detailed: bool = F
         )
         canvas.setFillColor(SLATE)
         canvas.setFont("Helvetica", 7)
-        canvas.drawString(10 * mm, 5 * mm, "Figures in MT are rounded to whole numbers. From drop / unvisited / unbilled add to Gap.")
+        canvas.drawString(
+            10 * mm,
+            5 * mm,
+            f"Figures in MT are whole numbers. From drop / unvisited / unbilled add to Gap. {EXPECTED_FORMULA}.",
+        )
         canvas.drawRightString(pagesize[0] - 10 * mm, 5 * mm, f"Page {doc_.page}")
         canvas.restoreState()
 
@@ -311,6 +316,12 @@ def _glossary_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle], d
     story.append(Paragraph("How to read the tables that follow", styles["h2"]))
     for i, step in enumerate(how_to_read_steps(pack, detailed=detailed), start=1):
         story.append(Paragraph(f"<b>{i}.</b>  {xml_escape(step)}", styles["body"]))
+    warnings = getattr(pack, "visit_warnings", None) or []
+    if warnings:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("Visit file quality", styles["h2"]))
+        for warning in warnings:
+            story.append(Paragraph(xml_escape(warning), styles["body"]))
     return story
 
 

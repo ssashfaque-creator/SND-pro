@@ -129,13 +129,24 @@ def build_action_pack(
     shops = attach_next_drop(shops, daily, as_of_ts, shop_month)
     shops = _attach_calls(shops, visits, period)
     shops = _classify_actions(shops, open_mtd)
+    from sndintel.capacity import apply_city_driver_priority, cap_shops_per_dsr, score_dsr_capacity
+
+    shops = apply_city_driver_priority(shops)
     shops = _attach_rest_of_month(shops, days_left, open_mtd, days_in_month)
     shops["instruction"] = [_instruction(r) for r in shops.itertuples(index=False)]
     shops["value_score"] = _value_score(shops)
     shops = shops.sort_values(["value_score", "week_target_mt", "days_overdue"], ascending=False)
 
     dist = _units_with_work(_roll_units(shops, "distributor", extra_city=True))
-    dsr = _units_with_work(_roll_units(shops, "dsr_name", extra_city=True, extra_dist=True))
+    dsr = _units_with_work(_roll_dsrs(shops))
+    cap = score_dsr_capacity(shops, as_of, days_in_month, days_left)
+    if not dsr.empty and not cap.empty:
+        dsr = dsr.merge(cap[["grain_id", "label", "span_unique", "day_cap"]], on="grain_id", how="left")
+        if "label" in dsr.columns:
+            dsr["instruction"] = [
+                f"{lab} · {inst}" if pd.notna(lab) and str(lab).strip() else inst
+                for lab, inst in zip(dsr["label"], dsr["instruction"])
+            ]
     country = _country_row(shops, as_of, days_in_month, days_left, open_mtd, source)
     backtest = backtest_cycles(daily, shop_month, stores, period) if has_daily else pd.DataFrame()
     headline = _headline(country, open_mtd, has_daily)
@@ -370,9 +381,25 @@ def backtest_cycles(
 
 
 def persist_action_pack(conn, pack: ActionPack) -> None:
-    from sndintel.storage import replace_table
+    from sndintel.storage import read_sql, replace_table
 
     period = pack.period
+    try:
+        previous = read_sql(conn, "SELECT * FROM action_shops WHERE period = ?", (period,))
+    except Exception:
+        previous = pd.DataFrame()
+    if previous is not None and not previous.empty:
+        from sndintel.ops import persist_outcomes, score_closed_loop
+
+        try:
+            shop_month = read_sql(conn, "SELECT * FROM shop_month")
+        except Exception:
+            shop_month = pd.DataFrame()
+        try:
+            visits = read_sql(conn, "SELECT * FROM shop_visits")
+        except Exception:
+            visits = pd.DataFrame()
+        persist_outcomes(conn, score_closed_loop(previous, shop_month, visits, period))
     replace_table(conn, "action_shops", _raw_shops_to_sql(pack.raw_shops, period))
     units = []
     if pack.raw_distributors is not None and not pack.raw_distributors.empty:
@@ -875,6 +902,31 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
     return pd.DataFrame(rows).sort_values(["value_score", "week_target_mt"], ascending=False).reset_index(drop=True)
 
 
+def _roll_dsrs(shops: pd.DataFrame) -> pd.DataFrame:
+    """One DSR row per unique (city, distributor, name) — never merge namesakes."""
+    from sndintel.identity import dsr_display_name, dsr_unit_id
+
+    if shops is None or shops.empty or "dsr_name" not in shops.columns:
+        return pd.DataFrame()
+    work = shops.copy()
+    for col, default in (("city", ""), ("distributor", ""), ("dsr_name", "")):
+        if col not in work.columns:
+            work[col] = default
+        work[col] = work[col].fillna(default).astype(str)
+    work["_dsr_id"] = [
+        dsr_unit_id(c, d, n) for c, d, n in zip(work["city"], work["distributor"], work["dsr_name"])
+    ]
+    out = _roll_units(work, "_dsr_id", extra_city=True, extra_dist=True)
+    if out.empty:
+        return out
+    out["dsr_name"] = [dsr_display_name(g) for g in out["grain_id"]]
+    out["instruction"] = [
+        inst.replace(f"Push {gid}:", f"Push {name}:", 1)
+        for gid, name, inst in zip(out["grain_id"], out["dsr_name"], out["instruction"])
+    ]
+    return out
+
+
 def _units_with_work(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df if df is not None else pd.DataFrame()
@@ -945,7 +997,14 @@ def _headline(country: dict[str, Any], open_mtd: bool, has_daily: bool) -> str:
 
 
 def _take_action(shops: pd.DataFrame, action: str, n: int) -> pd.DataFrame:
-    return shops[shops["action"] == action].head(n)
+    from sndintel.capacity import cap_shops_per_dsr
+
+    if shops is None or shops.empty or "action" not in shops.columns:
+        return shops if shops is not None else pd.DataFrame()
+    subset = shops[shops["action"] == action]
+    if subset.empty:
+        return subset
+    return cap_shops_per_dsr(subset).head(n)
 
 
 COUNTRY_VIEW = [
@@ -1067,9 +1126,10 @@ UNIT_VIEW_DIST = [
 ]
 
 UNIT_VIEW_DSR = [
-    ("grain_id", "DSR"),
+    ("dsr_name", "DSR"),
     ("city", "City"),
     ("distributor", "Distributor"),
+    ("label", "Label"),
     ("n_doors", "Doors"),
     ("n_coming", "Coming due"),
     ("n_call", "Due"),
@@ -1156,8 +1216,14 @@ def _present_units(df: pd.DataFrame, grain: str) -> pd.DataFrame:
         return df
     if grain == "DSR" and "DSR" in df.columns:
         return df
+    work = df
+    if grain == "DSR" and "dsr_name" not in df.columns and "grain_id" in df.columns:
+        from sndintel.identity import dsr_display_name
+
+        work = df.copy()
+        work["dsr_name"] = [dsr_display_name(v) for v in work["grain_id"]]
     view = UNIT_VIEW_DIST if grain == "Distributor" else UNIT_VIEW_DSR
-    return _present(df, view)
+    return _present(work, view)
 
 
 def _present_backtest(df: pd.DataFrame) -> pd.DataFrame:
@@ -1234,12 +1300,20 @@ def _raw_units_to_sql(df: pd.DataFrame, period: str, grain: str) -> pd.DataFrame
     out["grain"] = grain
     if "distributor" not in out.columns:
         out["distributor"] = out["grain_id"] if grain == "distributor" else ""
+    if "dsr_name" not in out.columns and grain == "dsr":
+        from sndintel.identity import dsr_display_name
+
+        out["dsr_name"] = [dsr_display_name(v) for v in out["grain_id"]]
     cols = [
         "period",
         "grain",
         "grain_id",
         "city",
         "distributor",
+        "dsr_name",
+        "label",
+        "span_unique",
+        "day_cap",
         "n_call",
         "n_convert",
         "n_lift",

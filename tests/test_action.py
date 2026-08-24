@@ -247,6 +247,9 @@ def test_dsr_instruction_names_counts_and_tonnes():
     assert not pack.dsrs.empty
     row = pack.dsrs.iloc[0]
     assert row["DSR"] == "Amir"
+    assert "Label" in pack.dsrs.columns
+    assert "Distributor" in pack.dsrs.columns
+    assert str(pack.raw_dsrs.iloc[0]["grain_id"]).startswith("Amir")
     assert "Push Amir" in str(row["Do this"])
     assert "rest of the month" in str(row["Do this"]).lower()
     assert "doors to work" in str(row["Do this"]).lower()
@@ -418,3 +421,37 @@ def test_just_billed_inside_cycle_is_not_rest_of_month_ask():
     assert not bool(raw.loc["EARLY1", "coming_due"])
     assert float(raw.loc["EARLY1", "week_target_mt"]) == 0.0
     assert float(raw.loc["EARLY1", "remaining_mt"]) > 0.5
+
+
+def test_two_amirs_roll_as_two_dsrs():
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    city, dist = "Lahore", "Lahore Dist"
+    extra = [_bill("LHR1", "Lahore Due", city, dist, "Amir", d, 1.0) for d in _cycle_dates(date(2026, 7, 28), 15, 20)]
+    shop_day = pd.concat([shop_day, pd.DataFrame(extra)], ignore_index=True)
+    shop_month = pd.concat([shop_month, pd.DataFrame(_months_from_days(extra))], ignore_index=True)
+    stores = pd.concat(
+        [
+            stores,
+            pd.DataFrame(
+                [
+                    {
+                        "store_id": "LHR1",
+                        "store_name": "Lahore Due",
+                        "city": city,
+                        "distributor": dist,
+                        "dsr_name": "Amir",
+                        "section": "Gulberg",
+                        "in_universe": 1,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    assert len(pack.raw_dsrs) >= 2
+    assert pack.raw_dsrs["grain_id"].nunique() >= 2
+    named = pack.all_dsrs[pack.all_dsrs["DSR"].astype(str) == "Amir"]
+    assert len(named) >= 2
+    assert set(named["City"].astype(str)) >= {"Karachi", "Lahore"}
+

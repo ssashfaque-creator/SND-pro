@@ -390,6 +390,76 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
     console.print(f"Wrote {detailed_pdf}")
 
 
+@app.command("export-ops")
+def export_ops(
+    kind: str = typer.Argument("monday", help="monday, dsr, or friday"),
+    path: Path = typer.Argument(Path("SND_ops.xlsx")),
+):
+    """Write Monday NSM / DSR beat / Friday close packs (Excel + PDF)."""
+    init_db()
+    from sndintel.action import build_action_pack, load_action_pack
+    from sndintel.features import latest_period
+    from sndintel.ops import (
+        build_dsr_beat_pack,
+        build_friday_pack,
+        build_monday_pack,
+        excel_bytes as ops_excel,
+        load_outcomes,
+        pdf_bytes as ops_pdf,
+    )
+
+    kind = (kind or "monday").strip().lower()
+    if kind not in {"monday", "dsr", "friday"}:
+        console.print("kind must be monday, dsr, or friday")
+        raise typer.Exit(1)
+    with connect() as conn:
+        try:
+            pack = load_action_pack(conn)
+        except Exception:
+            pack = None
+        if pack is None or not pack.headline:
+            shop_month = read_sql(conn, "SELECT * FROM shop_month")
+            stores = read_sql(conn, "SELECT * FROM stores")
+            try:
+                shop_day = read_sql(conn, "SELECT * FROM shop_day")
+            except Exception:
+                shop_day = pd.DataFrame()
+            try:
+                visits = read_sql(conn, "SELECT * FROM shop_visits")
+            except Exception:
+                visits = pd.DataFrame()
+            ledger = read_sql(conn, "SELECT * FROM period_ledger")
+            period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+        else:
+            try:
+                visits = read_sql(conn, "SELECT * FROM shop_visits")
+            except Exception:
+                visits = pd.DataFrame()
+        try:
+            units = read_sql(conn, "SELECT * FROM unit_scorecards")
+        except Exception:
+            units = pd.DataFrame()
+        outcomes = load_outcomes(conn, pack.period)
+    if not pack.headline:
+        console.print("No action list yet. Ingest Outlet Date Wise and run [bold]snd-intel rescore[/].")
+        raise typer.Exit(1)
+    if kind == "monday":
+        ops = build_monday_pack(pack, units, visits)
+    elif kind == "dsr":
+        ops = build_dsr_beat_pack(pack)
+    else:
+        ops = build_friday_pack(outcomes, pack)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(ops_excel(ops))
+    pdf_path = path.with_suffix(".pdf")
+    pdf_path.write_bytes(ops_pdf(ops))
+    console.print(f"Wrote {path}")
+    console.print(f"Wrote {pdf_path}")
+    console.print(ops.headline)
+
+
 @app.command()
 def query(text: str = typer.Argument(..., help="Plain-language filter, e.g. 'trade loading Quetta'")):
     """Filter stored insights without an LLM — deterministic keyword search for a future ReAct agent."""

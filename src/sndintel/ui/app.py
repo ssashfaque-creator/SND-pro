@@ -32,6 +32,14 @@ from sndintel.briefing import (
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
+from sndintel.ops import (
+    build_dsr_beat_pack,
+    build_friday_pack,
+    build_monday_pack,
+    excel_bytes as ops_excel_bytes,
+    load_outcomes,
+    pdf_bytes as ops_pdf_bytes,
+)
 from sndintel.storage import connect, init_db, read_sql
 
 DIAGNOSIS_COLOR = {
@@ -465,6 +473,8 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         return
 
     pack = _strategy_pack(data, period, ledger)
+    for warning in getattr(pack, "visit_warnings", None) or []:
+        st.warning(warning)
     if pack.exec_situation:
         st.markdown(
             '<div class="sit-card" style="background:#f8fafc;border-left:8px solid #0f172a">'
@@ -566,11 +576,10 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         "Excel is the working file (filters, one sheet per layer). "
         "PDF is the board pack — whole numbers, remarks as bullets in the last column. "
         "For a city / distributor / DSR pack, use **Report**. "
-        "National summary names one top 10 of lagging distributors, one top 10 of lagging DSRs, "
-        "and one top 50 of lagging shops — each ranked nationally by how serious the miss "
-        "is versus that unit’s own Expected given its size, not the biggest Gap tons "
-        "(after the 0.25 MT shop floor), and not nested under the other list. "
-        "Detailed pack = every city, every distributor and DSR with AMS > 0, and every shop with gap > 0.25 MT."
+        "National summary has two rankings per grain: Gap tons (the books that close the month) "
+        "and seriousness (Gap ÷ √Expected — collapsed mid-size names). Whales are AMS / last drop ≥ 1 MT. "
+        "A DSR is city + distributor + name. Detailed pack = every city, every distributor and DSR with AMS > 0, "
+        "and every shop with gap > 0.25 MT."
     )
 
     st.markdown("##### 1. The country — every city")
@@ -636,27 +645,57 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         fig.update_layout(height=200, margin=dict(l=10, r=10, t=30, b=10), title="National volume")
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("##### 2. Top 10 lagging distributors")
+    st.markdown("##### 2. Top 10 distributors by Gap tons")
+    st.caption("The books that close the month. Ranked by Gap MT, not seriousness. AMS = 0 is hidden.")
+    vol_dist = pack.volume_distributors if pack.volume_distributors is not None and not pack.volume_distributors.empty else pack.lagging_distributors
+    if vol_dist is None or vol_dist.empty:
+        st.info("No lagging distributor with a recent run-rate.")
+    else:
+        _strategy_table(vol_dist)
+
+    st.markdown("##### 3. Top 10 most serious lagging distributors")
     st.caption(
-        "One national list. Ranked by how serious the miss is versus own Expected given size, not the biggest Gap. AMS = 0 is hidden. Remainder line is everyone after the tenth."
+        "Ranked by Gap ÷ √Expected — collapsed mid-size names beat large books that are only slightly light. Remainder line is everyone after the tenth."
     )
     if pack.lagging_distributors.empty:
         st.info("No lagging distributor with a recent run-rate.")
     else:
         _strategy_table(pack.lagging_distributors)
 
-    st.markdown("##### 3. Top 10 lagging DSRs")
+    st.markdown("##### 4. Top 10 DSRs by Gap tons")
+    st.caption("City + distributor + name. Ranked by Gap MT. Two people with the same first name never share a row.")
+    vol_dsr = pack.volume_dsrs if pack.volume_dsrs is not None and not pack.volume_dsrs.empty else pack.lagging_dsrs
+    if vol_dsr is None or vol_dsr.empty:
+        st.info("No lagging DSR with a recent run-rate.")
+    else:
+        _strategy_table(vol_dsr)
+
+    st.markdown("##### 5. Top 10 most serious lagging DSRs")
     st.caption(
-        "One national list — not nested under the ten distributors. Ranked by miss versus own Expected given size. AMS = 0 is hidden. Remainder line is everyone after the tenth."
+        "One national list — not nested under the ten distributors. Ranked by miss versus own Expected given size. AMS = 0 is hidden."
     )
     if pack.lagging_dsrs.empty:
         st.info("No lagging DSR with a recent run-rate.")
     else:
         _strategy_table(pack.lagging_dsrs)
 
-    st.markdown("##### 4. Top 50 lagging shops")
+    st.markdown("##### 6. Whales")
+    st.caption("AMS or last drop ≥ 1 MT. These close the month. Kiryana seriousness lists do not.")
+    if pack.whales is None or pack.whales.empty:
+        st.info("No whale doors at the 1 MT floor this period.")
+    else:
+        _strategy_table(pack.whales, height=280)
+
+    st.markdown("##### 7. Top 50 most serious shops")
     st.caption(pack.shop_note or "One national list of the 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.")
     _strategy_table(pack.lagging_shops, height=420)
+
+    st.markdown("##### 8. DSR capacity")
+    st.caption("Overloaded = not enough DSRs. Not working the beat = spare capacity, weak visit %. Not converting = visits happened, shops did not buy. Not lifting drop = billed, order size is light.")
+    if pack.capacity_dsrs is None or pack.capacity_dsrs.empty:
+        st.info("No DSR capacity labels yet.")
+    else:
+        _strategy_table(pack.capacity_dsrs, height=320)
 
     with st.expander("How to read the columns", expanded=False):
         for term, meaning in GLOSSARY:
@@ -778,6 +817,60 @@ def _page_this_week(data, period, mtd, ledger):
             file_name=f"SND_this_week_{period}_detailed.pdf",
             mime="application/pdf",
         )
+
+    units = data.get("units", pd.DataFrame())
+    visits = data.get("visits", pd.DataFrame())
+    monday = build_monday_pack(pack, units, visits)
+    beat = build_dsr_beat_pack(pack)
+    with connect() as conn:
+        outcomes = load_outcomes(conn, period)
+    friday = build_friday_pack(outcomes, pack)
+    st.markdown("##### Operating packs")
+    st.caption("Monday = NSM dispatch. DSR beat = capacity-capped call lists. Friday = listed → visited → billed against the previous list.")
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.download_button(
+            "Monday NSM (Excel)",
+            ops_excel_bytes(monday),
+            file_name=f"SND_monday_{period}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.download_button(
+            "Monday NSM (PDF)",
+            ops_pdf_bytes(monday),
+            file_name=f"SND_monday_{period}.pdf",
+            mime="application/pdf",
+        )
+    with m2:
+        st.download_button(
+            "DSR beat lists (Excel)",
+            ops_excel_bytes(beat),
+            file_name=f"SND_dsr_beat_{period}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.download_button(
+            "DSR beat lists (PDF)",
+            ops_pdf_bytes(beat),
+            file_name=f"SND_dsr_beat_{period}.pdf",
+            mime="application/pdf",
+        )
+    with m3:
+        st.download_button(
+            "Friday close (Excel)",
+            ops_excel_bytes(friday),
+            file_name=f"SND_friday_{period}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.download_button(
+            "Friday close (PDF)",
+            ops_pdf_bytes(friday),
+            file_name=f"SND_friday_{period}.pdf",
+            mime="application/pdf",
+        )
+    if monday.warnings:
+        for warning in monday.warnings:
+            st.warning(warning)
+    st.caption(friday.headline)
 
     st.markdown("##### 1. Country this week")
     _strategy_table(pack.country, height=140)
@@ -1105,9 +1198,13 @@ def _page_shops(data, period):
     fc = data["forecasts"]
     fc = fc[(fc["entity_type"] == "shop") & (fc["entity_id"] == sid)]
     if not fc.empty:
-        fig.add_scatter(x=fc["period"], y=fc["predicted"], name="expected", mode="lines+markers")
+        fig.add_scatter(x=fc["period"], y=fc["predicted"], name="ML forecast (not official Expected)", mode="lines+markers")
     fig.update_layout(height=320)
     st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Official Expected on the board pack is last-three-month run-rate, paced. "
+        "The line above is a shop-month ML forecast and is not used for Gap or this-week Ask."
+    )
     st.dataframe(hist, use_container_width=True, hide_index=True)
 
 

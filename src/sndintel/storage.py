@@ -229,6 +229,8 @@ CREATE TABLE IF NOT EXISTS unit_scorecards (
     parent_id TEXT,
     zone TEXT,
     city TEXT,
+    distributor TEXT,
+    dsr_name TEXT,
     volume_mt REAL,
     ly_mt REAL,
     expected_mt REAL,
@@ -438,6 +440,10 @@ CREATE TABLE IF NOT EXISTS action_units (
     grain_id TEXT NOT NULL,
     city TEXT,
     distributor TEXT,
+    dsr_name TEXT,
+    label TEXT,
+    span_unique REAL,
+    day_cap INTEGER,
     n_call INTEGER,
     n_convert INTEGER,
     n_lift INTEGER,
@@ -498,6 +504,27 @@ CREATE TABLE IF NOT EXISTS action_brief (
     source TEXT,
     metrics_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS action_outcomes (
+    period TEXT NOT NULL,
+    listed_at TEXT NOT NULL,
+    store_id TEXT NOT NULL,
+    store_name TEXT,
+    city TEXT,
+    distributor TEXT,
+    dsr_name TEXT,
+    action TEXT,
+    ask_mt REAL,
+    billed_mt_listed REAL,
+    visits_listed REAL,
+    billed_mt_now REAL,
+    visits_now REAL,
+    gained_mt REAL,
+    outcome TEXT,
+    PRIMARY KEY (period, store_id, listed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_outcomes_period ON action_outcomes(period, listed_at);
 """
 
 
@@ -567,6 +594,8 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("visits", "REAL"),
             ("opportunity_mt", "REAL"),
             ("has_visit_file", "INTEGER"),
+            ("distributor", "TEXT"),
+            ("dsr_name", "TEXT"),
         ):
             _ensure_column(conn, "unit_scorecards", col, ddl)
         _ensure_column(conn, "stores", "source", "TEXT")
@@ -608,6 +637,10 @@ def init_db(path: Optional[Path] = None) -> Path:
         _ensure_column(conn, "action_units", "n_doors", "INTEGER")
         _ensure_column(conn, "action_units", "n_coming", "INTEGER")
         _ensure_column(conn, "action_units", "ams_3m", "REAL")
+        _ensure_column(conn, "action_units", "dsr_name", "TEXT")
+        _ensure_column(conn, "action_units", "label", "TEXT")
+        _ensure_column(conn, "action_units", "span_unique", "REAL")
+        _ensure_column(conn, "action_units", "day_cap", "INTEGER")
         _ensure_column(conn, "action_brief", "n_lapse", "INTEGER")
         _ensure_column(conn, "action_brief", "n_doors", "INTEGER")
         _ensure_column(conn, "action_brief", "n_coming", "INTEGER")

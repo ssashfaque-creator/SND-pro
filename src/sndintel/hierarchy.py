@@ -30,6 +30,7 @@ from sndintel.config import MIN_MATERIAL_MT
 from sndintel.coverage import attach_coverage_split, build_coverage_book
 from sndintel.features import latest_period
 from sndintel.io_utils import shift_period
+from sndintel.identity import attach_dsr_identity
 from sndintel.isolate import (
     apply_coverage_velocity,
     apply_expected_gap,
@@ -62,6 +63,8 @@ UNIT_COLUMNS = [
     "parent_id",
     "zone",
     "city",
+    "distributor",
+    "dsr_name",
     "volume_mt",
     "ly_mt",
     "expected_mt",
@@ -245,13 +248,18 @@ def build_hierarchy_pack(
     dist_units = _rewrite_actions(dist_units, mtd, "distributor")
 
     dsr_units = _grain_bridge(
-        cur, ly, ["city", "dsr_name"], _universe_by_keys(stores, ["city", "dsr_name"], fallback=sm), pace, factor
+        cur,
+        ly,
+        ["city", "distributor", "dsr_name"],
+        _universe_by_keys(stores, ["city", "distributor", "dsr_name"], fallback=sm),
+        pace,
+        factor,
     )
     dsr_units["grain"] = "dsr"
     dsr_units["parent_grain"] = "city"
     dsr_units["parent_id"] = dsr_units["city"].astype(str)
-    dsr_units["grain_id"] = dsr_units["dsr_name"].astype(str)
-    dsr_units = apply_child_expected(dsr_units, sm, period, ["city", "dsr_name"], season, pace)
+    dsr_units = attach_dsr_identity(dsr_units)
+    dsr_units = apply_child_expected(dsr_units, sm, period, ["city", "distributor", "dsr_name"], season, pace)
     dsr_units = reconcile_expected(dsr_units, city_units, intra_frac=pace)
     dsr_units = _enrich_children(dsr_units, default_k=0.2)
     dsr_units["intra_month_frac"] = pace
@@ -635,6 +643,8 @@ def _diagnose(r: pd.Series, mtd: dict[str, Any], grain_label: str) -> tuple[str,
     strike = r.get("strike_rate")
     uni = int(r.get("universe") or 0)
     name = str(r.get("grain_id") or r.get("city") or grain_label)
+    if grain_label == "dsr":
+        name = str(r.get("dsr_name") or r.get("grain_id") or grain_label)
     if name == "ALL":
         name = "National"
     hole = max(0.0, -gap)
@@ -810,23 +820,25 @@ def _focus_targets(
                 continue
             if len([r for r in rows if r["city"] == city_name and r["grain"] == "dsr"]) >= 4:
                 break
+            dsr_disp = getattr(rec, "dsr_name", None) or rec.grain_id
+            dist_disp = getattr(rec, "distributor", None)
             rows.append(
                 _target(
                     period,
                     "dsr",
                     rec.grain_id,
-                    rec.grain_id,
+                    dsr_disp,
                     city_name,
                     zone,
-                    None,
-                    rec.grain_id,
+                    dist_disp,
+                    dsr_disp,
                     None,
                     rec.volume_mt,
                     rec.ly_mt,
                     rec.gap_mt,
                     rec.diagnosis,
-                    f"Ride-with {rec.grain_id} this week. {rec.do_this_week}",
-                    f"{rec.grain_id} is {iso:+.1f} MT vs Expected.",
+                    f"Ride-with {dsr_disp} this week. {rec.do_this_week}",
+                    f"{dsr_disp} is {iso:+.1f} MT vs Expected.",
                     iso,
                     iso,
                     float(getattr(rec, "z_score", 0) or 0),

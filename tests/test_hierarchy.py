@@ -226,7 +226,9 @@ def test_distributor_and_dsr_universe_come_from_shop_master():
         ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]),
     )
     dist = pack.units[(pack.units["grain"] == "distributor") & (pack.units["grain_id"] == "Eva Foods")].iloc[0]
-    dsr = pack.units[(pack.units["grain"] == "dsr") & (pack.units["grain_id"] == "Amir Surveyor")].iloc[0]
+    dsrs = pack.units[pack.units["grain"] == "dsr"]
+    dsr = dsrs[dsrs["dsr_name"] == "Amir Surveyor"].iloc[0] if "dsr_name" in dsrs.columns else dsrs[dsrs["grain_id"].astype(str).str.startswith("Amir Surveyor")].iloc[0]
+    assert str(dsr["grain_id"]).startswith("Amir Surveyor")
     assert int(dist["universe"]) >= 6
     assert int(dsr["universe"]) >= 6
     assert int(dist["billed"]) == 1

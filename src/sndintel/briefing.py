@@ -25,6 +25,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.worksheet import Worksheet
 
+from sndintel.config import EXPECTED_FORMULA
 from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibling_z_frame
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
@@ -67,7 +68,19 @@ GLOSSARY = [
     ("AMS = 0 distributors / DSRs", "Hidden everywhere in the report. No recent three-month run-rate, so they are not a call."),
     (
         "Summary pack lists",
-        "Hard caps, not a statistical sample of the country: one table of the top 10 distributors, one of the top 10 DSRs, one of the top 50 shops — each ranked nationally, not nested under the other. Ranked by how serious the miss is versus that unit’s own Expected given its size (Gap ÷ √Expected), so a collapsed mid-size name can outrank a large book that is only slightly light. Remainder lines are the tail. The detailed pack is the full list (AMS > 0 distributors/DSRs; shops above 0.25 MT).",
+        "Two national rankings per grain. Volume = largest Gap tons (the books that close the month). Seriousness = Gap ÷ √Expected (collapsed mid-size names). Shop lists: whales (AMS / last drop ≥ 1 MT) then the top 50 most serious doors after the 0.25 MT floor. Remainder lines are the tail. The detailed pack is the full list.",
+    ),
+    (
+        "DSR identity",
+        "A salesperson is city + distributor + name. Two people called Shahid never share a row.",
+    ),
+    (
+        "Visit file",
+        "Visit % near 100% on a large city is a quality check, not automatically a conversion story. If the file is planned beats or any GPS ping, unbilled vs unvisited is fiction.",
+    ),
+    (
+        "YoY",
+        "Suppressed when last year is below 0.5 MT — a 1 MT base makes +475% look like a win.",
     ),
 ]
 
@@ -102,11 +115,15 @@ CALCULATION_NOTES = [
     ),
     (
         "Rounding and lists",
-        "MT, shop counts, and percents print as whole numbers. From-columns are adjusted so they still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names one top 10 of lagging distributors, one top 10 of lagging DSRs, and one top 50 of lagging shops (after the 0.25 MT floor), each ranked nationally by miss versus own Expected given size — not the largest Gap tons, and not nested under the other list. Remainder lines are the tail. The detailed pack lists every AMS > 0 distributor/DSR and every shop above 0.25 MT.",
+        "MT, shop counts, and percents print as whole numbers. From-columns still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names volume top-10 and seriousness top-10 for distributors and DSRs, whales, then the top 50 most serious shops. Remainder lines are the tail.",
     ),
     (
         "Top-N lists",
-        "National summary only. Rank lagging units by how far they are behind their own Expected for their size (Gap ÷ √Expected). Keep 10 distributors, 10 DSRs, and 50 shops (Gap > 0.25 MT) as three separate national lists. A DSR can appear even if its distributor is not in the ten; a shop can appear even if its distributor is not in the ten. A large book that is 8% light loses to a mid-size book that has collapsed. City / distributor / DSR Report packs and the detailed pack are still one full list per grain, highest Gap first.",
+        "National summary only. Volume lists rank by Gap tons. Seriousness lists rank by Gap ÷ √Expected. Whales are AMS or last drop ≥ 1 MT. A DSR is city + distributor + name, so two Shahids never share a row. City / distributor / DSR Report packs and the detailed pack are still one full list per grain, highest Gap first.",
+    ),
+    (
+        "Formula version",
+        EXPECTED_FORMULA + ". Printed on every pack so a later change cannot silently rewrite history.",
     ),
 ]
 
@@ -140,9 +157,11 @@ def how_to_read_steps(pack: StrategyPack, detailed: bool = False) -> list[str]:
         ]
     return [
         "Country by city — every city versus its own Expected. Highest gap first.",
-        "Top 10 most serious lagging distributors nationally. Ranked by miss versus own Expected given size, not the biggest Gap. AMS = 0 is hidden.",
-        "Top 10 most serious lagging DSRs nationally — not only DSRs under the ten distributors. Ranked the same way. AMS = 0 is hidden.",
-        "Top 50 most serious lagging shops nationally (doors ≤ 0.25 MT and the tail are the remainder line).",
+        "Top 10 distributors by Gap tons — the books that close the month.",
+        "Top 10 most serious lagging distributors (Gap ÷ √Expected) — collapsed mid-size names.",
+        "Top 10 DSRs by Gap tons, then top 10 by seriousness. A DSR is city + distributor + name.",
+        "Whales — AMS or last drop ≥ 1 MT. Then top 50 most serious shops (0.25 MT floor).",
+        "DSR capacity — Overloaded (headcount) vs not visiting vs not converting vs not lifting drop.",
     ]
 
 SHOP_RECOVERABLE_FLOOR = 0.25
@@ -175,7 +194,7 @@ CITY_VIEW = [("grain_id", "City"), *SCORECARD_METRICS]
 
 DIST_ALL_VIEW = [("grain_id", "Distributor"), ("city", "City"), *SCORECARD_METRICS]
 
-DSR_VIEW = [("grain_id", "DSR"), ("city", "City"), *SCORECARD_METRICS]
+DSR_VIEW = [("dsr_name", "DSR"), ("city", "City"), ("distributor", "Distributor"), *SCORECARD_METRICS]
 
 SHOP_VIEW = [
     ("store_name", "Shop"),
@@ -208,6 +227,11 @@ class StrategyPack:
     lagging_distributors: pd.DataFrame = field(default_factory=pd.DataFrame)
     lagging_dsrs: pd.DataFrame = field(default_factory=pd.DataFrame)
     lagging_shops: pd.DataFrame = field(default_factory=pd.DataFrame)
+    volume_distributors: pd.DataFrame = field(default_factory=pd.DataFrame)
+    volume_dsrs: pd.DataFrame = field(default_factory=pd.DataFrame)
+    whales: pd.DataFrame = field(default_factory=pd.DataFrame)
+    capacity_dsrs: pd.DataFrame = field(default_factory=pd.DataFrame)
+    visit_warnings: list[str] = field(default_factory=list)
     lagging_city_names: list[str] = field(default_factory=list)
     lagging_distributor_names: list[str] = field(default_factory=list)
     shop_note: str = ""
@@ -327,9 +351,14 @@ def build_strategy_pack(
         dists = _attach_ams(dists, shop_month, period, ["city", "distributor"], ledger, ams_pace)
         dists = _drop_zero_ams(dists)
     if not dsrs.empty:
-        dsrs["city"] = dsrs["parent_id"]
-        dsrs["dsr_name"] = dsrs["grain_id"]
-        dsrs = _attach_ams(dsrs, shop_month, period, ["city", "dsr_name"], ledger, ams_pace)
+        if "city" not in dsrs.columns or dsrs["city"].isna().all() or (dsrs["city"].astype(str) == "").all():
+            dsrs["city"] = dsrs["parent_id"]
+        if "dsr_name" not in dsrs.columns or dsrs["dsr_name"].isna().all():
+            from sndintel.identity import dsr_display_name
+
+            dsrs["dsr_name"] = dsrs["grain_id"].map(dsr_display_name)
+        ams_keys = ["city", "distributor", "dsr_name"] if "distributor" in dsrs.columns else ["city", "dsr_name"]
+        dsrs = _attach_ams(dsrs, shop_month, period, ams_keys, ledger, ams_pace)
         dsrs = _drop_zero_ams(dsrs)
 
     cities = _sort_focus(cities)
@@ -360,9 +389,10 @@ def build_strategy_pack(
     lagging_cities = cities[cities["situation"] == "lagging"] if not cities.empty else cities
     lagging_city_names = [str(x) for x in lagging_cities["grain_id"].tolist()] if not lagging_cities.empty else []
 
-    all_lag_dist = dists[dists["situation"] == "lagging"].copy() if not dists.empty else dists
-    all_lag_dist = attach_seriousness(all_lag_dist, pace)
-    all_lag_dist, lag_dist_meta = keep_top_holes(all_lag_dist, SUMMARY_DIST_N, rank_col="_seriousness")
+    lag_pool_dist = dists[dists["situation"] == "lagging"].copy() if not dists.empty else dists
+    lag_pool_dist = attach_seriousness(lag_pool_dist, pace)
+    vol_dist, vol_dist_meta = keep_top_holes(lag_pool_dist, SUMMARY_DIST_N, rank_col="recoverable_mt")
+    all_lag_dist, lag_dist_meta = keep_top_holes(lag_pool_dist, SUMMARY_DIST_N, rank_col="_seriousness")
     all_lag_dist = _sort_focus(all_lag_dist)
 
     lagging_dist_names: list[str] = []
@@ -374,13 +404,16 @@ def build_strategy_pack(
     shops = _attach_shop_calls(shops, visits, period)
     hole_floor = SHOP_RECOVERABLE_FLOOR
 
-    all_lag_dsr = dsrs[dsrs["situation"] == "lagging"].copy() if not dsrs.empty else dsrs
-    if all_lag_dsr is None or all_lag_dsr.empty:
-        all_lag_dsr = all_lag_dsr.iloc[0:0].copy() if all_lag_dsr is not None else pd.DataFrame()
+    lag_pool_dsr = dsrs[dsrs["situation"] == "lagging"].copy() if not dsrs.empty else dsrs
+    if lag_pool_dsr is None or lag_pool_dsr.empty:
+        all_lag_dsr = lag_pool_dsr.iloc[0:0].copy() if lag_pool_dsr is not None else pd.DataFrame()
+        vol_dsr = all_lag_dsr
         lag_dsr_meta = keep_top_holes(all_lag_dsr, SUMMARY_DSR_N)[1]
+        vol_dsr_meta = lag_dsr_meta
     else:
-        all_lag_dsr = attach_seriousness(all_lag_dsr, pace)
-        all_lag_dsr, lag_dsr_meta = keep_top_holes(all_lag_dsr, SUMMARY_DSR_N, rank_col="_seriousness")
+        lag_pool_dsr = attach_seriousness(lag_pool_dsr, pace)
+        vol_dsr, vol_dsr_meta = keep_top_holes(lag_pool_dsr, SUMMARY_DSR_N, rank_col="recoverable_mt")
+        all_lag_dsr, lag_dsr_meta = keep_top_holes(lag_pool_dsr, SUMMARY_DSR_N, rank_col="_seriousness")
         all_lag_dsr = _sort_focus(all_lag_dsr)
 
     lag_shops = pd.DataFrame()
@@ -411,6 +444,14 @@ def build_strategy_pack(
         all_lag_dist, DIST_ALL_VIEW, lag_dist_meta, "Distributor", "distributors"
     )
     presented_shops = _present_shops(lag_shops, lag_meta)
+    from sndintel.capacity import present_capacity_table, score_dsr_capacity_from_units, visit_quality_warnings, whale_shops
+
+    whale_src = shops.copy() if shops is not None and not shops.empty else pd.DataFrame()
+    whale_tbl = whale_shops(whale_src) if not whale_src.empty else pd.DataFrame()
+    as_of = int(mtd.get("as_of_day") or mtd.get("days_in_month") or 21)
+    days_m = int(mtd.get("days_in_month") or 31)
+    cap_src = score_dsr_capacity_from_units(dsrs, as_of, days_m) if dsrs is not None and not dsrs.empty else pd.DataFrame()
+    warnings = visit_quality_warnings(units, visits, period)
 
     pack = StrategyPack(
         period=period,
@@ -426,6 +467,11 @@ def build_strategy_pack(
         lagging_distributors=presented_dists,
         lagging_dsrs=_present_with_remainder(all_lag_dsr, DSR_VIEW, lag_dsr_meta, "DSR", "DSRs"),
         lagging_shops=presented_shops,
+        volume_distributors=_present_with_remainder(vol_dist, DIST_ALL_VIEW, vol_dist_meta, "Distributor", "distributors"),
+        volume_dsrs=_present_with_remainder(vol_dsr, DSR_VIEW, vol_dsr_meta, "DSR", "DSRs"),
+        whales=_present(whale_tbl, SHOP_VIEW) if whale_tbl is not None and not whale_tbl.empty else pd.DataFrame(columns=[l for _, l in SHOP_VIEW]),
+        capacity_dsrs=present_capacity_table(cap_src),
+        visit_warnings=warnings,
         lagging_city_names=lagging_city_names,
         lagging_distributor_names=lagging_dist_names,
         shop_note=shop_note,
@@ -473,17 +519,24 @@ def list_report_entities(pack: StrategyPack, report_type: str) -> list[str]:
         for _, r in src.iterrows():
             name = str(r[name_col])
             city = str(r[city_col]) if city_col else ""
-            out.append(f"{city} · {name}" if city and city != "nan" else name)
+            dist = str(r["Distributor"]) if "Distributor" in src.columns else ""
+            if dist and dist not in {"", "nan"} and city and city != "nan":
+                out.append(f"{city} · {dist} · {name}")
+            elif city and city != "nan":
+                out.append(f"{city} · {name}")
+            else:
+                out.append(name)
         return sorted(set(out))
     return []
 
 
-def _split_entity(entity: str) -> tuple[str | None, str]:
-    text = str(entity or "").strip()
-    if " · " in text:
-        left, right = text.split(" · ", 1)
-        return left.strip(), right.strip()
-    return None, text
+def _split_entity(entity: str) -> tuple[str | None, str | None, str]:
+    parts = [p.strip() for p in str(entity or "").split(" · ") if str(p).strip()]
+    if len(parts) >= 3:
+        return parts[0], parts[1], " · ".join(parts[2:])
+    if len(parts) == 2:
+        return parts[0], None, parts[1]
+    return None, None, str(entity or "").strip()
 
 
 def _filter_table(df: pd.DataFrame, col: str, value: str) -> pd.DataFrame:
@@ -506,7 +559,7 @@ def focus_pack(pack: StrategyPack, report_type: str, entity: str) -> StrategyPac
         exec_error="",
         exec_model="",
     )
-    city_key, name = _split_entity(entity)
+    city_key, dist_key, name = _split_entity(entity)
     if kind == "city":
         city = name
         cities = pack.cities
@@ -576,12 +629,17 @@ def focus_pack(pack: StrategyPack, report_type: str, entity: str) -> StrategyPac
             mask = dsrs_src["DSR"].astype(str) == dsr
             if city_key and "City" in dsrs_src.columns:
                 mask = mask & (dsrs_src["City"].astype(str) == city_key)
+            if dist_key and "Distributor" in dsrs_src.columns:
+                mask = mask & (dsrs_src["Distributor"].astype(str) == dist_key)
             row = dsrs_src.loc[mask].copy()
         city = city_key or (str(row.iloc[0]["City"]) if not row.empty and "City" in row.columns else "")
+        dist = dist_key or (str(row.iloc[0]["Distributor"]) if not row.empty and "Distributor" in row.columns else "")
         shops_src = pack.all_shops if pack.all_shops is not None and not pack.all_shops.empty else pack.lagging_shops
         shops = _filter_table(shops_src, "DSR", dsr)
         if city and shops is not None and not shops.empty and "City" in shops.columns:
             shops = shops[shops["City"].astype(str) == city]
+        if dist and shops is not None and not shops.empty and "Distributor" in shops.columns:
+            shops = shops[shops["Distributor"].astype(str) == dist]
         headline = f"{dsr} — DSR pack"
         return replace(
             pack,
@@ -1027,22 +1085,46 @@ def iter_report_sheets(pack: StrategyPack, detailed: bool = False) -> list[tuple
             pack.cities,
         ),
         (
-            "02 Top 10 distributors",
-            "Top 10 lagging distributors",
-            "One national list. Ranked by Gap ÷ √Expected — collapsed mid-size names beat large books that are only slightly light. AMS = 0 is hidden. Remainder line is everyone after the tenth.",
+            "02 Distributors by volume",
+            "Top 10 lagging distributors by Gap tons",
+            "The books that close the month. Ranked by Gap MT, not seriousness. AMS = 0 is hidden.",
+            pack.volume_distributors if pack.volume_distributors is not None and not pack.volume_distributors.empty else pack.lagging_distributors,
+        ),
+        (
+            "03 Distributors by seriousness",
+            "Top 10 most serious lagging distributors",
+            "Ranked by Gap ÷ √Expected — collapsed mid-size names beat large books that are only slightly light. Remainder line is everyone after the tenth.",
             pack.lagging_distributors,
         ),
         (
-            "03 Top 10 DSRs",
-            "Top 10 lagging DSRs",
-            "One national list — not nested under the ten distributors. Ranked by Gap ÷ √Expected. AMS = 0 is hidden. Remainder line is everyone after the tenth.",
+            "04 DSRs by volume",
+            "Top 10 lagging DSRs by Gap tons",
+            "City + distributor + name. Ranked by Gap MT. A DSR can appear even if its distributor is not in the ten.",
+            pack.volume_dsrs if pack.volume_dsrs is not None and not pack.volume_dsrs.empty else pack.lagging_dsrs,
+        ),
+        (
+            "05 DSRs by seriousness",
+            "Top 10 most serious lagging DSRs",
+            "Ranked by Gap ÷ √Expected. AMS = 0 is hidden.",
             pack.lagging_dsrs,
         ),
         (
-            "04 Top 50 shops",
+            "06 Whales",
+            "Volume doors (AMS / last drop ≥ 1 MT)",
+            "These close the month. The seriousness shop list below is the collapsed mid-size doors.",
+            pack.whales,
+        ),
+        (
+            "07 Top 50 shops",
             "Top 50 lagging shops",
             pack.shop_note or "One national list of the 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.",
             pack.lagging_shops,
+        ),
+        (
+            "08 DSR capacity",
+            "Overloaded vs not visiting vs not converting",
+            "Overloaded = not enough DSRs for the universe. Not working the beat = spare capacity, weak visit %. Not converting = visits happened, shops did not buy. Not lifting drop = billed, order size is light.",
+            pack.capacity_dsrs,
         ),
     ]
 
@@ -1396,8 +1478,11 @@ def _sheet_cover(wb: Workbook, pack: StrategyPack, detailed: bool = False) -> Wo
     ws["A3"] = "Glossary first, then the national executive summary (national packs only), then the tables."
     ws["A3"].font = Font(name="Calibri", size=10, italic=True, color=SLATE)
     ws.merge_cells("A3:H3")
+    ws["A4"] = EXPECTED_FORMULA
+    ws["A4"].font = Font(name="Calibri", size=9, italic=True, color=SLATE)
+    ws.merge_cells("A4:H4")
 
-    row = 5
+    row = 6
     ws.cell(row, 1, "Glossary")
     ws.cell(row, 1).font = Font(bold=True, size=12, color=NAVY)
     row += 1
@@ -1490,6 +1575,18 @@ def _sheet_cover(wb: Workbook, pack: StrategyPack, detailed: bool = False) -> Wo
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
         ws.cell(row, 1).alignment = Alignment(wrap_text=True)
         row += 1
+
+    warnings = getattr(pack, "visit_warnings", None) or []
+    if warnings:
+        row += 1
+        ws.cell(row, 1, "Visit file quality")
+        ws.cell(row, 1).font = Font(bold=True, size=12, color=NAVY)
+        row += 1
+        for warning in warnings:
+            ws.cell(row, 1, warning)
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+            ws.cell(row, 1).alignment = Alignment(wrap_text=True)
+            row += 1
 
     ws.column_dimensions["A"].width = 36
     for col in "BCDEFGH":

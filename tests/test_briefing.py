@@ -232,13 +232,19 @@ def test_excel_and_html_are_readable_packs():
     names = wb.sheetnames
     assert names[0] == "00 Cover"
     assert "01 Country by city" in names
-    assert "02 Top 10 distributors" in names
-    assert "03 Top 10 DSRs" in names
-    assert "04 Top 50 shops" in names
+    assert "02 Distributors by volume" in names
+    assert "03 Distributors by seriousness" in names
+    assert "04 DSRs by volume" in names
+    assert "05 DSRs by seriousness" in names
+    assert "06 Whales" in names
+    assert "07 Top 50 shops" in names
+    assert "08 DSR capacity" in names
+    assert "02 Top 10 distributors" not in names
+    assert "03 Top 10 DSRs" not in names
     assert "04 Top 10 dists all cities" not in names
     assert "05 Top 10 DSRs of those" not in names
     assert "03 Top 50 shops of those" not in names
-    assert len([n for n in names if n != "00 Cover"]) == 4
+    assert len([n for n in names if n != "00 Cover"]) == 8
     cover = wb["00 Cover"]
     col_a = [c.value for row in cover.iter_rows(min_col=1, max_col=1, values_only=False) for c in row]
     assert "Glossary" in col_a
@@ -541,4 +547,28 @@ def test_summary_ranks_collapsed_mid_size_ahead_of_large_modest_miss():
     assert dsr_named[0] == "Crisis Rep"
     shop_named = [x for x in report.lagging_shops["Shop"].astype(str) if not str(x).startswith("Not listed")]
     assert shop_named[0] == "Crisis Shop"
+    vol_named = [x for x in report.volume_distributors["Distributor"].astype(str) if not str(x).startswith("Not listed")]
+    assert vol_named[0].startswith("Whale Dist")
+    assert all(str(x).startswith("Whale Dist") for x in vol_named)
+    vol_dsr = [x for x in report.volume_dsrs["DSR"].astype(str) if not str(x).startswith("Not listed")]
+    assert vol_dsr[0].startswith("Whale Rep")
+
+
+def test_two_shahids_never_share_a_scorecard_row():
+    rows = []
+    volume_by_store = {"K1": 20.0, "L1": 12.0}
+    rows.append(_row("K1", "2026-08", 4.0, "Karachi", "Eva Foods", "Shahid", name="Karachi Shop"))
+    rows.append(_row("K1", "2025-08", 20.0, "Karachi", "Eva Foods", "Shahid", name="Karachi Shop"))
+    rows.append(_row("L1", "2026-08", 2.0, "Lahore", "Lahore Dist", "Shahid", name="Lahore Shop"))
+    rows.append(_row("L1", "2025-08", 12.0, "Lahore", "Lahore Dist", "Shahid", name="Lahore Shop"))
+    rows = _with_recent_ams(rows, volume_by_store=volume_by_store)
+    sm = pd.DataFrame(rows)
+    pack_h = build_hierarchy_pack(sm, _stores(rows), ledger=pd.DataFrame([{"period": "2026-08", "status": "closed"}]))
+    report = build_strategy_pack(pack_h.units, sm, period="2026-08")
+    dsrs = pack_h.units[pack_h.units["grain"] == "dsr"]
+    assert len(dsrs) == 2
+    assert dsrs["grain_id"].nunique() == 2
+    named = report.all_dsrs[report.all_dsrs["DSR"].astype(str) == "Shahid"]
+    assert len(named) == 2
+    assert set(named["City"].astype(str)) == {"Karachi", "Lahore"}
 
