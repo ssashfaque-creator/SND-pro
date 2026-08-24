@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sndintel import __version__
-from sndintel.config import SAMPLE_DIR, DATA_DIR, DB_PATH
+from sndintel.config import SAMPLE_DIR, DATA_DIR, DB_PATH, APP_DIR
 from sndintel.ingest.pipeline import load_brief, load_kpis, load_ledger, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
 from sndintel.sampledata import generate_demo_files
@@ -30,6 +30,40 @@ def _version(version: bool = typer.Option(False, "--version", help="Show version
         raise typer.Exit()
 
 
+@app.command("apply-zip")
+def apply_zip_cmd(
+    zip_path: Optional[Path] = typer.Argument(
+        None,
+        help="ZIP from the browser (GitHub → Code → Download ZIP). Default: newest SND-pro*.zip in Downloads.",
+    ),
+    app_dir: Optional[Path] = typer.Option(None, "--app-dir", help="App folder. Default ~/sndintel"),
+):
+    """Replace app code from a ZIP. Does not use git. Does not touch the warehouse."""
+    import subprocess
+
+    from sndintel.update import apply_code_zip, find_download_zip
+
+    dest = Path(app_dir or APP_DIR).expanduser()
+    archive = Path(zip_path).expanduser() if zip_path else find_download_zip()
+    if archive is None:
+        console.print(
+            "No ZIP given and none named SND-pro*.zip in Downloads.\n"
+            "In GitHub (logged in): Code → Download ZIP, then:\n"
+            "  snd-intel apply-zip ~/Downloads/SND-pro-cursor-actionable-ops-layer-2f34.zip"
+        )
+        raise typer.Exit(1)
+    result = apply_code_zip(archive, dest)
+    py = dest / ".venv" / "bin" / "python"
+    if py.exists():
+        subprocess.check_call([str(py), "-m", "pip", "install", "-e", str(dest)])
+    else:
+        console.print("No .venv in the app folder yet. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -e .")
+    console.print(f"Updated code from {result['src_zip']}")
+    console.print(f"App folder  {result['app_dir']}")
+    console.print(f"Warehouse   {DB_PATH}  (unchanged)")
+    console.print("Start:  cd ~/sndintel && source .venv/bin/activate && snd-intel app")
+
+
 @app.command()
 def ingest(
     sales: Optional[list[Path]] = typer.Argument(None, help="One or more Outlet Date Wise / Shop SKU Wise files"),
@@ -39,7 +73,7 @@ def ingest(
     replace_sales: bool = typer.Option(
         False,
         "--replace-sales",
-        help="Wipe previous billed sales; keep universe and visits",
+        help="Wipe previous billed sales; keep universe and visits. Without this flag, Outlet Date Wise overrides overlapping shop-days and leaves the rest.",
     ),
 ):
     """Clean a sales export, merge the live universe and visits, and write insights."""
@@ -388,6 +422,79 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
     console.print(f"Wrote {pdf_path}")
     console.print(f"Wrote {detailed_xlsx}")
     console.print(f"Wrote {detailed_pdf}")
+
+
+@app.command("export-ops")
+def export_ops(
+    kind: str = typer.Argument("monday", help="monday, dsr, or friday"),
+    path: Path = typer.Argument(Path("SND_ops.xlsx")),
+):
+    """Write Monday NSM / DSR beat / Friday close packs (Excel + PDF)."""
+    init_db()
+    from sndintel.action import build_action_pack, load_action_pack
+    from sndintel.features import latest_period
+    from sndintel.ops import (
+        build_dsr_beat_pack,
+        build_friday_pack,
+        build_monday_pack,
+        excel_bytes as ops_excel,
+        load_outcomes,
+        pdf_bytes as ops_pdf,
+    )
+
+    kind = (kind or "monday").strip().lower()
+    if kind not in {"monday", "dsr", "friday"}:
+        console.print("kind must be monday, dsr, or friday")
+        raise typer.Exit(1)
+    with connect() as conn:
+        try:
+            pack = load_action_pack(conn)
+        except Exception:
+            pack = None
+        if pack is None or not pack.headline:
+            shop_month = read_sql(conn, "SELECT * FROM shop_month")
+            stores = read_sql(conn, "SELECT * FROM stores")
+            try:
+                shop_day = read_sql(conn, "SELECT * FROM shop_day")
+            except Exception:
+                shop_day = pd.DataFrame()
+            try:
+                visits = read_sql(conn, "SELECT * FROM shop_visits")
+            except Exception:
+                visits = pd.DataFrame()
+            ledger = read_sql(conn, "SELECT * FROM period_ledger")
+            period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+        else:
+            try:
+                visits = read_sql(conn, "SELECT * FROM shop_visits")
+            except Exception:
+                visits = pd.DataFrame()
+        try:
+            units = read_sql(conn, "SELECT * FROM unit_scorecards")
+        except Exception:
+            units = pd.DataFrame()
+        from sndintel.narrative import load_exec_summary_row
+
+        exec_row = load_exec_summary_row(conn, pack.period if pack is not None else None)
+        outcomes = load_outcomes(conn, pack.period)
+    if not pack.headline:
+        console.print("No action list yet. Ingest Outlet Date Wise and run [bold]snd-intel rescore[/].")
+        raise typer.Exit(1)
+    if kind == "monday":
+        ops = build_monday_pack(pack, units, visits, exec_summary=exec_row)
+    elif kind == "dsr":
+        ops = build_dsr_beat_pack(pack)
+    else:
+        ops = build_friday_pack(outcomes, pack)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(ops_excel(ops))
+    pdf_path = path.with_suffix(".pdf")
+    pdf_path.write_bytes(ops_pdf(ops))
+    console.print(f"Wrote {path}")
+    console.print(f"Wrote {pdf_path}")
+    console.print(ops.headline)
 
 
 @app.command()

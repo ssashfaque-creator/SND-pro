@@ -69,8 +69,17 @@ OCCASIONAL_BILLED_RATE = float(os.environ.get("SNDINTEL_OCCASIONAL_RATE", "0.35"
 ISOLATION_CONTAMINATION = float(os.environ.get("SNDINTEL_IF_CONTAM", "0.06"))
 FORECAST_MIN_PERIODS = int(os.environ.get("SNDINTEL_FORECAST_MIN_PERIODS", "8"))
 CLUSTER_RANDOM_STATE = 42
-APP_BRANCH = os.environ.get("SNDINTEL_APP_BRANCH", "cursor/fmcg-sales-intelligence-9302")
+YOY_MIN_LY_MT = float(os.environ.get("SNDINTEL_YOY_MIN_LY_MT", "0.5"))
+WHALE_AMS_MT = float(os.environ.get("SNDINTEL_WHALE_AMS_MT", "1.0"))
+CALLS_PER_DAY = float(os.environ.get("SNDINTEL_CALLS_PER_DAY", "25"))
+DSR_DAY_CAP = int(os.environ.get("SNDINTEL_DSR_DAY_CAP", "12"))
+SPAN_OVERLOAD = float(os.environ.get("SNDINTEL_SPAN_OVERLOAD", "1.2"))
+VISIT_SUSPECT_RATE = float(os.environ.get("SNDINTEL_VISIT_SUSPECT_RATE", "0.95"))
+VISIT_SUSPECT_UNIVERSE = int(os.environ.get("SNDINTEL_VISIT_SUSPECT_UNI", "400"))
+EXPECTED_FORMULA = os.environ.get("SNDINTEL_EXPECTED_FORMULA", "expected_v3 · paced national day curve")
+APP_BRANCH = os.environ.get("SNDINTEL_APP_BRANCH", "cursor/actionable-ops-layer-2f34")
 GITHUB_REPO = os.environ.get("SNDINTEL_GITHUB_REPO", "ssashfaque-creator/SND-pro")
+APP_DIR = Path(os.environ.get("SNDINTEL_APP_DIR", str(Path.home() / "sndintel"))).expanduser()
 
 
 def migrate_legacy_warehouse() -> None:

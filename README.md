@@ -90,57 +90,57 @@ snd-intel watch --once
 
 JSON API (for a future agent): `snd-intel serve-api` then `GET /brief`, `/insights`, `/focus`, `/shops/{id}`, `/search?q=trade+loading`.
 
-## Install on a Mac (no git)
+## Install on a Mac (curl, keep `.venv`)
 
 The warehouse is **not** stored in the app folder. It lives at:
 
 `~/Library/Application Support/SND Intelligence/warehouse.db`
 
-Updating the app replaces code only. You do not re-upload July (or any closed month).
+Git is not required. Update is `curl` the branch ZIP, `rsync` over `~/sndintel`, keep `.venv`, `pip install -e .`.
 
-**Install once** — paste into Terminal:
+**Install once**
 
 ```bash
-mkdir -p ~/sndintel /tmp/sndintel-dl
-curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/fmcg-sales-intelligence-9302.zip" -o /tmp/sndintel-dl/app.zip
+rm -rf /tmp/sndintel-dl
+mkdir -p /tmp/sndintel-dl "$HOME/sndintel"
+curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/actionable-ops-layer-2f34.zip" -o /tmp/sndintel-dl/app.zip
 unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
 SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
 rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
 cd ~/sndintel
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
 pip install -e .
 snd-intel app
 ```
-
-If `curl` cannot see GitHub (private repo), download the ZIP from the GitHub page in your browser, unzip it, then `rsync` that folder to `~/sndintel` and run the `python3 -m venv` lines.
 
 In the app: **Upload files** → shop list once, then the sales extract. Later months: sales file only.
 
-**Update the app later** (warehouse stays):
+**Update later** (warehouse stays — do not re-upload July). Same `.venv` method as before; only the branch in the URL changed:
 
 ```bash
-curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/fmcg-sales-intelligence-9302.zip" -o /tmp/sndintel-dl/app.zip
+rm -rf /tmp/sndintel-dl
+mkdir -p /tmp/sndintel-dl
+curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/actionable-ops-layer-2f34.zip" -o /tmp/sndintel-dl/app.zip
 unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
 SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
 rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
-cd ~/sndintel
-source .venv/bin/activate
-pip install -e .
-snd-intel app
+cd ~/sndintel && source .venv/bin/activate && pip install -e . && snd-intel app
 ```
 
-Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates) and leave **Replace all billed sales** ticked so Shop SKU Wise rows go away. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
+Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.6.4**. The app opens on **This week → Monday dispatch**. The Monday PDF opens with a two-page AI executive summary, then the linked summary plus city/store detail.
 
-Warehouse → **Clear billed sales only** also wipes billed rows and keeps shop lists. Do not upload the same POP+day in two files — those volumes are added.
+Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates). Leave **Replace all billed sales** unticked for a weekly refresh: days in the new file override the same shop-days (a later 20 Aug file replaces an incomplete 20 Aug); other days stay. Tick replace-all only when switching from Shop SKU Wise or wiping billed history. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
+
+Warehouse → **Clear billed sales only** also wipes billed rows and keeps shop lists.
 
 ## How a new file is applied
 
-The Google Drive sample is July + August in one extract. The next file you drop will often be **August only** (or a later cut of the same month as MTD grows).
+The Google Drive sample is July + August in one extract. The next file you drop will often be **later days of August** (or a later cut of the same month as MTD grows).
 
-- Every calendar month **present in the file** is replaced in full. That is how MTD works: 20 Aug 0.60 MT at a shop becomes 0.95 MT when the 20 Aug extract is superseded. Shops that drop off that month’s extract are removed from that month, not left as stale MTD.
-- Months **not** in the file stay as they are. July does not change when you upload August.
+- **Outlet Date Wise:** each shop-day present in the file **replaces** that shop-day in the warehouse. A 20 Aug extract that was incomplete is overwritten when the next file includes 20 Aug. Days not in the new file (1–19 Aug, or July) stay. Month totals are rebuilt from the combined daily rows for shops the file touched.
+- **Shop SKU Wise:** every calendar month **present in the file** is replaced in full. Months **not** in the file stay. July does not change when you upload August.
+- Insights are rebuilt from the **whole warehouse** (closed July + open August MTD + any earlier history), not from the new file in isolation.
 - Insights are rebuilt from the **whole warehouse** (closed July + open August MTD + any earlier history), not from the new file in isolation.
 - Focus is **Expected-based**. Every grain is scored billed versus its own typical same calendar month (history + destationalized trend, then children scaled so they add to the parent Expected). A city that declined with the country is still a hole if it missed that typical month. Intra-month pace uses elapsed calendar days of the learned typical month until successive MTD cuts train your own curve.
 - If the SSRS header has `Execution Date & Time` before month-end, that month is tagged `mtd_open`. Briefings use run-rate vs last year’s **closed** August instead of comparing 20 days to 31.
@@ -166,7 +166,7 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 src/sndintel/
   ingest/ssrs.py       SSRS chrome stripper + column inference
   ingest/shops.py      Universe parser
-  ingest/pipeline.py   Snapshot-replace months in the file → features → models → insights
+  ingest/pipeline.py   Daily shop-day overlay (or SKU-wise month replace) → features → models → insights
   materiality.py       Pareto core / middle / long-tail (not every quiet shop is 'lost')
   strategy.py          Five-play briefing
   ui/app.py            Local app: upload + strategy pack

@@ -213,3 +213,112 @@ def test_replace_sales_wipes_old_billed_and_keeps_universe(tmp_path):
     assert int(len(stores)) == n_stores
     mapped = facts.iloc[0]["distributor"]
     assert mapped == "S.M Traders (F.B Area)"
+
+
+def test_later_daily_file_overrides_overlapping_days_and_keeps_the_rest(tmp_path):
+    uni = tmp_path / "universe.xlsx"
+    first = tmp_path / "aug20.xlsx"
+    second = tmp_path / "aug20_24.xlsx"
+    db = tmp_path / "wh.db"
+    _write_universe(uni)
+    _write_daily(
+        first,
+        dates=[date(2026, 8, 1), date(2026, 8, 19), date(2026, 8, 20)],
+        shops=[("T0000100100100009849", "B.MART")],
+        volumes=[[1.00, 0.40, 0.10]],
+    )
+    run_pipeline(first, universe_path=uni, db_path=db)
+    with connect(db) as conn:
+        days1 = read_sql(conn, "SELECT * FROM shop_day")
+        facts1 = read_sql(conn, "SELECT * FROM sales_facts")
+    assert set(days1["sale_date"].astype(str).str[:10]) == {"2026-08-01", "2026-08-19", "2026-08-20"}
+    assert abs(float(days1.loc[days1["sale_date"].astype(str).str.startswith("2026-08-20"), "volume_mt"].sum()) - 0.10) < 1e-9
+    assert abs(float(facts1.loc[facts1["period"] == "2026-08", "volume_mt"].sum()) - 1.50) < 1e-9
+
+    _write_daily(
+        second,
+        dates=[date(2026, 8, 20), date(2026, 8, 21), date(2026, 8, 24)],
+        shops=[("T0000100100100009849", "B.MART")],
+        volumes=[[0.80, 0.20, 0.05]],
+    )
+    result = run_pipeline(second, db_path=db, replace_sales=False)
+    assert result["ingest_mode"] == "daily_overlay"
+    assert result["replace_sales"] is False
+    with connect(db) as conn:
+        days = read_sql(conn, "SELECT * FROM shop_day")
+        facts = read_sql(conn, "SELECT * FROM sales_facts")
+        sm = read_sql(conn, "SELECT * FROM shop_month")
+    day_map = (
+        days.assign(d=days["sale_date"].astype(str).str[:10])
+        .groupby("d")["volume_mt"]
+        .sum()
+        .to_dict()
+    )
+    assert abs(float(day_map["2026-08-01"]) - 1.00) < 1e-9
+    assert abs(float(day_map["2026-08-19"]) - 0.40) < 1e-9
+    assert abs(float(day_map["2026-08-20"]) - 0.80) < 1e-9
+    assert abs(float(day_map["2026-08-21"]) - 0.20) < 1e-9
+    assert abs(float(day_map["2026-08-24"]) - 0.05) < 1e-9
+    assert abs(float(facts.loc[facts["period"] == "2026-08", "volume_mt"].sum()) - 2.45) < 1e-9
+    aug = sm[(sm["store_id"] == "T0000100100100009849") & (sm["period"] == "2026-08")]
+    assert abs(float(aug["volume_mt"].sum()) - 2.45) < 1e-9
+
+
+def test_later_daily_file_can_clear_a_shop_day_that_is_now_zero(tmp_path):
+    uni = tmp_path / "universe.xlsx"
+    first = tmp_path / "with_aug20.xlsx"
+    second = tmp_path / "aug20_zero.xlsx"
+    db = tmp_path / "wh.db"
+    _write_universe(uni)
+    _write_daily(
+        first,
+        dates=[date(2026, 8, 19), date(2026, 8, 20)],
+        shops=[("T0000100100100009849", "B.MART")],
+        volumes=[[0.40, 0.10]],
+    )
+    run_pipeline(first, universe_path=uni, db_path=db)
+    _write_daily(
+        second,
+        dates=[date(2026, 8, 20), date(2026, 8, 21)],
+        shops=[("T0000100100100009849", "B.MART")],
+        volumes=[[0.0, 0.25]],
+    )
+    run_pipeline(second, db_path=db, replace_sales=False)
+    with connect(db) as conn:
+        days = read_sql(conn, "SELECT * FROM shop_day")
+        facts = read_sql(conn, "SELECT * FROM sales_facts")
+    got = set(days["sale_date"].astype(str).str[:10])
+    assert "2026-08-19" in got
+    assert "2026-08-20" not in got
+    assert "2026-08-21" in got
+    assert abs(float(facts.loc[facts["period"] == "2026-08", "volume_mt"].sum()) - 0.65) < 1e-9
+
+
+def test_sequential_shop_split_daily_files_keep_both_shops(tmp_path):
+    uni = tmp_path / "universe.xlsx"
+    a = tmp_path / "part_a.xlsx"
+    b = tmp_path / "part_b.xlsx"
+    db = tmp_path / "wh.db"
+    _write_universe(uni)
+    _write_daily(
+        a,
+        dates=[date(2026, 8, 20)],
+        shops=[("T0001601401000016136", "Hameed GS")],
+        volumes=[[0.05]],
+    )
+    _write_daily(
+        b,
+        dates=[date(2026, 8, 20)],
+        shops=[("T0000100100100009849", "B.MART")],
+        volumes=[[1.50]],
+    )
+    run_pipeline(universe_path=uni, db_path=db)
+    run_pipeline(sales_paths=[a], db_path=db, replace_sales=False)
+    run_pipeline(sales_paths=[b], db_path=db, replace_sales=False)
+    with connect(db) as conn:
+        facts = read_sql(conn, "SELECT * FROM sales_facts")
+        days = read_sql(conn, "SELECT * FROM shop_day")
+    assert "T0001601401000016136" in set(facts["store_id"])
+    assert "T0000100100100009849" in set(facts["store_id"])
+    assert abs(float(facts.loc[facts["period"] == "2026-08", "volume_mt"].sum()) - 1.55) < 1e-9
+    assert len(days) == 2

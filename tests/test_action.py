@@ -188,7 +188,11 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     raw = pack.raw_shops.set_index("store_id")
 
     assert "DUE1" in raw.index
-    assert "GHOST" not in raw.index
+    assert "GHOST" in raw.index
+    assert raw.loc["GHOST", "action"] == ACTION_CALL
+    assert float(raw.loc["GHOST", "ams_3m"]) == 0
+    assert float(raw.loc["GHOST", "week_target_mt"]) == 0
+    assert raw.loc["GHOST", "call_status"] == "Unvisited"
     assert raw.loc["DUE1", "action"] == ACTION_CALL
     assert raw.loc["VIS1", "action"] == ACTION_CONVERT
     assert raw.loc["LITE1", "action"] == ACTION_LIFT
@@ -234,6 +238,51 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     assert "Due Mart" not in set(pack.lapses["Shop"].astype(str))
 
 
+def test_zero_ams_universe_door_counts_in_unvisited_and_visit_pct():
+    from sndintel.action import action_buckets
+    from sndintel.capacity import score_dsr_capacity
+
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    without = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    before = score_dsr_capacity(without.raw_shops, without.as_of_day, without.days_in_month, without.days_left)
+    amir_before = before[(before["city"] == "Karachi") & (before["dsr_name"].astype(str).str.contains("Amir"))].iloc[0]
+
+    stores = pd.concat(
+        [
+            stores,
+            pd.DataFrame(
+                [
+                    {
+                        "store_id": "ZERO1",
+                        "store_name": "Zero Mart",
+                        "city": "Karachi",
+                        "distributor": "Eva Foods",
+                        "dsr_name": "Amir",
+                        "section": "Clifton",
+                        "in_universe": 1,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    raw = pack.raw_shops.set_index("store_id")
+    assert "ZERO1" in raw.index
+    assert raw.loc["ZERO1", "action"] == ACTION_CALL
+    assert raw.loc["ZERO1", "call_status"] == "Unvisited"
+    assert float(raw.loc["ZERO1", "ams_3m"]) == 0
+    assert float(raw.loc["ZERO1", "week_target_mt"]) == 0
+    after_buckets = action_buckets(pack.raw_shops)
+    before_buckets = action_buckets(without.raw_shops)
+    assert after_buckets["n_call"] == before_buckets["n_call"] + 1
+    assert abs(after_buckets["ask_call"] - before_buckets["ask_call"]) < 1e-9
+    cap = score_dsr_capacity(pack.raw_shops, pack.as_of_day, pack.days_in_month, pack.days_left)
+    amir = cap[(cap["city"] == "Karachi") & (cap["dsr_name"].astype(str).str.contains("Amir"))].iloc[0]
+    assert int(amir["universe"]) == int(amir_before["universe"]) + 1
+    assert float(amir["visit_rate"]) < float(amir_before["visit_rate"])
+
+
 def test_unvisited_due_ranks_ahead_of_visited_due():
     shop_month, stores, shop_day, ledger, visits = _panel()
     pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
@@ -247,6 +296,9 @@ def test_dsr_instruction_names_counts_and_tonnes():
     assert not pack.dsrs.empty
     row = pack.dsrs.iloc[0]
     assert row["DSR"] == "Amir"
+    assert "Label" in pack.dsrs.columns
+    assert "Distributor" in pack.dsrs.columns
+    assert str(pack.raw_dsrs.iloc[0]["grain_id"]).startswith("Amir")
     assert "Push Amir" in str(row["Do this"])
     assert "rest of the month" in str(row["Do this"]).lower()
     assert "doors to work" in str(row["Do this"]).lower()
@@ -418,3 +470,37 @@ def test_just_billed_inside_cycle_is_not_rest_of_month_ask():
     assert not bool(raw.loc["EARLY1", "coming_due"])
     assert float(raw.loc["EARLY1", "week_target_mt"]) == 0.0
     assert float(raw.loc["EARLY1", "remaining_mt"]) > 0.5
+
+
+def test_two_amirs_roll_as_two_dsrs():
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    city, dist = "Lahore", "Lahore Dist"
+    extra = [_bill("LHR1", "Lahore Due", city, dist, "Amir", d, 1.0) for d in _cycle_dates(date(2026, 7, 28), 15, 20)]
+    shop_day = pd.concat([shop_day, pd.DataFrame(extra)], ignore_index=True)
+    shop_month = pd.concat([shop_month, pd.DataFrame(_months_from_days(extra))], ignore_index=True)
+    stores = pd.concat(
+        [
+            stores,
+            pd.DataFrame(
+                [
+                    {
+                        "store_id": "LHR1",
+                        "store_name": "Lahore Due",
+                        "city": city,
+                        "distributor": dist,
+                        "dsr_name": "Amir",
+                        "section": "Gulberg",
+                        "in_universe": 1,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    assert len(pack.raw_dsrs) >= 2
+    assert pack.raw_dsrs["grain_id"].nunique() >= 2
+    named = pack.all_dsrs[pack.all_dsrs["DSR"].astype(str) == "Amir"]
+    assert len(named) >= 2
+    assert set(named["City"].astype(str)) >= {"Karachi", "Lahore"}
+

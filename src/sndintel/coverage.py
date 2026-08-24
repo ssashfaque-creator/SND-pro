@@ -265,11 +265,11 @@ def attach_coverage_split(units: pd.DataFrame, book: pd.DataFrame) -> pd.DataFra
         return out
     city_r = rollup_coverage(book, ["city"])
     dist_r = rollup_coverage(book, ["city", "distributor"])
-    dsr_r = rollup_coverage(book, ["city", "dsr_name"])
+    dsr_r = rollup_coverage(book, ["city", "distributor", "dsr_name"])
     nat_r = rollup_coverage(book, None)
     out = _merge_grain(out, "city", city_r, {"city": "grain_id"})
     out = _merge_grain(out, "distributor", dist_r, {"city": "parent_id", "distributor": "grain_id"})
-    out = _merge_grain(out, "dsr", dsr_r, {"city": "parent_id", "dsr_name": "grain_id"})
+    out = _merge_grain(out, "dsr", dsr_r, {"city": "city", "distributor": "distributor", "dsr_name": "dsr_name"})
     out = _merge_grain(out, "national", nat_r, {})
     return out
 
@@ -385,12 +385,15 @@ def _trend_bit(r: pd.Series, parent: dict[str, Any]) -> str:
         gap = vol - exp
         parts.append(f"{gap:+.0f} MT vs Expected.")
     if ly is not None and ly > 1e-9 and vol is not None:
-        yoy = 100.0 * (vol - ly) / ly
-        p_yoy = parent.get("yoy_pct")
-        if p_yoy is not None:
-            parts.append(f"YoY {yoy:+.0f}% vs country {p_yoy:+.0f}%.")
-        else:
-            parts.append(f"YoY {yoy:+.0f}%.")
+        from sndintel.capacity import yoy_is_printable
+
+        if yoy_is_printable(ly):
+            yoy = 100.0 * (vol - ly) / ly
+            p_yoy = parent.get("yoy_pct")
+            if p_yoy is not None:
+                parts.append(f"YoY {yoy:+.0f}% vs country {p_yoy:+.0f}%.")
+            else:
+                parts.append(f"YoY {yoy:+.0f}%.")
     return " ".join(parts) if len(parts) > 1 else ""
 
 

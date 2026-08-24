@@ -29,9 +29,21 @@ from sndintel.briefing import (
     pdf_bytes,
     pdf_bytes_detailed,
 )
+from sndintel import __version__
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
+from sndintel.monday import monday_summary_sheets
+from sndintel.ops import (
+    beat_owner_options,
+    build_dsr_beat_pack,
+    build_friday_pack,
+    build_monday_pack,
+    excel_bytes as ops_excel_bytes,
+    filter_beat_by_owner,
+    load_outcomes,
+    pdf_bytes as ops_pdf_bytes,
+)
 from sndintel.storage import connect, init_db, read_sql
 
 DIAGNOSIS_COLOR = {
@@ -199,7 +211,7 @@ def main():
     page = st.sidebar.radio(
         "Workspace",
         ["Strategy", "This week", "Report", "Upload files", "Focus", "People", "Mix", "Shops", "Warehouse"],
-        index=1 if empty else 0,
+        index=1,
     )
     st.sidebar.divider()
     st.sidebar.markdown(f"**Warehouse** `{DB_PATH}`")
@@ -232,7 +244,7 @@ def main():
     elif page == "Focus":
         _page_focus(data, period)
     elif page == "People":
-        _page_people(data, period)
+        _page_people(data, period, mtd)
     elif page == "Mix":
         _page_mix(data, period)
     elif page == "Shops":
@@ -280,7 +292,7 @@ def _page_upload(empty: bool):
             type=["xlsx", "xls", "xlsm", "csv"],
             key="sales",
             accept_multiple_files=True,
-            help="Split a large daily file by shops or by date range and drop every part here in one go.",
+            help="Split a large daily file by shops or by date range. Later files override overlapping shop-days; other days stay.",
         )
         visits = st.file_uploader(
             "Shop visit calls (csv / xlsx) — MTD visits, weekly with sales",
@@ -292,14 +304,18 @@ def _page_upload(empty: bool):
 
     st.markdown(
         "- **Universe** can stay in the warehouse. Re-upload only when shops/DSRs move.\n"
-        "- **Sales:** drop several Outlet Date Wise files together (shop split or date split). Same POP + month is added across files. Do not upload the same rows twice.\n"
-        "- Shop SKU Wise still parses if that is what you have.\n"
-        "- Every later week: **sales + visit calls**. Closed months stay unless you tick replace-all below."
+        "- **Outlet Date Wise:** days in these files **replace** the same shop-days already stored "
+        "(a later file that includes 20 Aug overrides an earlier incomplete 20 Aug). "
+        "Days and shops not in the file stay. Shop-split files in one drop are combined. "
+        "Do not tick replace-all for a weekly MTD refresh.\n"
+        "- **Shop SKU Wise:** months in the file replace those months (August-only keeps July).\n"
+        "- Every later week: **sales + visit calls**. Tick replace-all only to wipe billed history "
+        "(for example switching from Shop SKU Wise to Outlet Date Wise)."
     )
     replace_sales = st.checkbox(
         "Replace all billed sales (keep universe and visits)",
-        value=True,
-        help="On: wipe previous billed rows, then load these files. Use this when switching from Shop SKU Wise to Outlet Date Wise, or when the split set is the full history. Off: only months present in these files are replaced (August-only MTD refresh keeps July).",
+        value=False,
+        help="Off (default): Outlet Date Wise overrides overlapping shop-days and rebuilds those months from the warehouse; other days stay. Shop SKU Wise still replaces each month the file contains. On: wipe every billed row first, then load only these files.",
     )
 
     st.divider()
@@ -428,12 +444,19 @@ def _page_upload(empty: bool):
             st.exception(exc)
             return
     st.cache_data.clear()
+    overlay_note = ""
+    if result.get("ingest_mode") == "daily_overlay" and not result.get("replace_sales"):
+        n_days = len(result.get("overridden_dates") or [])
+        overlay_note = (
+            f"Daily overlay: {n_days} billed day(s) in these files replaced matching warehouse shop-days; "
+            "other days stayed. "
+        )
     st.success(
         f"Scored {result.get('n_sales_rows')} fact rows · {result.get('n_sales_files') or 0} sales file(s) · "
         f"latest {result.get('latest_period')} · "
         f"{result.get('n_cities', 0)} cities · universe {result.get('n_universe') or '—'} · "
         f"visits {result.get('n_visits') or '—'}. "
-        f"{'Replaced all billed sales. ' if result.get('replace_sales') else ''}"
+        f"{'Replaced all billed sales. ' if result.get('replace_sales') else overlay_note}"
         f"Months: {', '.join(result.get('replaced_periods') or []) or '—'}"
     )
     if result.get("open_mtd_period"):
@@ -465,6 +488,8 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         return
 
     pack = _strategy_pack(data, period, ledger)
+    for warning in getattr(pack, "visit_warnings", None) or []:
+        st.warning(warning)
     if pack.exec_situation:
         st.markdown(
             '<div class="sit-card" style="background:#f8fafc;border-left:8px solid #0f172a">'
@@ -566,11 +591,10 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         "Excel is the working file (filters, one sheet per layer). "
         "PDF is the board pack — whole numbers, remarks as bullets in the last column. "
         "For a city / distributor / DSR pack, use **Report**. "
-        "National summary names one top 10 of lagging distributors, one top 10 of lagging DSRs, "
-        "and one top 50 of lagging shops — each ranked nationally by how serious the miss "
-        "is versus that unit’s own Expected given its size, not the biggest Gap tons "
-        "(after the 0.25 MT shop floor), and not nested under the other list. "
-        "Detailed pack = every city, every distributor and DSR with AMS > 0, and every shop with gap > 0.25 MT."
+        "National summary has two rankings per grain: Gap tons (the books that close the month) "
+        "and seriousness (Gap ÷ √Expected — collapsed mid-size names). Whales are AMS / last drop ≥ 1 MT. "
+        "A DSR is city + distributor + name. Detailed pack = every city, every distributor and DSR with AMS > 0, "
+        "and every shop with gap > 0.25 MT."
     )
 
     st.markdown("##### 1. The country — every city")
@@ -636,27 +660,57 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         fig.update_layout(height=200, margin=dict(l=10, r=10, t=30, b=10), title="National volume")
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("##### 2. Top 10 lagging distributors")
+    st.markdown("##### 2. Top 10 distributors by Gap tons")
+    st.caption("The books that close the month. Ranked by Gap MT, not seriousness. AMS = 0 is hidden.")
+    vol_dist = pack.volume_distributors if pack.volume_distributors is not None and not pack.volume_distributors.empty else pack.lagging_distributors
+    if vol_dist is None or vol_dist.empty:
+        st.info("No lagging distributor with a recent run-rate.")
+    else:
+        _strategy_table(vol_dist)
+
+    st.markdown("##### 3. Top 10 most serious lagging distributors")
     st.caption(
-        "One national list. Ranked by how serious the miss is versus own Expected given size, not the biggest Gap. AMS = 0 is hidden. Remainder line is everyone after the tenth."
+        "Ranked by Gap ÷ √Expected — collapsed mid-size names beat large books that are only slightly light. Remainder line is everyone after the tenth."
     )
     if pack.lagging_distributors.empty:
         st.info("No lagging distributor with a recent run-rate.")
     else:
         _strategy_table(pack.lagging_distributors)
 
-    st.markdown("##### 3. Top 10 lagging DSRs")
+    st.markdown("##### 4. Top 10 DSRs by Gap tons")
+    st.caption("City + distributor + name. Ranked by Gap MT. Two people with the same first name never share a row.")
+    vol_dsr = pack.volume_dsrs if pack.volume_dsrs is not None and not pack.volume_dsrs.empty else pack.lagging_dsrs
+    if vol_dsr is None or vol_dsr.empty:
+        st.info("No lagging DSR with a recent run-rate.")
+    else:
+        _strategy_table(vol_dsr)
+
+    st.markdown("##### 5. Top 10 most serious lagging DSRs")
     st.caption(
-        "One national list — not nested under the ten distributors. Ranked by miss versus own Expected given size. AMS = 0 is hidden. Remainder line is everyone after the tenth."
+        "One national list — not nested under the ten distributors. Ranked by miss versus own Expected given size. AMS = 0 is hidden."
     )
     if pack.lagging_dsrs.empty:
         st.info("No lagging DSR with a recent run-rate.")
     else:
         _strategy_table(pack.lagging_dsrs)
 
-    st.markdown("##### 4. Top 50 lagging shops")
+    st.markdown("##### 6. Whales")
+    st.caption("AMS or last drop ≥ 1 MT. These close the month. Kiryana seriousness lists do not.")
+    if pack.whales is None or pack.whales.empty:
+        st.info("No whale doors at the 1 MT floor this period.")
+    else:
+        _strategy_table(pack.whales, height=280)
+
+    st.markdown("##### 7. Top 50 most serious shops")
     st.caption(pack.shop_note or "One national list of the 50 most serious doors after the 0.25 MT floor. The rest of the hole is the remainder line.")
     _strategy_table(pack.lagging_shops, height=420)
+
+    st.markdown("##### 8. DSR capacity")
+    st.caption("Overloaded = not enough DSRs. Not working the beat = spare capacity, weak visit %. Not converting = visits happened, shops did not buy. Not lifting drop = billed, order size is light.")
+    if pack.capacity_dsrs is None or pack.capacity_dsrs.empty:
+        st.info("No DSR capacity labels yet.")
+    else:
+        _strategy_table(pack.capacity_dsrs, height=320)
 
     with st.expander("How to read the columns", expanded=False):
         for term, meaning in GLOSSARY:
@@ -707,11 +761,41 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
     )
 
 
+def _ops_downloads(pack, period: str, stem: str, key_prefix: str):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Excel",
+            ops_excel_bytes(pack),
+            file_name=f"SND_{stem}_{period}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_xlsx",
+        )
+    with c2:
+        st.download_button(
+            "PDF",
+            ops_pdf_bytes(pack),
+            file_name=f"SND_{stem}_{period}.pdf",
+            mime="application/pdf",
+            key=f"{key_prefix}_pdf",
+        )
+
+
+def _render_ops_sheets(sheets, height: int = 280):
+    if not sheets:
+        st.caption("No rows at this layer.")
+        return
+    for _sheet, heading, note, df in sheets:
+        st.markdown(f"**{heading}**")
+        if note:
+            st.caption(note)
+        _strategy_table(df, height=height)
+
+
 def _page_this_week(data, period, mtd, ledger):
     st.title("This week")
     st.caption(
-        f"**{mtd['label'] or period}** · Which doors are due to order, bought too little, or are fading. "
-        "Each shop’s usual days-between-bills and leftover cover from the last drop decide the action. "
+        f"**{mtd['label'] or period}** · Monday dispatch is the operating view. "
         "Expected is still the last-three-closed-month run-rate — no day-of-month seasonality. "
         "Rebuild scorecards after an Outlet Date Wise upload."
     )
@@ -747,63 +831,113 @@ def _page_this_week(data, period, mtd, ledger):
     else:
         st.caption("Purchase cycle and leftover cover learned from billed days, shrunk shop → DSR → city.")
 
-    left, right = st.columns(2)
-    with left:
-        st.download_button(
-            "Download this week (Excel)",
-            action_excel_bytes(pack),
-            file_name=f"SND_this_week_{period}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
-    with right:
-        st.download_button(
-            "Download this week (PDF)",
-            action_pdf_bytes(pack),
-            file_name=f"SND_this_week_{period}.pdf",
-            mime="application/pdf",
-        )
-    d1, d2 = st.columns(2)
-    with d1:
-        st.download_button(
-            "Download detailed action pack (Excel)",
-            action_excel_bytes(pack, detailed=True),
-            file_name=f"SND_this_week_{period}_detailed.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    with d2:
-        st.download_button(
-            "Download detailed action pack (PDF)",
-            action_pdf_bytes(pack, detailed=True),
-            file_name=f"SND_this_week_{period}_detailed.pdf",
-            mime="application/pdf",
-        )
+    units = data.get("units", pd.DataFrame())
+    visits = data.get("visits", pd.DataFrame())
+    monday = build_monday_pack(pack, units, visits, exec_summary=_exec_row(data, period))
+    beat = build_dsr_beat_pack(pack)
+    with connect() as conn:
+        outcomes = load_outcomes(conn, period)
+    friday = build_friday_pack(outcomes, pack)
 
-    st.markdown("##### 1. Country this week")
-    _strategy_table(pack.country, height=140)
-    st.markdown("##### 2. Push these distributors")
-    st.caption("Ranked by rest-of-month ask KG. Doors = due now. Coming due = cycle lands before month-end. Ask is those drops, not the whole Expected hole.")
-    _strategy_table(pack.distributors, height=320)
-    st.markdown("##### 3. Push these DSRs")
-    st.caption("One national list. A DSR can appear even if its distributor is not above.")
-    _strategy_table(pack.dsrs, height=320)
-    st.markdown("##### 4. Due — cycle elapsed, not visited")
-    st.caption("Usually buys every N days; it has been N days with no bill. Nobody visited this month.")
-    _strategy_table(pack.calls, height=420)
-    st.markdown("##### 5. Due · visited — called, still no bill")
-    _strategy_table(pack.converts, height=280)
-    st.markdown("##### 6. Another visit — bought too little this month")
-    st.caption("Billed once (or a stub) and still short of Expected. Cycle says they should have bought again.")
-    _strategy_table(pack.lifts, height=280)
-    st.markdown("##### 7. Lapsing — quiet too long or declining")
-    st.caption("Two cycles with no bill, or last-three months down versus the three before. Unvisited doors rank first.")
-    _strategy_table(pack.lapses, height=280)
-    st.markdown("##### 8. Backtest")
-    st.caption("At day 15 of closed months: did shops marked due actually bill in the next 14 days?")
-    _strategy_table(pack.backtest, height=160)
-    with st.expander("How to read this pack", expanded=False):
-        for term, meaning in ACTION_GLOSSARY:
-            st.markdown(f"**{term}.** {meaning}")
+    view = st.radio(
+        "View",
+        ["Monday dispatch", "DSR beat lists", "Friday close", "Full this-week lists"],
+        horizontal=True,
+        index=0,
+        key="this_week_view",
+    )
+
+    if view == "Monday dispatch":
+        st.caption(
+            "Summary: country, city drivers, city actions, DSRs, highlighted distributors, highlighted stores. "
+            "The PDF/Excel download has every city and every store with Ask, with links from the summary."
+        )
+        for warning in monday.warnings:
+            st.warning(warning)
+        _render_ops_sheets(monday_summary_sheets(monday.sheets), height=300)
+        with st.expander("Download Monday NSM pack"):
+            _ops_downloads(monday, period, "monday", "monday")
+    elif view == "DSR beat lists":
+        st.caption(beat.headline)
+        beat_df = beat.sheets[0][3] if beat.sheets else pd.DataFrame()
+        owners = beat_owner_options(beat_df)
+        pick = st.selectbox("DSR", ["All DSRs"] + owners, key="beat_dsr")
+        shown = beat_df if pick == "All DSRs" else filter_beat_by_owner(beat_df, pick)
+        st.caption(f"{len(shown)} doors on this list. Waiting-list doors stay in Full this-week lists.")
+        _strategy_table(shown, height=480)
+        with st.expander("Download DSR beat lists"):
+            _ops_downloads(beat, period, "dsr_beat", "beat")
+    elif view == "Friday close":
+        st.caption(
+            "This is whether last week’s list moved volume — not a new ranking. "
+            "Score the warehouse twice in the same month to fill it."
+        )
+        st.markdown(f"**{friday.headline}**")
+        _render_ops_sheets(friday.sheets, height=240)
+        with st.expander("Download Friday close"):
+            _ops_downloads(friday, period, "friday", "friday")
+    else:
+        left, right = st.columns(2)
+        with left:
+            st.download_button(
+                "Download this week (Excel)",
+                action_excel_bytes(pack),
+                file_name=f"SND_this_week_{period}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="full_week_xlsx",
+            )
+        with right:
+            st.download_button(
+                "Download this week (PDF)",
+                action_pdf_bytes(pack),
+                file_name=f"SND_this_week_{period}.pdf",
+                mime="application/pdf",
+                key="full_week_pdf",
+            )
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Download detailed action pack (Excel)",
+                action_excel_bytes(pack, detailed=True),
+                file_name=f"SND_this_week_{period}_detailed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="full_week_detail_xlsx",
+            )
+        with d2:
+            st.download_button(
+                "Download detailed action pack (PDF)",
+                action_pdf_bytes(pack, detailed=True),
+                file_name=f"SND_this_week_{period}_detailed.pdf",
+                mime="application/pdf",
+                key="full_week_detail_pdf",
+            )
+        st.markdown("##### 1. Country this week")
+        _strategy_table(pack.country, height=140)
+        st.markdown("##### 2. Push these distributors")
+        st.caption("Ranked by rest-of-month ask KG. Doors = due now. Coming due = cycle lands before month-end. Ask is those drops, not the whole Expected hole.")
+        _strategy_table(pack.distributors, height=320)
+        st.markdown("##### 3. Push these DSRs")
+        st.caption("One national list. A DSR can appear even if its distributor is not above.")
+        _strategy_table(pack.dsrs, height=320)
+        st.markdown("##### 4. Due — cycle elapsed, not visited")
+        st.caption("Usually buys every N days; it has been N days with no bill. Nobody visited this month.")
+        _strategy_table(pack.calls, height=420)
+        st.markdown("##### 5. Due · visited — called, still no bill")
+        _strategy_table(pack.converts, height=280)
+        st.markdown("##### 6. Another visit — bought too little this month")
+        st.caption("Billed once (or a stub) and still short of Expected. Cycle says they should have bought again.")
+        _strategy_table(pack.lifts, height=280)
+        st.markdown("##### 7. Lapsing — quiet too long or declining")
+        st.caption("Two cycles with no bill, or last-three months down versus the three before. Unvisited doors rank first.")
+        _strategy_table(pack.lapses, height=280)
+        st.markdown("##### 8. Backtest")
+        st.caption("At day 15 of closed months: did shops marked due actually bill in the next 14 days?")
+        _strategy_table(pack.backtest, height=160)
+        with st.expander("How to read this pack", expanded=False):
+            for term, meaning in ACTION_GLOSSARY:
+                st.markdown(f"**{term}.** {meaning}")
+
     _rescore_button()
 
 
@@ -1033,40 +1167,90 @@ def _page_focus(data, period):
         st.plotly_chart(fig, use_container_width=True)
 
 
-def _page_people(data, period):
+def _page_people(data, period, mtd):
     st.title("People scorecards")
+    st.caption(
+        "A DSR is city + distributor + name. Two people with the same first name never share a row. "
+        "Label is capacity vs skill: Overloaded / Not working the beat / Not converting / Not lifting drop / Fine."
+    )
     units = data.get("units", pd.DataFrame())
     kpis = data["kpis"]
-    for grain, label, key in [("dsr", "Salespeople", "dsr"), ("distributor", "Distributors", "distributor")]:
-        st.markdown(f"#### {label}")
-        if units is not None and not units.empty and grain in set(units["grain"].dropna()):
-            df = units[(units["grain"] == grain) & (units["period"] == period)].sort_values("gap_mt")
-            cols = [
-                c
-                for c in ["grain_id", "city", "volume_mt", "expected_mt", "ly_mt", "gap_mt", "diagnosis", "verdict", "do_this_week"]
-                if c in df.columns
+    as_of = int(mtd.get("as_of_day") or mtd.get("days_in_month") or 21)
+    days_m = int(mtd.get("days_in_month") or 31)
+    st.markdown("#### Salespeople")
+    if units is not None and not units.empty and "dsr" in set(units["grain"].dropna()):
+        from sndintel.capacity import present_capacity_table, score_dsr_capacity_from_units
+        from sndintel.identity import dsr_display_name
+
+        dsrs = units[(units["grain"] == "dsr") & (units["period"] == period)].copy()
+        if "dsr_name" not in dsrs.columns or dsrs["dsr_name"].isna().all():
+            dsrs["dsr_name"] = dsrs["grain_id"].map(dsr_display_name)
+        cap = score_dsr_capacity_from_units(dsrs, as_of, days_m)
+        if not cap.empty:
+            st.markdown("##### Capacity labels")
+            _strategy_table(present_capacity_table(cap, n=40), height=360)
+        show = dsrs.sort_values("gap_mt")
+        cols = [
+            c
+            for c in [
+                "dsr_name",
+                "city",
+                "distributor",
+                "volume_mt",
+                "expected_mt",
+                "ly_mt",
+                "gap_mt",
+                "visit_rate",
+                "strike_rate",
+                "diagnosis",
+                "verdict",
+                "do_this_week",
             ]
-            st.dataframe(df[cols].rename(columns={"grain_id": key}), use_container_width=True, hide_index=True)
-        else:
-            df = kpis[(kpis["grain"] == grain) & (kpis["period"] == period)].sort_values("volume_mt", ascending=False)
-            cols = [
-                c
-                for c in [
-                    "grain_id",
-                    "volume_mt",
-                    "mom_pct",
-                    "comparable_mom_pct",
-                    "yoy_pct",
-                    "run_rate_yoy_pct",
-                    "strike_rate",
-                    "drop_size",
-                    "sku_depth",
-                    "billed_outlets",
-                    "universe_outlets",
-                ]
-                if c in df.columns
-            ]
-            st.dataframe(df[cols].rename(columns={"grain_id": label[:-1]}), use_container_width=True, hide_index=True)
+            if c in show.columns
+        ]
+        rename = {
+            "dsr_name": "DSR",
+            "city": "City",
+            "distributor": "Distributor",
+            "volume_mt": "Billed (MT)",
+            "expected_mt": "Expected (MT)",
+            "ly_mt": "Last year (MT)",
+            "gap_mt": "Gap (MT)",
+            "visit_rate": "Visit %",
+            "strike_rate": "Strike %",
+            "diagnosis": "Diagnosis",
+            "verdict": "Verdict",
+            "do_this_week": "Do this week",
+        }
+        table = show[cols].rename(columns=rename)
+        if "Visit %" in table.columns:
+            table["Visit %"] = (pd.to_numeric(table["Visit %"], errors="coerce") * 100).round(0)
+        if "Strike %" in table.columns:
+            table["Strike %"] = (pd.to_numeric(table["Strike %"], errors="coerce") * 100).round(0)
+        st.markdown("##### Scorecards")
+        _strategy_table(table, height=420)
+    else:
+        df = kpis[(kpis["grain"] == "dsr") & (kpis["period"] == period)].sort_values("volume_mt", ascending=False)
+        cols = [c for c in ["grain_id", "volume_mt", "strike_rate", "drop_size", "billed_outlets", "universe_outlets"] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    st.markdown("#### Distributors")
+    if units is not None and not units.empty and "distributor" in set(units["grain"].dropna()):
+        df = units[(units["grain"] == "distributor") & (units["period"] == period)].sort_values("gap_mt")
+        cols = [
+            c
+            for c in ["grain_id", "city", "volume_mt", "expected_mt", "ly_mt", "gap_mt", "diagnosis", "verdict", "do_this_week"]
+            if c in df.columns
+        ]
+        st.dataframe(
+            df[cols].rename(columns={"grain_id": "Distributor", "city": "City"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        df = kpis[(kpis["grain"] == "distributor") & (kpis["period"] == period)].sort_values("volume_mt", ascending=False)
+        cols = [c for c in ["grain_id", "volume_mt", "strike_rate", "drop_size"] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
 
 def _page_mix(data, period):
@@ -1105,19 +1289,33 @@ def _page_shops(data, period):
     fc = data["forecasts"]
     fc = fc[(fc["entity_type"] == "shop") & (fc["entity_id"] == sid)]
     if not fc.empty:
-        fig.add_scatter(x=fc["period"], y=fc["predicted"], name="expected", mode="lines+markers")
+        fig.add_scatter(x=fc["period"], y=fc["predicted"], name="ML forecast (not official Expected)", mode="lines+markers")
     fig.update_layout(height=320)
     st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Official Expected on the board pack is last-three-month run-rate, paced. "
+        "The line above is a shop-month ML forecast and is not used for Gap or this-week Ask."
+    )
     st.dataframe(hist, use_container_width=True, hide_index=True)
 
 
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
+        f"- App version **{__version__}**. If this is still 0.6.3, curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
     )
+    with st.expander("Update the app on this Mac (curl, keep .venv)", expanded=True):
+        from sndintel.update import mac_update_commands, zip_url
+
+        st.markdown(
+            "Same method as before: `curl` the branch ZIP, `rsync` over `~/sndintel`, "
+            "keep `.venv`, `pip install -e .`. Warehouse stays in Application Support. "
+            f"URL: `{zip_url()}`"
+        )
+        st.code(mac_update_commands().rstrip(), language="bash")
     ledger = data.get("ledger", pd.DataFrame())
     if not ledger.empty:
         st.subheader("Months on file")

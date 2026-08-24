@@ -78,6 +78,7 @@ def _parse_sales_paths(paths: list[Path]) -> tuple[pd.DataFrame, ParseReport | N
 
 
 def combine_daily_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Later files in the same drop win on the same shop-day (override, not add)."""
     parts = [frame.copy() for frame in frames if frame is not None and not frame.empty]
     if not parts:
         return pd.DataFrame()
@@ -88,8 +89,6 @@ def combine_daily_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     key = ["store_id", "sale_date"]
     extra = [c for c in out.columns if c not in key]
     agg = {c: "last" for c in extra}
-    if "volume_mt" in agg:
-        agg["volume_mt"] = "sum"
     grouped = out.groupby(key, as_index=False, sort=False).agg(agg)
     grouped = grouped.loc[pd.to_numeric(grouped["volume_mt"], errors="coerce").fillna(0) > 0].copy()
     return grouped.reset_index(drop=True)
@@ -139,6 +138,13 @@ def merge_sales_reports(reports: list[ParseReport]) -> ParseReport | None:
         params=dict(best.params or {}),
     )
     merged.params["n_files"] = str(len(reports))
+    dates: list[str] = []
+    stores: list[str] = []
+    for report in reports:
+        dates.extend(getattr(report, "daily_dates", None) or [])
+        stores.extend(getattr(report, "daily_store_ids", None) or [])
+    merged.daily_dates = sorted({str(d)[:10] for d in dates if d})
+    merged.daily_store_ids = sorted({str(s).strip() for s in stores if s})
     return merged
 
 
@@ -203,9 +209,12 @@ def run_pipeline(
     """Ingest sales (optional if warehouse already has facts), live universe, visits, then rescore.
 
     ``sales_paths`` accepts several Outlet Date Wise (or Shop SKU Wise) files in
-    one go — split by shops or by date range. Volumes for the same POP + month
-    are added across files. ``replace_sales`` wipes previous billed rows and the
-    month ledger; stores (universe) and visit calls stay.
+    one go — split by shops or by date range. Outlet Date Wise **overrides** the
+    shop-days present in the files and leaves other days in the warehouse.
+    Month totals are rebuilt from the combined daily rows. Shop SKU Wise still
+    replaces each calendar month the file contains. ``replace_sales`` wipes
+    previous billed rows and the month ledger; stores (universe) and visit
+    calls stay.
     """
     ensure_dirs()
     db_path = Path(db_path or DB_PATH)
@@ -236,6 +245,8 @@ def run_pipeline(
     touched_periods: list[str] = []
     open_period: Optional[str] = None
     execution = None
+    ingest_mode = ""
+    overridden_dates: list[str] = []
 
     with connect(db_path) as conn:
         cur = conn.execute(
@@ -298,120 +309,49 @@ def run_pipeline(
                 new_ids["updated_at"] = utcnow()
                 _upsert_stores(conn, new_ids)
 
-            facts = collapse_sales_facts(sales.copy())
             label = _sales_label(file_paths)
-            facts["source_file"] = label
-            facts["ingested_at"] = utcnow()
-            touched_periods = sorted(facts["period"].dropna().unique().tolist())
+            execution = parse_execution_date(sales_report.params if sales_report else None)
+            daily = getattr(sales_report, "daily", None) if sales_report else None
+            has_daily = daily is not None and not daily.empty
+            ingest_mode = "daily_overlay" if has_daily else "month_replace"
             if replace_sales:
                 _clear_billed_sales(conn)
-            elif touched_periods:
-                # Snapshot replace: the extract is the new truth for every month it contains.
-                placeholders = ", ".join("?" * len(touched_periods))
-                conn.execute(
-                    f"DELETE FROM sales_facts WHERE period IN ({placeholders})",
-                    tuple(touched_periods),
-                )
-            upsert_dataframe(
-                conn,
-                "sales_facts",
-                facts[
-                    [
-                        "store_id",
-                        "sku",
-                        "period",
-                        "year",
-                        "month",
-                        "volume_mt",
-                        "distributor",
-                        "dsr_name",
-                        "section",
-                        "store_name",
-                        "source_file",
-                        "ingested_at",
-                    ]
-                ],
-                ["store_id", "sku", "period"],
-            )
-            execution = parse_execution_date(sales_report.params if sales_report else None)
-            open_period = open_mtd_period(touched_periods, execution)
-            for per in touched_periods:
-                part = facts[facts["period"] == per]
-                status = "mtd_open" if per == open_period else "closed"
-                as_of = days = None
-                if status == "mtd_open":
-                    _factor, as_of, days = run_rate_factor(execution, per)
-                else:
-                    year, month = int(str(per)[:4]), int(str(per)[5:7])
-                    days = monthrange(year, month)[1]
-                    as_of = days
-                conn.execute(
-                    """INSERT INTO period_ledger
-                       (period, status, source_file, execution_date, ingested_at, n_fact_rows, volume_mt, as_of_day, days_in_month)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(period) DO UPDATE SET
-                         status=excluded.status,
-                         source_file=excluded.source_file,
-                         execution_date=excluded.execution_date,
-                         ingested_at=excluded.ingested_at,
-                         n_fact_rows=excluded.n_fact_rows,
-                         volume_mt=excluded.volume_mt,
-                         as_of_day=excluded.as_of_day,
-                         days_in_month=excluded.days_in_month
-                    """,
-                    (
-                        per,
-                        status,
-                        label,
-                        execution.strftime("%Y-%m-%d") if execution else None,
-                        utcnow(),
-                        int(len(part)),
-                        float(part["volume_mt"].sum()),
-                        as_of,
-                        days,
-                    ),
-                )
-                if as_of and days:
-                    conn.execute(
-                        """INSERT INTO mtd_observations
-                           (period, as_of_day, days_in_month, volume_mt, source_file, ingested_at)
-                           VALUES (?, ?, ?, ?, ?, ?)
-                           ON CONFLICT(period, as_of_day) DO UPDATE SET
-                             volume_mt=excluded.volume_mt,
-                             days_in_month=excluded.days_in_month,
-                             source_file=excluded.source_file,
-                             ingested_at=excluded.ingested_at
-                        """,
-                        (
-                            per,
-                            int(as_of),
-                            int(days),
-                            float(part["volume_mt"].sum()),
-                            label,
-                            utcnow(),
-                        ),
-                    )
-
-            daily = getattr(sales_report, "daily", None) if sales_report else None
-            if daily is not None and not daily.empty:
+            if has_daily:
                 daily = overlay_store_attrs(daily, live_book)
                 daily = _prepare_shop_day(daily, label)
-                day_periods = sorted(daily["period"].dropna().astype(str).unique().tolist())
-                if replace_sales:
-                    try:
-                        conn.execute("DELETE FROM shop_day")
-                    except Exception:
-                        pass
-                elif day_periods:
-                    placeholders = ", ".join("?" * len(day_periods))
-                    try:
-                        conn.execute(
-                            f"DELETE FROM shop_day WHERE period IN ({placeholders})",
-                            tuple(day_periods),
-                        )
-                    except Exception:
-                        pass
-                upsert_dataframe(conn, "shop_day", daily[SHOP_DAY_COLS], ["store_id", "sale_date"])
+                coverage_dates = _daily_coverage_dates(sales_report, daily)
+                coverage_stores = _daily_coverage_stores(sales_report, daily)
+                if coverage_stores and coverage_dates:
+                    _delete_shop_days(conn, coverage_stores, coverage_dates)
+                if not daily.empty:
+                    upsert_dataframe(conn, "shop_day", daily[SHOP_DAY_COLS], ["store_id", "sale_date"])
+                touched_periods = _rebuild_facts_from_shop_day(
+                    conn,
+                    coverage_stores,
+                    _periods_from_daily(coverage_dates, daily),
+                    label,
+                    live_book,
+                )
+                overridden_dates = coverage_dates
+            else:
+                facts = collapse_sales_facts(sales.copy())
+                facts["source_file"] = label
+                facts["ingested_at"] = utcnow()
+                touched_periods = sorted(facts["period"].dropna().unique().tolist())
+                if not replace_sales and touched_periods:
+                    placeholders = ", ".join("?" * len(touched_periods))
+                    conn.execute(
+                        f"DELETE FROM sales_facts WHERE period IN ({placeholders})",
+                        tuple(touched_periods),
+                    )
+                upsert_dataframe(
+                    conn,
+                    "sales_facts",
+                    facts[[c for c in SALES_FACT_COLS if c in facts.columns]],
+                    ["store_id", "sku", "period"],
+                )
+            open_period = open_mtd_period(touched_periods, execution)
+            _refresh_period_ledger(conn, touched_periods, label, execution, open_period)
 
         if not visits.empty:
             if visits["period"].isna().all() or (visits["period"].astype(str) == "None").all():
@@ -490,6 +430,8 @@ def run_pipeline(
             "open_mtd_period": open_period,
             "replace_sales": replace_sales,
             "n_sales_files": len(file_paths),
+            "ingest_mode": ingest_mode,
+            "overridden_dates": overridden_dates,
         }
         warnings = []
         for rep in (sales_report, shop_report, universe_report, visit_report):
@@ -525,6 +467,8 @@ def run_pipeline(
         "open_mtd_period": open_period,
         "replace_sales": replace_sales,
         "n_sales_files": len(file_paths),
+        "ingest_mode": ingest_mode,
+        "overridden_dates": overridden_dates,
         "n_plays": int(len(plays)) if plays is not None else 0,
         "n_cities": int(pack.national.get("n_cities") or 0) if pack is not None else 0,
         "n_targets": int(len(pack.targets)) if pack is not None and pack.targets is not None else 0,
@@ -589,6 +533,211 @@ def _prepare_shop_day(daily: pd.DataFrame, source_file: str) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = None
     return out[SHOP_DAY_COLS]
+
+
+SQL_IN_CHUNK = 400
+
+
+def _chunked(items: list, size: int = SQL_IN_CHUNK):
+    seq = list(items)
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def _as_day_key(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    return text[:10]
+
+
+def _daily_coverage_dates(report, daily: pd.DataFrame) -> list[str]:
+    dates = [ _as_day_key(d) for d in (getattr(report, "daily_dates", None) or []) ]
+    if daily is not None and not daily.empty and "sale_date" in daily.columns:
+        dates.extend(_as_day_key(v) for v in daily["sale_date"].tolist())
+    return sorted({d for d in dates if d})
+
+
+def _daily_coverage_stores(report, daily: pd.DataFrame) -> list[str]:
+    stores = [str(s).strip() for s in (getattr(report, "daily_store_ids", None) or [])]
+    if daily is not None and not daily.empty and "store_id" in daily.columns:
+        stores.extend(daily["store_id"].astype(str).str.strip().tolist())
+    return sorted({s for s in stores if s})
+
+
+def _periods_from_daily(dates: list[str], daily: pd.DataFrame) -> list[str]:
+    periods: set[str] = set()
+    if daily is not None and not daily.empty and "period" in daily.columns:
+        periods.update(daily["period"].dropna().astype(str).str.strip().tolist())
+    for day in dates:
+        key = _as_day_key(day)
+        if len(key) >= 7:
+            periods.add(key[:7])
+    return sorted(p for p in periods if p)
+
+
+def _delete_shop_days(conn, store_ids: list[str], dates: list[str]) -> None:
+    if not store_ids or not dates:
+        return
+    date_list = [_as_day_key(d) for d in dates if _as_day_key(d)]
+    if not date_list:
+        return
+    dph = ", ".join("?" * len(date_list))
+    try:
+        for part in _chunked(store_ids):
+            sph = ", ".join("?" * len(part))
+            conn.execute(
+                f"DELETE FROM shop_day WHERE store_id IN ({sph}) AND sale_date IN ({dph})",
+                tuple(part) + tuple(date_list),
+            )
+    except Exception:
+        pass
+
+
+def _delete_sales_facts(conn, store_ids: list[str], periods: list[str]) -> None:
+    if not store_ids or not periods:
+        return
+    pph = ", ".join("?" * len(periods))
+    for part in _chunked(store_ids):
+        sph = ", ".join("?" * len(part))
+        conn.execute(
+            f"DELETE FROM sales_facts WHERE store_id IN ({sph}) AND period IN ({pph})",
+            tuple(part) + tuple(periods),
+        )
+
+
+def _read_shop_day_slice(conn, store_ids: list[str], periods: list[str]) -> pd.DataFrame:
+    if not store_ids or not periods:
+        return pd.DataFrame()
+    frames: list[pd.DataFrame] = []
+    pph = ", ".join("?" * len(periods))
+    for part in _chunked(store_ids):
+        sph = ", ".join("?" * len(part))
+        try:
+            chunk = read_sql(
+                conn,
+                f"SELECT * FROM shop_day WHERE store_id IN ({sph}) AND period IN ({pph})",
+                tuple(part) + tuple(periods),
+            )
+        except Exception:
+            chunk = pd.DataFrame()
+        if chunk is not None and not chunk.empty:
+            frames.append(chunk)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _month_facts_from_days(days: pd.DataFrame, label: str) -> pd.DataFrame:
+    work = days.copy()
+    work["store_id"] = work["store_id"].astype(str).str.strip()
+    work["period"] = work["period"].astype(str).str.strip()
+    work["volume_mt"] = pd.to_numeric(work["volume_mt"], errors="coerce").fillna(0)
+    grouped = work.groupby(["store_id", "period"], as_index=False).agg(
+        store_name=("store_name", "last") if "store_name" in work.columns else ("store_id", "last"),
+        year=("year", "last") if "year" in work.columns else ("period", "last"),
+        month=("month", "last") if "month" in work.columns else ("period", "last"),
+        volume_mt=("volume_mt", "sum"),
+        distributor=("distributor", "last") if "distributor" in work.columns else ("store_id", "last"),
+        dsr_name=("dsr_name", "last") if "dsr_name" in work.columns else ("store_id", "last"),
+        section=("section", "last") if "section" in work.columns else ("store_id", "last"),
+    )
+    if "year" not in grouped.columns or grouped["year"].isna().any():
+        grouped["year"] = grouped["period"].astype(str).str.slice(0, 4).astype(int)
+    if "month" not in grouped.columns or grouped["month"].isna().any():
+        grouped["month"] = grouped["period"].astype(str).str.slice(5, 7).astype(int)
+    grouped["year"] = pd.to_numeric(grouped["year"], errors="coerce").fillna(0).astype(int)
+    grouped["month"] = pd.to_numeric(grouped["month"], errors="coerce").fillna(0).astype(int)
+    grouped["sku"] = "ALL"
+    grouped["source_file"] = label
+    grouped["ingested_at"] = utcnow()
+    return grouped
+
+
+def _rebuild_facts_from_shop_day(
+    conn,
+    store_ids: list[str],
+    periods: list[str],
+    label: str,
+    live_book: pd.DataFrame,
+) -> list[str]:
+    periods = sorted({str(p) for p in periods if p})
+    if not periods:
+        return []
+    if store_ids:
+        _delete_sales_facts(conn, store_ids, periods)
+    days = _read_shop_day_slice(conn, store_ids, periods) if store_ids else pd.DataFrame()
+    if days is None or days.empty:
+        return periods
+    facts = _month_facts_from_days(days, label)
+    facts = overlay_store_attrs(facts, live_book)
+    facts = collapse_sales_facts(facts)
+    if facts is not None and not facts.empty:
+        facts["source_file"] = label
+        facts["ingested_at"] = utcnow()
+        cols = [c for c in SALES_FACT_COLS if c in facts.columns]
+        upsert_dataframe(conn, "sales_facts", facts[cols], ["store_id", "sku", "period"])
+    return periods
+
+
+def _refresh_period_ledger(conn, periods: list[str], label: str, execution, open_period: Optional[str]) -> None:
+    for per in periods:
+        part = read_sql(conn, "SELECT volume_mt FROM sales_facts WHERE period = ?", (per,))
+        vol = (
+            float(pd.to_numeric(part["volume_mt"], errors="coerce").fillna(0).sum())
+            if part is not None and not part.empty
+            else 0.0
+        )
+        n_rows = int(len(part)) if part is not None and not part.empty else 0
+        status = "mtd_open" if per == open_period else "closed"
+        as_of = days = None
+        if status == "mtd_open":
+            _factor, as_of, days = run_rate_factor(execution, per)
+        else:
+            year, month = int(str(per)[:4]), int(str(per)[5:7])
+            days = monthrange(year, month)[1]
+            as_of = days
+        conn.execute(
+            """INSERT INTO period_ledger
+               (period, status, source_file, execution_date, ingested_at, n_fact_rows, volume_mt, as_of_day, days_in_month)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(period) DO UPDATE SET
+                 status=excluded.status,
+                 source_file=excluded.source_file,
+                 execution_date=excluded.execution_date,
+                 ingested_at=excluded.ingested_at,
+                 n_fact_rows=excluded.n_fact_rows,
+                 volume_mt=excluded.volume_mt,
+                 as_of_day=excluded.as_of_day,
+                 days_in_month=excluded.days_in_month
+            """,
+            (
+                per,
+                status,
+                label,
+                execution.strftime("%Y-%m-%d") if execution else None,
+                utcnow(),
+                n_rows,
+                vol,
+                as_of,
+                days,
+            ),
+        )
+        if as_of and days:
+            conn.execute(
+                """INSERT INTO mtd_observations
+                   (period, as_of_day, days_in_month, volume_mt, source_file, ingested_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(period, as_of_day) DO UPDATE SET
+                     volume_mt=excluded.volume_mt,
+                     days_in_month=excluded.days_in_month,
+                     source_file=excluded.source_file,
+                     ingested_at=excluded.ingested_at
+                """,
+                (per, int(as_of), int(days), vol, label, utcnow()),
+            )
 
 
 SHOP_MONTH_COLS = [
