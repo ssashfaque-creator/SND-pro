@@ -459,6 +459,10 @@ def load_action_pack(conn, period: str | None = None) -> ActionPack:
         all_dsrs=dsr_p,
         backtest=_present_backtest(back),
         brief=dict(row),
+        raw_shops=_sql_shops_to_raw(shops),
+        raw_distributors=dists if dists is not None else pd.DataFrame(),
+        raw_dsrs=dsrs if dsrs is not None else pd.DataFrame(),
+        raw_backtest=back if back is not None else pd.DataFrame(),
     )
 
 
@@ -1241,6 +1245,16 @@ def _take_present(shops: pd.DataFrame, action: str, n: int) -> pd.DataFrame:
     if col not in shops.columns:
         return shops.head(0)
     return shops[shops[col] == action].head(n)
+
+
+def _sql_shops_to_raw(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Reload persisted action_shops so Monday / beat packs can use them."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "coming_due" in out.columns:
+        out["coming_due"] = pd.to_numeric(out["coming_due"], errors="coerce").fillna(0).astype(bool)
+    return out
 
 
 def _raw_shops_to_sql(df: pd.DataFrame, period: str) -> pd.DataFrame:

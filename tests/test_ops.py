@@ -223,3 +223,41 @@ def test_persist_action_pack_scores_previous_list(tmp_path):
         outcomes = load_outcomes(conn, "2026-08")
     assert not outcomes.empty
     assert outcomes.iloc[0]["outcome"] == "billed"
+
+
+def test_loaded_pack_still_builds_beat_lists(tmp_path):
+    from sndintel.action import ActionPack, persist_action_pack, load_action_pack
+    from sndintel.config import DSR_DAY_CAP
+
+    db = tmp_path / "w.db"
+    init_db(db)
+    rows = []
+    for i in range(20):
+        rows.append(
+            {
+                "store_id": f"S{i}",
+                "store_name": f"Shop {i}",
+                "dsr_name": "Amir",
+                "city": "Karachi",
+                "distributor": "Eva",
+                "action": ACTION_CALL,
+                "instruction": "Call",
+                "billed_mt": 0.0,
+                "visits": 0,
+                "week_target_mt": 1.0 - i * 0.02,
+                "value_score": 20 - i,
+                "coming_due": False,
+                "ams_3m": 0.4,
+                "expected_mt": 0.5,
+            }
+        )
+    pack = ActionPack(period="2026-08", label="August 2026", headline="Karachi is the hole", raw_shops=pd.DataFrame(rows))
+    with connect(db) as conn:
+        persist_action_pack(conn, pack)
+        loaded = load_action_pack(conn, "2026-08")
+    assert loaded.headline == "Karachi is the hole"
+    assert loaded.raw_shops is not None and not loaded.raw_shops.empty
+    beat = build_dsr_beat_pack(loaded)
+    listed = beat.sheets[0][3]
+    assert len(listed) == DSR_DAY_CAP
+    assert "Shop 0" in set(listed["Shop"].astype(str))
