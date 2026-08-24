@@ -96,40 +96,51 @@ The warehouse is **not** stored in the app folder. It lives at:
 
 `~/Library/Application Support/SND Intelligence/warehouse.db`
 
-Updating the app replaces code only. You do not re-upload July (or any closed month).
+Git is not required. Private GitHub often blocks `curl`, so download the ZIP **in the browser while logged in**, then paste the Terminal block below.
 
-**Install once** — paste into Terminal:
+**Install once**
+
+1. Open (logged into GitHub):  
+   https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/actionable-ops-layer-2f34.zip
+2. Save the ZIP to Downloads.
+3. Paste into Terminal:
 
 ```bash
-mkdir -p ~/sndintel /tmp/sndintel-dl
-curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/fmcg-sales-intelligence-9302.zip" -o /tmp/sndintel-dl/app.zip
-unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
-SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
-rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
-cd ~/sndintel
+ZIP="$(ls -t "$HOME/Downloads"/SND-pro*.zip | head -1)"
+mkdir -p "$HOME/sndintel" /tmp/sndintel-dl/unpacked
+rm -rf /tmp/sndintel-dl/unpacked
+unzip -o "$ZIP" -d /tmp/sndintel-dl/unpacked
+SRC="$(find /tmp/sndintel-dl/unpacked -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
+rsync -a --delete --exclude '.venv' "$SRC/" "$HOME/sndintel/"
+cd "$HOME/sndintel"
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -e .
+python -m pip install -e .
 snd-intel app
 ```
-
-If `curl` cannot see GitHub (private repo), download the ZIP from the GitHub page in your browser, unzip it, then `rsync` that folder to `~/sndintel` and run the `python3 -m venv` lines.
 
 In the app: **Upload files** → shop list once, then the sales extract. Later months: sales file only.
 
-**Update the app later** (warehouse stays):
+**Update later** (warehouse stays — do not re-upload July):
+
+1. Download a fresh ZIP from the same GitHub link (browser, logged in).
+2. Paste:
 
 ```bash
-curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/fmcg-sales-intelligence-9302.zip" -o /tmp/sndintel-dl/app.zip
-unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
-SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
-rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
-cd ~/sndintel
+ZIP="$(ls -t "$HOME/Downloads"/SND-pro*.zip | head -1)"
+mkdir -p /tmp/sndintel-dl/unpacked
+rm -rf /tmp/sndintel-dl/unpacked
+unzip -o "$ZIP" -d /tmp/sndintel-dl/unpacked
+SRC="$(find /tmp/sndintel-dl/unpacked -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
+rsync -a --delete --exclude '.venv' --exclude 'data' "$SRC/" "$HOME/sndintel/"
+cd "$HOME/sndintel"
 source .venv/bin/activate
-pip install -e .
+python -m pip install -e .
 snd-intel app
 ```
+
+After this version is installed you can also run `snd-intel apply-zip` (picks the newest `SND-pro*.zip` in Downloads). Check **Warehouse** — it should show version **0.5.0**.
 
 Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates) and leave **Replace all billed sales** ticked so Shop SKU Wise rows go away. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
 

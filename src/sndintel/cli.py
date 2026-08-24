@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sndintel import __version__
-from sndintel.config import SAMPLE_DIR, DATA_DIR, DB_PATH
+from sndintel.config import SAMPLE_DIR, DATA_DIR, DB_PATH, APP_DIR
 from sndintel.ingest.pipeline import load_brief, load_kpis, load_ledger, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
 from sndintel.sampledata import generate_demo_files
@@ -28,6 +28,40 @@ def _version(version: bool = typer.Option(False, "--version", help="Show version
     if version:
         console.print(__version__)
         raise typer.Exit()
+
+
+@app.command("apply-zip")
+def apply_zip_cmd(
+    zip_path: Optional[Path] = typer.Argument(
+        None,
+        help="ZIP from the browser (GitHub → Code → Download ZIP). Default: newest SND-pro*.zip in Downloads.",
+    ),
+    app_dir: Optional[Path] = typer.Option(None, "--app-dir", help="App folder. Default ~/sndintel"),
+):
+    """Replace app code from a ZIP. Does not use git. Does not touch the warehouse."""
+    import subprocess
+
+    from sndintel.update import apply_code_zip, find_download_zip
+
+    dest = Path(app_dir or APP_DIR).expanduser()
+    archive = Path(zip_path).expanduser() if zip_path else find_download_zip()
+    if archive is None:
+        console.print(
+            "No ZIP given and none named SND-pro*.zip in Downloads.\n"
+            "In GitHub (logged in): Code → Download ZIP, then:\n"
+            "  snd-intel apply-zip ~/Downloads/SND-pro-cursor-actionable-ops-layer-2f34.zip"
+        )
+        raise typer.Exit(1)
+    result = apply_code_zip(archive, dest)
+    py = dest / ".venv" / "bin" / "python"
+    if py.exists():
+        subprocess.check_call([str(py), "-m", "pip", "install", "-e", str(dest)])
+    else:
+        console.print("No .venv in the app folder yet. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -e .")
+    console.print(f"Updated code from {result['src_zip']}")
+    console.print(f"App folder  {result['app_dir']}")
+    console.print(f"Warehouse   {DB_PATH}  (unchanged)")
+    console.print("Start:  cd ~/sndintel && source .venv/bin/activate && snd-intel app")
 
 
 @app.command()

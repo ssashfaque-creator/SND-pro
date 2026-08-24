@@ -29,6 +29,7 @@ from sndintel.briefing import (
     pdf_bytes,
     pdf_bytes_detailed,
 )
+from sndintel import __version__
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
@@ -240,7 +241,7 @@ def main():
     elif page == "Focus":
         _page_focus(data, period)
     elif page == "People":
-        _page_people(data, period)
+        _page_people(data, period, mtd)
     elif page == "Mix":
         _page_mix(data, period)
     elif page == "Shops":
@@ -871,6 +872,14 @@ def _page_this_week(data, period, mtd, ledger):
         for warning in monday.warnings:
             st.warning(warning)
     st.caption(friday.headline)
+    if friday.sheets:
+        st.markdown("##### Friday close")
+        st.caption("This is whether last week’s list moved volume — not a new ranking. Score the warehouse twice in the same month to fill it.")
+        for _sheet, heading, note, df in friday.sheets:
+            st.markdown(f"**{heading}**")
+            if note:
+                st.caption(note)
+            _strategy_table(df, height=220)
 
     st.markdown("##### 1. Country this week")
     _strategy_table(pack.country, height=140)
@@ -1126,40 +1135,90 @@ def _page_focus(data, period):
         st.plotly_chart(fig, use_container_width=True)
 
 
-def _page_people(data, period):
+def _page_people(data, period, mtd):
     st.title("People scorecards")
+    st.caption(
+        "A DSR is city + distributor + name. Two people with the same first name never share a row. "
+        "Label is capacity vs skill: Overloaded / Not working the beat / Not converting / Not lifting drop / Fine."
+    )
     units = data.get("units", pd.DataFrame())
     kpis = data["kpis"]
-    for grain, label, key in [("dsr", "Salespeople", "dsr"), ("distributor", "Distributors", "distributor")]:
-        st.markdown(f"#### {label}")
-        if units is not None and not units.empty and grain in set(units["grain"].dropna()):
-            df = units[(units["grain"] == grain) & (units["period"] == period)].sort_values("gap_mt")
-            cols = [
-                c
-                for c in ["grain_id", "city", "volume_mt", "expected_mt", "ly_mt", "gap_mt", "diagnosis", "verdict", "do_this_week"]
-                if c in df.columns
+    as_of = int(mtd.get("as_of_day") or mtd.get("days_in_month") or 21)
+    days_m = int(mtd.get("days_in_month") or 31)
+    st.markdown("#### Salespeople")
+    if units is not None and not units.empty and "dsr" in set(units["grain"].dropna()):
+        from sndintel.capacity import present_capacity_table, score_dsr_capacity_from_units
+        from sndintel.identity import dsr_display_name
+
+        dsrs = units[(units["grain"] == "dsr") & (units["period"] == period)].copy()
+        if "dsr_name" not in dsrs.columns or dsrs["dsr_name"].isna().all():
+            dsrs["dsr_name"] = dsrs["grain_id"].map(dsr_display_name)
+        cap = score_dsr_capacity_from_units(dsrs, as_of, days_m)
+        if not cap.empty:
+            st.markdown("##### Capacity labels")
+            _strategy_table(present_capacity_table(cap, n=40), height=360)
+        show = dsrs.sort_values("gap_mt")
+        cols = [
+            c
+            for c in [
+                "dsr_name",
+                "city",
+                "distributor",
+                "volume_mt",
+                "expected_mt",
+                "ly_mt",
+                "gap_mt",
+                "visit_rate",
+                "strike_rate",
+                "diagnosis",
+                "verdict",
+                "do_this_week",
             ]
-            st.dataframe(df[cols].rename(columns={"grain_id": key}), use_container_width=True, hide_index=True)
-        else:
-            df = kpis[(kpis["grain"] == grain) & (kpis["period"] == period)].sort_values("volume_mt", ascending=False)
-            cols = [
-                c
-                for c in [
-                    "grain_id",
-                    "volume_mt",
-                    "mom_pct",
-                    "comparable_mom_pct",
-                    "yoy_pct",
-                    "run_rate_yoy_pct",
-                    "strike_rate",
-                    "drop_size",
-                    "sku_depth",
-                    "billed_outlets",
-                    "universe_outlets",
-                ]
-                if c in df.columns
-            ]
-            st.dataframe(df[cols].rename(columns={"grain_id": label[:-1]}), use_container_width=True, hide_index=True)
+            if c in show.columns
+        ]
+        rename = {
+            "dsr_name": "DSR",
+            "city": "City",
+            "distributor": "Distributor",
+            "volume_mt": "Billed (MT)",
+            "expected_mt": "Expected (MT)",
+            "ly_mt": "Last year (MT)",
+            "gap_mt": "Gap (MT)",
+            "visit_rate": "Visit %",
+            "strike_rate": "Strike %",
+            "diagnosis": "Diagnosis",
+            "verdict": "Verdict",
+            "do_this_week": "Do this week",
+        }
+        table = show[cols].rename(columns=rename)
+        if "Visit %" in table.columns:
+            table["Visit %"] = (pd.to_numeric(table["Visit %"], errors="coerce") * 100).round(0)
+        if "Strike %" in table.columns:
+            table["Strike %"] = (pd.to_numeric(table["Strike %"], errors="coerce") * 100).round(0)
+        st.markdown("##### Scorecards")
+        _strategy_table(table, height=420)
+    else:
+        df = kpis[(kpis["grain"] == "dsr") & (kpis["period"] == period)].sort_values("volume_mt", ascending=False)
+        cols = [c for c in ["grain_id", "volume_mt", "strike_rate", "drop_size", "billed_outlets", "universe_outlets"] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    st.markdown("#### Distributors")
+    if units is not None and not units.empty and "distributor" in set(units["grain"].dropna()):
+        df = units[(units["grain"] == "distributor") & (units["period"] == period)].sort_values("gap_mt")
+        cols = [
+            c
+            for c in ["grain_id", "city", "volume_mt", "expected_mt", "ly_mt", "gap_mt", "diagnosis", "verdict", "do_this_week"]
+            if c in df.columns
+        ]
+        st.dataframe(
+            df[cols].rename(columns={"grain_id": "Distributor", "city": "City"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        df = kpis[(kpis["grain"] == "distributor") & (kpis["period"] == period)].sort_values("volume_mt", ascending=False)
+        cols = [c for c in ["grain_id", "volume_mt", "strike_rate", "drop_size"] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
 
 def _page_mix(data, period):
@@ -1211,10 +1270,30 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
+        f"- App version **{__version__}**. If this is still 0.4.0, the ZIP did not land.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
     )
+    with st.expander("Update the app on this Mac (no git)"):
+        st.markdown(
+            "1. In the browser, while logged into GitHub, download "
+            "[this ZIP](https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/actionable-ops-layer-2f34.zip).\n"
+            "2. Paste this in Terminal:"
+        )
+        st.code(
+            'ZIP="$(ls -t "$HOME/Downloads"/SND-pro*.zip | head -1)"\n'
+            "mkdir -p /tmp/sndintel-dl/unpacked\n"
+            "rm -rf /tmp/sndintel-dl/unpacked\n"
+            'unzip -o "$ZIP" -d /tmp/sndintel-dl/unpacked\n'
+            "SRC=\"$(find /tmp/sndintel-dl/unpacked -maxdepth 2 -type d -name 'SND-pro-*' | head -1)\"\n"
+            'rsync -a --delete --exclude ".venv" --exclude "data" "$SRC/" "$HOME/sndintel/"\n'
+            "cd \"$HOME/sndintel\"\n"
+            "source .venv/bin/activate\n"
+            "python -m pip install -e .\n"
+            "snd-intel app",
+            language="bash",
+        )
     ledger = data.get("ledger", pd.DataFrame())
     if not ledger.empty:
         st.subheader("Months on file")
