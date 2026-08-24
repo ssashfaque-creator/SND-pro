@@ -210,12 +210,15 @@ def city_driver_table(units: pd.DataFrame, shops: pd.DataFrame | None = None) ->
         parts = [("unbilled", float(u)), ("unvisited", float(v)), ("drop size", float(d))]
         parts.sort(key=lambda x: abs(x[1]), reverse=True)
         driver.append(parts[0][0] if parts[0][1] else "on expected")
-    ams = pd.to_numeric(cities.get("ams_3m"), errors="coerce")
+    if "ams_3m" in cities.columns:
+        ams = pd.to_numeric(cities["ams_3m"], errors="coerce")
+    else:
+        ams = pd.Series(float("nan"), index=cities.index, dtype="float64")
     if shops is not None and not shops.empty and "city" in shops.columns:
         shop_ams = pd.to_numeric(shops.get("ams_3m"), errors="coerce").fillna(0)
         rolled = shops.assign(_city=shops["city"].astype(str), _ams=shop_ams).groupby("_city")["_ams"].sum()
         from_shops = cities["grain_id"].astype(str).map(rolled)
-        empty = ams.isna() | (pd.to_numeric(ams, errors="coerce").fillna(0) <= 0)
+        empty = ams.isna() | (ams.fillna(0) <= 0)
         ams = ams.where(~empty, from_shops)
     out = pd.DataFrame(
         {

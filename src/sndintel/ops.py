@@ -596,6 +596,7 @@ def _monday_pdf(pack: OpsPack) -> bytes:
         topMargin=12 * mm,
         bottomMargin=14 * mm,
         title=f"SND Intelligence · Monday NSM pack · {pack.label}",
+        pageCompression=0,
     )
     styles = getSampleStyleSheet()
     title = ParagraphStyle("t", parent=styles["Heading1"], fontSize=14, textColor=colors.HexColor("#0F172A"), spaceAfter=6)
@@ -672,7 +673,7 @@ def _monday_pdf(pack: OpsPack) -> bytes:
         y = 6 * mm
         canvas.drawCentredString(x, y, text)
         width = canvas.stringWidth(text, "Helvetica", 8)
-        canvas.linkRect("top", "top", (x - width / 2 - 4, y - 3, x + width / 2 + 4, y + 11), relative=0, thickness=0)
+        canvas.linkRect("Top of report", "top", (x - width / 2 - 4, y - 3, x + width / 2 + 4, y + 11), relative=0, thickness=0)
         canvas.setFillColor(colors.HexColor("#64748B"))
         canvas.setFont("Helvetica", 7)
         canvas.drawRightString(pagesize[0] - 10 * mm, y, f"Page {doc_.page}")
