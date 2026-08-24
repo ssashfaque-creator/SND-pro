@@ -128,7 +128,7 @@ rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
 cd ~/sndintel && source .venv/bin/activate && pip install -e . && snd-intel app
 ```
 
-Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.6.3**. The app opens on **This week → Monday dispatch**. The Monday PDF opens with a two-page AI executive summary, then the linked summary plus city/store detail.
+Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.6.4**. The app opens on **This week → Monday dispatch**. The Monday PDF opens with a two-page AI executive summary, then the linked summary plus city/store detail.
 
 Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates). Leave **Replace all billed sales** unticked for a weekly refresh: days in the new file override the same shop-days (a later 20 Aug file replaces an incomplete 20 Aug); other days stay. Tick replace-all only when switching from Shop SKU Wise or wiping billed history. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
 

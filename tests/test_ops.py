@@ -187,7 +187,8 @@ def test_monday_pack_has_capacity_and_whales():
     assert "05 Highlighted distributors" in by_key
     assert "06 Highlighted stores" in by_key
     drivers = by_key["02 City drivers"][3]
-    assert list(drivers.columns[:2]) == ["City", "AMS (MT)"]
+    assert list(drivers.columns[:6]) == ["City", "AMS (MT)", "Billed (MT)", "Expected (MT)", "Gap (MT)", "Universe"]
+    assert int(drivers.iloc[0]["Universe"]) == 800
     assert float(drivers.iloc[0]["AMS (MT)"]) == 18.0
     country = by_key["01 Country"][3]
     assert "Billed (MT)" in country.columns
@@ -231,6 +232,7 @@ def test_city_driver_ams_fills_from_shops_when_units_lack_it():
     )
     out = city_driver_table(units, shops)
     assert float(out.iloc[0]["AMS (MT)"]) == 18.0
+    assert list(out.columns).index("Universe") == list(out.columns).index("Gap (MT)") + 1
 
 
 def test_action_buckets_add_back_to_ask():

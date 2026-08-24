@@ -220,6 +220,15 @@ def city_driver_table(units: pd.DataFrame, shops: pd.DataFrame | None = None) ->
         from_shops = cities["grain_id"].astype(str).map(rolled)
         empty = ams.isna() | (ams.fillna(0) <= 0)
         ams = ams.where(~empty, from_shops)
+    if "universe" in cities.columns:
+        universe = pd.to_numeric(cities["universe"], errors="coerce")
+    else:
+        universe = pd.Series(float("nan"), index=cities.index, dtype="float64")
+    if shops is not None and not shops.empty and "city" in shops.columns and "store_id" in shops.columns:
+        shop_uni = shops.groupby(shops["city"].astype(str))["store_id"].nunique()
+        from_shops_n = cities["grain_id"].astype(str).map(shop_uni)
+        missing_uni = universe.isna() | (universe.fillna(0) <= 0)
+        universe = universe.where(~missing_uni, from_shops_n)
     out = pd.DataFrame(
         {
             "City": cities["grain_id"].astype(str),
@@ -227,6 +236,7 @@ def city_driver_table(units: pd.DataFrame, shops: pd.DataFrame | None = None) ->
             "Billed (MT)": pd.to_numeric(cities.get("volume_mt"), errors="coerce").round(1),
             "Expected (MT)": pd.to_numeric(cities.get("expected_mt"), errors="coerce").round(1),
             "Gap (MT)": rec.round(1),
+            "Universe": pd.to_numeric(universe, errors="coerce").fillna(0).astype(int),
             "Visit %": (pd.to_numeric(cities.get("visit_rate"), errors="coerce") * 100).round(0),
             "Strike %": (pd.to_numeric(cities.get("strike_rate"), errors="coerce") * 100).round(0),
             "Driver": driver,
@@ -331,4 +341,5 @@ def operating_shops(shops: pd.DataFrame) -> pd.DataFrame:
     ask = pd.to_numeric(shops.get("week_target_mt"), errors="coerce").fillna(0)
     work = shops["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT, ACTION_RECOVER}) if "action" in shops.columns else False
     coming = shops["coming_due"].fillna(False) if "coming_due" in shops.columns else False
-    return shops.loc[(ask > 0.0005) | work | coming].copy()
+    ams = pd.to_numeric(shops.get("ams_3m"), errors="coerce").fillna(0) if "ams_3m" in shops.columns else 1.0
+    return shops.loc[(ask > 0.0005) | ((work | coming) & (ams > 1e-9))].copy()

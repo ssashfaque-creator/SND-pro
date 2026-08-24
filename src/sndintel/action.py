@@ -90,7 +90,11 @@ def build_action_pack(
     ledger: pd.DataFrame | None = None,
     period: str | None = None,
 ) -> ActionPack:
-    """Score every AMS>0 door for due / another-visit / lapsing / hold."""
+    """Score every universe door for due / another-visit / lapsing / hold.
+
+    0-AMS shops stay in the universe: they count in visit % and unvisited Due.
+    Ask and Expected stay 0 — we do not invent volume for doors with no run-rate.
+    """
     if shop_month is None or shop_month.empty:
         return empty_action_pack(period or "")
     period = period or str(shop_month["period"].dropna().astype(str).max() or "")
@@ -548,6 +552,17 @@ def _period_billed(shop_month: pd.DataFrame, period: str) -> pd.Series:
     return cur.groupby(cur["store_id"].astype(str))["volume_mt"].sum()
 
 
+def _universe_store_ids(stores: pd.DataFrame | None) -> pd.DataFrame:
+    if stores is None or stores.empty or "store_id" not in stores.columns:
+        return pd.DataFrame(columns=["store_id"])
+    uni = stores.copy()
+    uni["store_id"] = uni["store_id"].astype(str).str.strip()
+    uni = uni.loc[uni["store_id"].ne("")].copy()
+    if "in_universe" in uni.columns and (pd.to_numeric(uni["in_universe"], errors="coerce").fillna(0) == 1).any():
+        uni = uni[pd.to_numeric(uni["in_universe"], errors="coerce").fillna(0) == 1]
+    return uni.drop_duplicates("store_id")
+
+
 def _shop_frame(
     expected: pd.DataFrame,
     billed: pd.Series,
@@ -556,10 +571,33 @@ def _shop_frame(
     period: str,
 ) -> pd.DataFrame:
     if expected is None or expected.empty:
+        out = pd.DataFrame(columns=["store_id", "expected_mt", "ams_3m"])
+    else:
+        out = expected.copy()
+    if "store_id" in out.columns:
+        out["store_id"] = out["store_id"].astype(str)
+    if "expected_mt" not in out.columns:
+        out["expected_mt"] = 0.0
+    if "ams_3m" not in out.columns:
+        out["ams_3m"] = 0.0
+    uni = _universe_store_ids(stores)
+    if not uni.empty:
+        have = set(out["store_id"].astype(str)) if not out.empty else set()
+        missing = uni.loc[~uni["store_id"].astype(str).isin(have), ["store_id"]].copy()
+        if not missing.empty:
+            extra = pd.DataFrame(
+                {
+                    "store_id": missing["store_id"].astype(str),
+                    "expected_mt": 0.0,
+                    "ams_3m": 0.0,
+                }
+            )
+            out = pd.concat([out, extra], ignore_index=True) if not out.empty else extra
+    if out is None or out.empty:
         return pd.DataFrame()
-    out = expected.copy()
     out["billed_mt"] = out["store_id"].map(billed).fillna(0.0)
-    out = out[pd.to_numeric(out["ams_3m"], errors="coerce").fillna(0) > 0]
+    out["expected_mt"] = pd.to_numeric(out["expected_mt"], errors="coerce").fillna(0.0)
+    out["ams_3m"] = pd.to_numeric(out["ams_3m"], errors="coerce").fillna(0.0)
     attrs = _latest_attrs(shop_month, stores, period)
     if not attrs.empty:
         out = out.merge(attrs, on="store_id", how="left")
@@ -706,6 +744,8 @@ def _classify_actions(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
     out.loc[loaded & ~lapse, "action"] = ACTION_HOLD
     if not open_mtd:
         out.loc[out["action"].isin({ACTION_CALL, ACTION_CONVERT}), "action"] = ACTION_RECOVER
+    whitespace = unvisited & unbilled & (ams <= 1e-9)
+    out.loc[whitespace, "action"] = ACTION_CALL
     out["instruction"] = [_instruction(r) for r in out.itertuples(index=False)]
     return out
 
@@ -733,6 +773,11 @@ def _instruction(row: Any) -> str:
     cover_s = f"{int(round(float(cover)))} days of cover left" if pd.notna(cover) else "cover unknown"
     last_bit = f" Last billed {last}." if last else ""
     if action == ACTION_CALL:
+        if ams <= 1e-9:
+            return (
+                f"Call {name}. Universe door with no last-3-month AMS. "
+                f"Unvisited this month — still part of the beat.{last_bit}"
+            )
         return (
             f"Call {name}. Usually buys every {cycle_s}; it has been {since_s} with no bill. "
             f"Close about {_kg_text(drop)}. Not visited this month.{last_bit}"

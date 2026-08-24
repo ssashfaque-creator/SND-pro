@@ -188,7 +188,11 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     raw = pack.raw_shops.set_index("store_id")
 
     assert "DUE1" in raw.index
-    assert "GHOST" not in raw.index
+    assert "GHOST" in raw.index
+    assert raw.loc["GHOST", "action"] == ACTION_CALL
+    assert float(raw.loc["GHOST", "ams_3m"]) == 0
+    assert float(raw.loc["GHOST", "week_target_mt"]) == 0
+    assert raw.loc["GHOST", "call_status"] == "Unvisited"
     assert raw.loc["DUE1", "action"] == ACTION_CALL
     assert raw.loc["VIS1", "action"] == ACTION_CONVERT
     assert raw.loc["LITE1", "action"] == ACTION_LIFT
@@ -232,6 +236,51 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     assert "Down Mart" in set(pack.lapses["Shop"].astype(str))
     assert "Hold Mart" not in set(pack.calls["Shop"].astype(str))
     assert "Due Mart" not in set(pack.lapses["Shop"].astype(str))
+
+
+def test_zero_ams_universe_door_counts_in_unvisited_and_visit_pct():
+    from sndintel.action import action_buckets
+    from sndintel.capacity import score_dsr_capacity
+
+    shop_month, stores, shop_day, ledger, visits = _panel()
+    without = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    before = score_dsr_capacity(without.raw_shops, without.as_of_day, without.days_in_month, without.days_left)
+    amir_before = before[(before["city"] == "Karachi") & (before["dsr_name"].astype(str).str.contains("Amir"))].iloc[0]
+
+    stores = pd.concat(
+        [
+            stores,
+            pd.DataFrame(
+                [
+                    {
+                        "store_id": "ZERO1",
+                        "store_name": "Zero Mart",
+                        "city": "Karachi",
+                        "distributor": "Eva Foods",
+                        "dsr_name": "Amir",
+                        "section": "Clifton",
+                        "in_universe": 1,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
+    raw = pack.raw_shops.set_index("store_id")
+    assert "ZERO1" in raw.index
+    assert raw.loc["ZERO1", "action"] == ACTION_CALL
+    assert raw.loc["ZERO1", "call_status"] == "Unvisited"
+    assert float(raw.loc["ZERO1", "ams_3m"]) == 0
+    assert float(raw.loc["ZERO1", "week_target_mt"]) == 0
+    after_buckets = action_buckets(pack.raw_shops)
+    before_buckets = action_buckets(without.raw_shops)
+    assert after_buckets["n_call"] == before_buckets["n_call"] + 1
+    assert abs(after_buckets["ask_call"] - before_buckets["ask_call"]) < 1e-9
+    cap = score_dsr_capacity(pack.raw_shops, pack.as_of_day, pack.days_in_month, pack.days_left)
+    amir = cap[(cap["city"] == "Karachi") & (cap["dsr_name"].astype(str).str.contains("Amir"))].iloc[0]
+    assert int(amir["universe"]) == int(amir_before["universe"]) + 1
+    assert float(amir["visit_rate"]) < float(amir_before["visit_rate"])
 
 
 def test_unvisited_due_ranks_ahead_of_visited_due():
