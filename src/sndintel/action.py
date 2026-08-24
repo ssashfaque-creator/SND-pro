@@ -855,6 +855,77 @@ def _value_score(shops: pd.DataFrame) -> pd.Series:
     return score.fillna(0.0)
 
 
+def action_buckets(shops: pd.DataFrame) -> dict[str, float]:
+    """Partition rest-of-month Ask by action. The five Ask tons add back to week_target_mt.
+
+    Unvisited + due visited + another visit + lapsing + coming due = Ask.
+    Doors to visit is the work-now subtotal (the first four), not a sixth slice.
+    """
+    empty = {
+        "n_call": 0,
+        "n_convert": 0,
+        "n_lift": 0,
+        "n_lapse": 0,
+        "n_coming": 0,
+        "n_doors": 0,
+        "n_hold": 0,
+        "ask_call": 0.0,
+        "ask_convert": 0.0,
+        "ask_lift": 0.0,
+        "ask_lapse": 0.0,
+        "ask_coming": 0.0,
+        "ask_doors": 0.0,
+        "week_target_mt": 0.0,
+        "expected_mt": 0.0,
+        "ams_3m": 0.0,
+        "billed_mt": 0.0,
+        "remaining_mt": 0.0,
+    }
+    if shops is None or shops.empty:
+        return empty
+    g = shops
+    ask = pd.to_numeric(g["week_target_mt"], errors="coerce").fillna(0) if "week_target_mt" in g.columns else pd.Series(0.0, index=g.index)
+    action = g["action"] if "action" in g.columns else pd.Series("", index=g.index)
+    coming = g["coming_due"].fillna(False) if "coming_due" in g.columns else pd.Series(False, index=g.index)
+    coming = coming.astype(bool)
+
+    def _n_ask(mask) -> tuple[int, float]:
+        m = mask.fillna(False) if hasattr(mask, "fillna") else mask
+        return int(m.sum()), float(ask[m].sum())
+
+    def _sum(name: str) -> float:
+        if name not in g.columns:
+            return 0.0
+        return float(pd.to_numeric(g[name], errors="coerce").fillna(0).sum())
+
+    n_call, ask_call = _n_ask(action.eq(ACTION_CALL))
+    n_convert, ask_convert = _n_ask(action.eq(ACTION_CONVERT))
+    n_lift, ask_lift = _n_ask(action.eq(ACTION_LIFT))
+    n_lapse, ask_lapse = _n_ask(action.eq(ACTION_RECOVER))
+    n_coming, ask_coming = _n_ask(coming)
+    n_hold, _ = _n_ask(action.eq(ACTION_HOLD))
+    return {
+        "n_call": n_call,
+        "n_convert": n_convert,
+        "n_lift": n_lift,
+        "n_lapse": n_lapse,
+        "n_coming": n_coming,
+        "n_doors": n_call + n_convert + n_lift + n_lapse,
+        "n_hold": n_hold,
+        "ask_call": ask_call,
+        "ask_convert": ask_convert,
+        "ask_lift": ask_lift,
+        "ask_lapse": ask_lapse,
+        "ask_coming": ask_coming,
+        "ask_doors": ask_call + ask_convert + ask_lift + ask_lapse,
+        "week_target_mt": float(ask.sum()),
+        "expected_mt": _sum("expected_mt"),
+        "ams_3m": _sum("ams_3m"),
+        "billed_mt": _sum("billed_mt"),
+        "remaining_mt": _sum("remaining_mt"),
+    }
+
+
 def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_dist: bool = False) -> pd.DataFrame:
     if shops is None or shops.empty or key not in shops.columns:
         return pd.DataFrame()
@@ -863,14 +934,15 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
         return pd.DataFrame()
     rows = []
     for name, g in work.groupby(key):
-        n_call = int((g["action"] == ACTION_CALL).sum())
-        n_convert = int((g["action"] == ACTION_CONVERT).sum())
-        n_lift = int((g["action"] == ACTION_LIFT).sum())
-        n_lapse = int((g["action"] == ACTION_RECOVER).sum())
-        n_coming = int(g["coming_due"].fillna(False).sum()) if "coming_due" in g.columns else 0
-        week = float(g["week_target_mt"].sum())
-        remaining = float(g["remaining_mt"].sum())
-        n_doors = n_call + n_convert + n_lift + n_lapse
+        buckets = action_buckets(g)
+        n_call = int(buckets["n_call"])
+        n_convert = int(buckets["n_convert"])
+        n_lift = int(buckets["n_lift"])
+        n_lapse = int(buckets["n_lapse"])
+        n_coming = int(buckets["n_coming"])
+        week = float(buckets["week_target_mt"])
+        remaining = float(buckets["remaining_mt"])
+        n_doors = int(buckets["n_doors"])
         coming_bit = f", {n_coming} more come due before month-end" if n_coming else ""
         instruction = (
             f"Push {name}: {n_doors} doors to work now "
@@ -887,16 +959,22 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
             "n_convert": n_convert,
             "n_lift": n_lift,
             "n_lapse": n_lapse,
-            "n_hold": int((g["action"] == ACTION_HOLD).sum()),
-            "ams_3m": float(pd.to_numeric(g["ams_3m"], errors="coerce").fillna(0).sum()) if "ams_3m" in g.columns else 0.0,
-            "billed_mt": float(g["billed_mt"].sum()),
-            "expected_mt": float(g["expected_mt"].sum()),
-            "should_have_mt": float(g["expected_mt"].sum()),
-            "behind_pace_mt": float(g["remaining_mt"].sum()),
-            "remaining_mt": float(g["remaining_mt"].sum()),
+            "n_hold": int(buckets["n_hold"]),
+            "ask_call": buckets["ask_call"],
+            "ask_convert": buckets["ask_convert"],
+            "ask_lift": buckets["ask_lift"],
+            "ask_lapse": buckets["ask_lapse"],
+            "ask_coming": buckets["ask_coming"],
+            "ask_doors": buckets["ask_doors"],
+            "ams_3m": float(buckets["ams_3m"]),
+            "billed_mt": float(buckets["billed_mt"]),
+            "expected_mt": float(buckets["expected_mt"]),
+            "should_have_mt": float(buckets["expected_mt"]),
+            "behind_pace_mt": remaining,
+            "remaining_mt": remaining,
             "week_target_mt": week,
             "instruction": instruction,
-            "value_score": float(g["value_score"].sum()),
+            "value_score": float(pd.to_numeric(g["value_score"], errors="coerce").fillna(0).sum()) if "value_score" in g.columns else 0.0,
         }
         if extra_city and "city" in g.columns:
             row["city"] = str(g["city"].mode().iloc[0]) if not g["city"].mode().empty else ""

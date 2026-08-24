@@ -33,6 +33,7 @@ from sndintel import __version__
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, period_state
+from sndintel.monday import monday_summary_sheets
 from sndintel.ops import (
     beat_owner_options,
     build_dsr_beat_pack,
@@ -837,12 +838,12 @@ def _page_this_week(data, period, mtd, ledger):
 
     if view == "Monday dispatch":
         st.caption(
-            "Where the tons are, who is overloaded vs not converting, which whales close the month. "
-            "Do not send coverage actions into a 100% visit city."
+            "Summary: country, city drivers, city actions, DSRs, highlighted distributors, highlighted stores. "
+            "The PDF/Excel download has every city and every store with Ask, with links from the summary."
         )
         for warning in monday.warnings:
             st.warning(warning)
-        _render_ops_sheets(monday.sheets, height=280)
+        _render_ops_sheets(monday_summary_sheets(monday.sheets), height=300)
         with st.expander("Download Monday NSM pack"):
             _ops_downloads(monday, period, "monday", "monday")
     elif view == "DSR beat lists":
@@ -1290,7 +1291,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.6.0, curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.6.1, curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"

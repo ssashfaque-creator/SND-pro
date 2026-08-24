@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
+import re
 from typing import Any
 
 import pandas as pd
@@ -25,11 +26,24 @@ from sndintel.action import (
     _round_kg,
 )
 from sndintel.capacity import (
-    LABEL_FINE,
     cap_shops_per_dsr,
     score_dsr_capacity,
     visit_quality_warnings,
     whale_shops,
+)
+from sndintel.monday import (
+    HIGHLIGHT_DIST_N,
+    HIGHLIGHT_STORE_N,
+    SUMMARY_NOTE,
+    city_action_table,
+    city_driver_table,
+    country_action_table,
+    distributor_action_table,
+    distributors_in_city,
+    operating_shops,
+    store_table,
+    who_to_push_table,
+    anchor_id,
 )
 from sndintel.config import DSR_DAY_CAP, EXPECTED_FORMULA
 from sndintel.identity import dsr_display_name
@@ -53,41 +67,97 @@ def build_monday_pack(
     units: pd.DataFrame | None = None,
     visits: pd.DataFrame | None = None,
 ) -> OpsPack:
-    """NSM Monday: where the tons are, who is overloaded vs not converting, which whales."""
+    """NSM Monday: summary (country → cities → DSR → dist → stores) then city/store detail."""
     shops = action.raw_shops if action.raw_shops is not None and not action.raw_shops.empty else pd.DataFrame()
     warnings = visit_quality_warnings(units, visits, action.period)
     cap = score_dsr_capacity(shops, action.as_of_day, action.days_in_month, action.days_left) if not shops.empty else pd.DataFrame()
     whales = whale_shops(shops, n=MONDAY_WHALES) if not shops.empty else pd.DataFrame()
-    cities = _city_driver_table(units) if units is not None else pd.DataFrame()
+    drivers = city_driver_table(units) if units is not None else pd.DataFrame()
     headline = action.headline or f"{action.label}: Monday dispatch"
-    work_dsrs = cap[cap["label"] != LABEL_FINE].head(MONDAY_DSRS) if not cap.empty else cap
+    work = operating_shops(shops)
+    city_actions = city_action_table(shops)
+    highlighted_dist = distributor_action_table(shops, n=HIGHLIGHT_DIST_N)
+    highlighted_stores = store_table(whales if whales is not None and not whales.empty else work.head(HIGHLIGHT_STORE_N))
     sheets = [
-        ("01 Country", "Country this week", "Ask rest of month is closable drops, not the whole hole.", action.country),
         (
-            "02 Cities",
-            "City drivers",
+            "01 Country",
+            "1. Country",
+            SUMMARY_NOTE,
+            country_action_table(shops) if not shops.empty else (action.country if action.country is not None else pd.DataFrame()),
+        ),
+        (
+            "02 City drivers",
+            "2. City drivers",
             "Unbilled = conversion. Unvisited = coverage. Drop = order size. Do not send coverage actions into a 100% visit city.",
-            cities,
+            drivers,
         ),
         (
-            "03 DSR labels",
-            "Who to push — capacity vs skill",
-            "Overloaded = not enough DSRs. Not working = effort. Not converting / not lifting = skill or commercial. Fine = leave them.",
-            _present_capacity(work_dsrs if not work_dsrs.empty else cap.head(MONDAY_DSRS)),
+            "03 City actions",
+            "3. City-wise required actions",
+            "Click a city in the PDF to jump to that city's distributor list. " + SUMMARY_NOTE,
+            city_actions,
         ),
         (
-            "04 Whales",
-            "Volume doors (AMS / drop ≥ 1 MT)",
-            "These close the month. Kiryana seriousness lists do not. Owner is the DSR.",
-            _present_whale_ops(whales),
+            "04 Who to push",
+            "4. Who to push — DSR",
+            "Overloaded = headcount. Not working = effort. Not converting / not lifting = skill or commercial. Fine = leave them.",
+            who_to_push_table(cap, shops, n=MONDAY_DSRS),
         ),
         (
-            "05 Distributors",
-            "Distributor ask",
-            "Ranked by rest-of-month ask KG.",
-            action.distributors,
+            "05 Highlighted distributors",
+            "5. Highlighted distributors",
+            "Highest rest-of-month Ask. Click a distributor in the PDF to jump to its shops. " + SUMMARY_NOTE,
+            highlighted_dist,
+        ),
+        (
+            "06 Highlighted stores",
+            "6. Highlighted stores",
+            "Volume doors (AMS or last drop ≥ 1 MT). Shop figures are KG.",
+            highlighted_stores,
         ),
     ]
+    cities = []
+    if city_actions is not None and not city_actions.empty and "City" in city_actions.columns:
+        cities = [str(c) for c in city_actions["City"].tolist()]
+    elif not shops.empty and "city" in shops.columns:
+        cities = sorted(shops["city"].astype(str).unique())
+    for city in cities:
+        dist_tbl = distributors_in_city(shops, city)
+        if dist_tbl is None or dist_tbl.empty:
+            continue
+        sheets.append(
+            (
+                f"C {city}",
+                f"{city} — distributors",
+                f"Every distributor in {city} with rest-of-month Ask. " + SUMMARY_NOTE,
+                dist_tbl,
+            )
+        )
+    dist_order = []
+    if highlighted_dist is not None and not highlighted_dist.empty:
+        dist_order = [str(d) for d in highlighted_dist["Distributor"].tolist()]
+    if not shops.empty and "distributor" in shops.columns:
+        by_ask = (
+            shops.assign(_ask=pd.to_numeric(shops.get("week_target_mt"), errors="coerce").fillna(0))
+            .groupby(shops["distributor"].astype(str))["_ask"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        for name in by_ask.index.astype(str):
+            if name not in dist_order:
+                dist_order.append(name)
+    for dist in dist_order:
+        part = work[work["distributor"].astype(str) == str(dist)] if not work.empty and "distributor" in work.columns else pd.DataFrame()
+        if part is None or part.empty:
+            continue
+        sheets.append(
+            (
+                f"S {dist}",
+                f"{dist} — stores",
+                "Doors with rest-of-month Ask. DSR with the higher Ask is grouped first; shops inside a DSR by Ask. KG with thousands separators.",
+                store_table(part),
+            )
+        )
     return OpsPack(period=action.period, label=action.label, kind="monday", headline=headline, sheets=sheets, warnings=warnings)
 
 
@@ -345,18 +415,66 @@ def excel_bytes(pack: OpsPack) -> bytes:
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
         ws.cell(row, 1).alignment = Alignment(wrap_text=True)
         row += 1
+    used: set[str] = {"00 Cover"}
+    key_to_sheet: dict[str, str] = {}
     for sheet, heading, note, df in pack.sheets:
-        _sheet_table(wb, sheet, heading, note, df)
+        name = _unique_sheet(sheet, used)
+        _sheet_table(wb, name, heading, note, df)
+        key_to_sheet[sheet] = name
+        used.add(name)
+    if pack.kind == "monday":
+        _excel_monday_links(wb, pack, key_to_sheet)
     wb.save(buf)
     return buf.getvalue()
 
 
+def _unique_sheet(title: str, used: set[str]) -> str:
+    base = re.sub(r"[\\/*?:\[\]]", " ", str(title)).strip()[:31] or "Sheet"
+    name = base
+    i = 2
+    while name in used:
+        suffix = f" {i}"
+        name = (base[: 31 - len(suffix)] + suffix).strip()
+        i += 1
+    return name
+
+
+def _excel_monday_links(wb, pack: OpsPack, key_to_sheet: dict[str, str]) -> None:
+    from openpyxl.styles import Font
+
+    city_sheet = {k[2:]: v for k, v in key_to_sheet.items() if k.startswith("C ")}
+    dist_sheet = {k[2:]: v for k, v in key_to_sheet.items() if k.startswith("S ")}
+    link_font = Font(name="Calibri", size=10, color="0563C1", underline="single")
+    for key, sheet_name in key_to_sheet.items():
+        ws = wb[sheet_name]
+        header = [ws.cell(4, c).value for c in range(1, ws.max_column + 1)]
+        if key == "03 City actions" and "City" in header:
+            col = header.index("City") + 1
+            for r in range(5, ws.max_row + 1):
+                city = str(ws.cell(r, col).value or "")
+                target = city_sheet.get(city)
+                if target:
+                    ws.cell(r, col).hyperlink = f"#'{target}'!A1"
+                    ws.cell(r, col).font = link_font
+        if key in {"05 Highlighted distributors"} or key.startswith("C "):
+            if "Distributor" in header:
+                col = header.index("Distributor") + 1
+                for r in range(5, ws.max_row + 1):
+                    dist = str(ws.cell(r, col).value or "")
+                    target = dist_sheet.get(dist)
+                    if target:
+                        ws.cell(r, col).hyperlink = f"#'{target}'!A1"
+                        ws.cell(r, col).font = link_font
+
+
 def pdf_bytes(pack: OpsPack) -> bytes:
+    if pack.kind == "monday":
+        return _monday_pdf(pack)
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
     from sndintel.action_report import _xml
 
@@ -386,12 +504,96 @@ def pdf_bytes(pack: OpsPack) -> bytes:
         story.append(Paragraph(f"{i}. {_xml(heading)}", h2))
         story.append(Paragraph(_xml(note), body))
         story.append(Spacer(1, 4))
-        story.append(_pdf_table(df, body))
+        story.append(_pdf_table(df, body, max_rows=80))
     doc.build(story)
     return buf.getvalue()
 
 
-def _pdf_table(df: pd.DataFrame, style):
+def _monday_pdf(pack: OpsPack) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+
+    from sndintel.action_report import _xml
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        leftMargin=10 * mm,
+        rightMargin=10 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+        title=f"SND Intelligence · Monday NSM pack · {pack.label}",
+    )
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle("t", parent=styles["Heading1"], fontSize=14, textColor=colors.HexColor("#0F172A"), spaceAfter=6)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=12, textColor=colors.HexColor("#0F172A"), spaceBefore=10, spaceAfter=4)
+    h3 = ParagraphStyle("h3", parent=styles["Heading2"], fontSize=10, textColor=colors.HexColor("#1D4ED8"), spaceBefore=8, spaceAfter=3)
+    body = ParagraphStyle("b", parent=styles["Normal"], fontSize=7.5, textColor=colors.HexColor("#334155"), leading=10)
+    link = ParagraphStyle("lnk", parent=body, textColor=colors.HexColor("#1D4ED8"), leading=10)
+    city_anchor = {k[2:]: anchor_id("city", k[2:]) for k, *_ in pack.sheets if str(k).startswith("C ")}
+    dist_anchor = {k[2:]: anchor_id("dist", k[2:]) for k, *_ in pack.sheets if str(k).startswith("S ")}
+    story = [
+        Paragraph("SND Intelligence · Monday NSM pack", body),
+        Paragraph(_xml(pack.headline or pack.label), title),
+        Paragraph(_xml(EXPECTED_FORMULA), body),
+    ]
+    for warning in pack.warnings:
+        story.append(Paragraph(_xml(warning), body))
+    story.append(Paragraph("Contents", h2))
+    story.append(Paragraph('<a href="#sec-summary" color="#1D4ED8"><u>Summary</u></a>', link))
+    story.append(Paragraph('<a href="#sec-cities" color="#1D4ED8"><u>Distributors by city</u></a>', link))
+    story.append(Paragraph('<a href="#sec-stores" color="#1D4ED8"><u>Stores by distributor</u></a>', link))
+    for city, dest in city_anchor.items():
+        story.append(Paragraph(f'<a href="#{dest}" color="#1D4ED8"><u>{_xml(city)}</u></a>', link))
+
+    first_city = True
+    first_store = True
+    for key, heading, note, df in pack.sheets:
+        if str(key)[:2].isdigit():
+            if key.startswith("01"):
+                story.append(Paragraph('<a name="sec-summary"/>Summary', h2))
+            dest = None
+            link_col = None
+            link_map = None
+            if key.startswith("03"):
+                link_col, link_map = "City", city_anchor
+            elif key.startswith("05"):
+                link_col, link_map = "Distributor", dist_anchor
+            story.append(Paragraph(_xml(heading), h2))
+            story.append(Paragraph(_xml(note), body))
+            story.append(Spacer(1, 3))
+            story.append(_pdf_table(df, body, max_rows=None, link_col=link_col, link_map=link_map))
+            continue
+        if str(key).startswith("C "):
+            if first_city:
+                story.append(PageBreak())
+                story.append(Paragraph('<a name="sec-cities"/>Distributors by city', h2))
+                first_city = False
+            city = str(key)[2:]
+            dest = city_anchor.get(city, anchor_id("city", city))
+            story.append(Paragraph(f'<a name="{dest}"/>{_xml(heading)}', h3))
+            story.append(Paragraph(_xml(note), body))
+            story.append(_pdf_table(df, body, max_rows=None, link_col="Distributor", link_map=dist_anchor))
+            continue
+        if str(key).startswith("S "):
+            if first_store:
+                story.append(PageBreak())
+                story.append(Paragraph('<a name="sec-stores"/>Stores by distributor', h2))
+                first_store = False
+            dist = str(key)[2:]
+            dest = dist_anchor.get(dist, anchor_id("dist", dist))
+            story.append(Paragraph(f'<a name="{dest}"/>{_xml(heading)}', h3))
+            story.append(Paragraph(_xml(note), body))
+            story.append(_pdf_table(df, body, max_rows=None))
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _pdf_table(df: pd.DataFrame, style, max_rows: int | None = 40, link_col: str | None = None, link_map: dict[str, str] | None = None):
     from reportlab.lib import colors
     from reportlab.platypus import Paragraph, Table, TableStyle
 
@@ -399,11 +601,21 @@ def _pdf_table(df: pd.DataFrame, style):
 
     if df is None or df.empty:
         return Paragraph("No rows at this layer.", style)
-    show = df.head(40)
+    show = df if max_rows is None else df.head(max_rows)
     header = [Paragraph(f"<b>{_xml(str(c))}</b>", style) for c in show.columns]
     data = [header]
     for _, rec in show.iterrows():
-        data.append([Paragraph(_xml("" if rec[c] is None or pd.isna(rec[c]) else str(rec[c])), style) for c in show.columns])
+        cells = []
+        for c in show.columns:
+            raw = rec[c]
+            text = "" if raw is None or (isinstance(raw, float) and pd.isna(raw)) else str(raw)
+            if link_col and link_map and str(c) == str(link_col):
+                dest = link_map.get(text)
+                if dest:
+                    cells.append(Paragraph(f'<a href="#{dest}" color="#1D4ED8"><u>{_xml(text)}</u></a>', style))
+                    continue
+            cells.append(Paragraph(_xml(text), style))
+        data.append(cells)
     table = Table(data, repeatRows=1)
     table.setStyle(
         TableStyle(
@@ -414,6 +626,7 @@ def _pdf_table(df: pd.DataFrame, style):
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 3),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
             ]
         )
     )
