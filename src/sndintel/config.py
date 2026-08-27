@@ -77,7 +77,7 @@ SPAN_OVERLOAD = float(os.environ.get("SNDINTEL_SPAN_OVERLOAD", "1.2"))
 VISIT_SUSPECT_RATE = float(os.environ.get("SNDINTEL_VISIT_SUSPECT_RATE", "0.95"))
 VISIT_SUSPECT_UNIVERSE = int(os.environ.get("SNDINTEL_VISIT_SUSPECT_UNI", "400"))
 EXPECTED_FORMULA = os.environ.get("SNDINTEL_EXPECTED_FORMULA", "expected_v3 · paced national day curve")
-APP_BRANCH = os.environ.get("SNDINTEL_APP_BRANCH", "cursor/actionable-ops-layer-2f34")
+APP_BRANCH = os.environ.get("SNDINTEL_APP_BRANCH", "cursor/demand-driven-ask-7a79")
 GITHUB_REPO = os.environ.get("SNDINTEL_GITHUB_REPO", "ssashfaque-creator/SND-pro")
 APP_DIR = Path(os.environ.get("SNDINTEL_APP_DIR", str(Path.home() / "sndintel"))).expanduser()
 

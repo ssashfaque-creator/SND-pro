@@ -1,15 +1,15 @@
-"""This-week action engine: who is due to order, who still has cover, who is fading.
+"""This-week action engine: demand-driven Ask from each shop’s depletion cycle.
 
-Daily billed days teach each door’s replenishment cycle (days between drops) and
-typical drop size, shrunk shop → DSR → city so thin history borrows the parent.
-Next-order size is a gradient-boosted model on billed-day sequences (fat last
-drop → smaller next; quiet / thin last drop → catch-up). Last drop ÷ daily
-run-rate is remaining cover. A shop that took two months of stock last time is
-not due. A shop that usually buys every 15 days and is on day 16 with no bill
-is due — especially if nobody visited.
+Ask is decoupled from monthly pacing. A rolling 90-day window teaches API
+(median days between purchases) and expected drop (median invoice). Cold-start
+shops with 0 history contribute 0; 1–2 purchases use whatever invoices exist
+(default API = 14 days after a first bill). Due = depletion ratio ≥ 0.8.
+Lapsed = DSLP > 3 × API — Ask is reset to 0 and the door leaves the beat.
 
-Expected stays the last-three-closed-month run-rate. This engine does not use
-day-of-month seasonality.
+Official Expected (last-3 AMS blended with last-6 median, then the national
+day curve) is unchanged and is not multiplied into Ask. Pipeline identity:
+
+    Pipeline Expected = Billed + Due unvisited + Drop variance + Not yet due
 """
 
 from __future__ import annotations
@@ -21,6 +21,18 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from sndintel.demand import (
+    ACTION_CALL,
+    ACTION_CONVERT,
+    ACTION_HOLD,
+    ACTION_LIFT,
+    ACTION_RECOVER,
+    DUE_RATIO,
+    LAPSE_MULTIPLIER,
+    attach_demand_cycles,
+    attach_pipeline,
+    classify_demand_actions,
+)
 from sndintel.io_utils import prior_periods, shift_period
 from sndintel.mtd import period_state
 from sndintel.nextdrop import attach_next_drop
@@ -39,14 +51,7 @@ BACKTEST_MONTHS = 6
 COVER_HOLD_DAYS = 7
 LOADED_MONTHS = 1.6
 DECLINE_PCT = -0.25
-LAPSE_CYCLES = 2.0
-
-ACTION_CALL = "Due"
-ACTION_CONVERT = "Due · visited"
-ACTION_LIFT = "Another visit"
-ACTION_RECOVER = "Lapsing"
-ACTION_HOLD = "Hold"
-
+LAPSE_CYCLES = LAPSE_MULTIPLIER
 
 @dataclass
 class ActionPack:
@@ -76,6 +81,10 @@ class ActionPack:
     raw_distributors: pd.DataFrame = field(default_factory=pd.DataFrame)
     raw_dsrs: pd.DataFrame = field(default_factory=pd.DataFrame)
     raw_backtest: pd.DataFrame = field(default_factory=pd.DataFrame)
+    pipeline: pd.DataFrame = field(default_factory=pd.DataFrame)
+    sales_head: pd.DataFrame = field(default_factory=pd.DataFrame)
+    beat: pd.DataFrame = field(default_factory=pd.DataFrame)
+    lost_doors: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def empty_action_pack(period: str = "") -> ActionPack:
@@ -92,8 +101,9 @@ def build_action_pack(
 ) -> ActionPack:
     """Score every universe door for due / another-visit / lapsing / hold.
 
-    0-AMS shops stay in the universe: they count in visit % and unvisited Due.
-    Ask and Expected stay 0 — we do not invent volume for doors with no run-rate.
+    Ask is the 90-day expected drop when the depletion ratio is ≥ 0.8 and the
+    shop is not lapsed. Official Expected is still last-3 / last-6 for Gap.
+    0-history universe doors stay Due with Ask 0 so they count in visit %.
     """
     if shop_month is None or shop_month.empty:
         return empty_action_pack(period or "")
@@ -121,7 +131,7 @@ def build_action_pack(
 
     daily = _prepare_daily(shop_day)
     has_daily = not daily.empty
-    source = "cycle" if has_daily else "monthly"
+    source = "demand" if has_daily else "monthly"
     shops = _attach_trend(shops, shop_month, period)
     shops = _attach_last_month(shops, shop_month, period)
     shops = _attach_last_billed(shops, shop_month, period)
@@ -182,116 +192,17 @@ def build_action_pack(
         raw_distributors=dist,
         raw_dsrs=dsr,
         raw_backtest=backtest,
+        pipeline=_present_pipeline(shops),
+        sales_head=_present_sales_head(shops),
+        beat=_present_beat_plan(shops),
+        lost_doors=_present_lost_doors(shops),
     )
     return pack
 
 
 def attach_cycles(shops: pd.DataFrame, shop_day: pd.DataFrame, as_of_ts: pd.Timestamp) -> pd.DataFrame:
-    """Usual days between drops, last drop, cover left, days since last bill."""
-    out = shops.copy()
-    out["cycle_days"] = np.nan
-    out["typical_drop_mt"] = np.nan
-    out["last_drop_mt"] = np.nan
-    out["last_bill_date"] = ""
-    out["days_since_bill"] = np.nan
-    out["cover_left_days"] = np.nan
-    out["n_intervals"] = 0
-    raw: dict[str, dict[str, float]] = {}
-    if shop_day is not None and not shop_day.empty:
-        work = shop_day.copy()
-        work["sale_date"] = pd.to_datetime(work["sale_date"], errors="coerce")
-        work = work[work["sale_date"].notna() & (work["sale_date"] <= as_of_ts)]
-        work = work[pd.to_numeric(work["volume_mt"], errors="coerce").fillna(0) > 0]
-        for sid, g in work.groupby(work["store_id"].astype(str)):
-            g = g.sort_values("sale_date")
-            dates = g["sale_date"].drop_duplicates()
-            gaps = dates.diff().dt.days.dropna()
-            gaps = gaps[(gaps >= 2) & (gaps <= 120)]
-            last_row = g.iloc[-1]
-            raw[str(sid)] = {
-                "cycle": float(gaps.median()) if len(gaps) else np.nan,
-                "n": int(len(gaps)),
-                "drop": float(g["volume_mt"].median()),
-                "last_drop": float(last_row["volume_mt"]),
-                "last_date": last_row["sale_date"],
-            }
-
-    parents = _parent_cycle_priors(out, raw)
-    for i, row in out.iterrows():
-        sid = str(row["store_id"])
-        city = str(row.get("city") or "")
-        dsr = str(row.get("dsr_name") or "")
-        prior_cycle, prior_drop = parents.get((city, dsr), parents.get((city, ""), (30.0, float(row.get("ams_3m") or 1.0) / 2)))
-        got = raw.get(sid)
-        n = float(got["n"]) if got else 0.0
-        cred = n / (n + SHRINK_K) if n else 0.0
-        cycle = cred * got["cycle"] + (1 - cred) * prior_cycle if got and pd.notna(got["cycle"]) else prior_cycle
-        drop = cred * got["drop"] + (1 - cred) * prior_drop if got and pd.notna(got["drop"]) else prior_drop
-        last_drop = got["last_drop"] if got else float(row.get("last_billed_mt") or row.get("last_month_mt") or 0)
-        last_date = got["last_date"] if got else None
-        if last_date is None:
-            last_date = _month_end_or_as_of(str(row.get("last_billed_period") or ""), as_of_ts)
-        days_since = float((as_of_ts - pd.Timestamp(last_date)).days) if last_date is not None else np.nan
-        ams = float(row.get("ams_3m") or 0) or float(row.get("expected_mt") or 0)
-        daily_rate = max(ams / 30.0, drop / max(cycle, 1.0) if drop and cycle else 0.01, 0.01)
-        stock_days = float(last_drop) / daily_rate if last_drop and daily_rate else np.nan
-        cover_left = (stock_days - days_since) if pd.notna(stock_days) and pd.notna(days_since) else np.nan
-        out.at[i, "cycle_days"] = float(cycle)
-        out.at[i, "typical_drop_mt"] = float(drop) if pd.notna(drop) else np.nan
-        out.at[i, "last_drop_mt"] = float(last_drop) if last_drop else np.nan
-        out.at[i, "last_bill_date"] = pd.Timestamp(last_date).strftime("%Y-%m-%d") if last_date is not None else ""
-        out.at[i, "days_since_bill"] = days_since
-        out.at[i, "cover_left_days"] = cover_left
-        out.at[i, "n_intervals"] = int(n)
-        out.at[i, "typical_bill_day"] = float(cycle)
-
-    last_month = pd.to_numeric(out.get("last_month_mt"), errors="coerce")
-    ams = pd.to_numeric(out["ams_3m"], errors="coerce").replace(0, np.nan)
-    loaded_cover = last_month / (ams / 30.0)
-    days_since = pd.to_numeric(out["days_since_bill"], errors="coerce")
-    from_month = loaded_cover - days_since
-    use_month = last_month >= (LOADED_MONTHS * ams.fillna(0))
-    out["cover_left_days"] = np.where(use_month.fillna(False) & from_month.notna(), from_month, out["cover_left_days"])
-    out["days_overdue"] = (days_since - pd.to_numeric(out["cycle_days"], errors="coerce")).clip(lower=0)
-    out["pace_frac"] = np.nan
-    return out
-
-
-def _parent_cycle_priors(shops: pd.DataFrame, raw: dict[str, dict[str, float]]) -> dict[tuple[str, str], tuple[float, float]]:
-    rows = []
-    for i, row in shops.iterrows():
-        sid = str(row["store_id"])
-        got = raw.get(sid)
-        if not got or pd.isna(got.get("cycle")):
-            continue
-        rows.append(
-            {
-                "city": str(row.get("city") or ""),
-                "dsr_name": str(row.get("dsr_name") or ""),
-                "cycle": got["cycle"],
-                "drop": got["drop"],
-            }
-        )
-    if not rows:
-        return {}
-    frame = pd.DataFrame(rows)
-    nat_c = float(frame["cycle"].median())
-    nat_d = float(frame["drop"].median())
-    city = frame.groupby("city")[["cycle", "drop"]].median()
-    dsr = frame.groupby(["city", "dsr_name"])[["cycle", "drop"]].median()
-    out: dict[tuple[str, str], tuple[float, float]] = {("", ""): (nat_c, nat_d)}
-    for c, row in city.iterrows():
-        out[(str(c), "")] = (float(row["cycle"]), float(row["drop"]))
-    for _, row in shops.iterrows():
-        c = str(row.get("city") or "")
-        d = str(row.get("dsr_name") or "")
-        if (c, d) in dsr.index:
-            out[(c, d)] = (float(dsr.loc[(c, d), "cycle"]), float(dsr.loc[(c, d), "drop"]))
-        elif (c, "") in out:
-            out[(c, d)] = out[(c, "")]
-        else:
-            out[(c, d)] = (nat_c, nat_d)
-    return out
+    """Usual days between drops and expected drop from a rolling 90-day window."""
+    return attach_demand_cycles(shops, shop_day, as_of_ts)
 
 
 def backtest_cycles(
@@ -323,21 +234,16 @@ def backtest_cycles(
         shops = _attach_last_billed(shops, shop_month, test)
         shops = attach_cycles(shops, hist, cut_ts)
         shops["remaining_mt"] = (shops["expected_mt"] - shops["billed_mt"]).clip(lower=0)
+        shops = _attach_calls(shops, None, test)
+        shops = classify_demand_actions(shops, open_mtd=True)
         future = daily[
             (daily["period"].astype(str) == test)
             & (pd.to_numeric(daily["day"], errors="coerce") > cut_day)
             & (pd.to_numeric(daily["day"], errors="coerce") <= cut_day + 14)
         ]
         billed_next = set(future["store_id"].astype(str)) if not future.empty else set()
-        due = shops[
-            (pd.to_numeric(shops["days_since_bill"], errors="coerce") >= pd.to_numeric(shops["cycle_days"], errors="coerce") * 0.9)
-            & (pd.to_numeric(shops["cover_left_days"], errors="coerce").fillna(0) <= COVER_HOLD_DAYS)
-            & (pd.to_numeric(shops["expected_mt"], errors="coerce") >= SHOP_FLOOR_MT)
-        ]
-        loaded = shops[
-            (pd.to_numeric(shops["last_month_mt"], errors="coerce") >= LOADED_MONTHS * pd.to_numeric(shops["ams_3m"], errors="coerce"))
-            & (pd.to_numeric(shops["cover_left_days"], errors="coerce") > COVER_HOLD_DAYS)
-        ]
+        due = shops[shops["action"].isin({ACTION_CALL, ACTION_CONVERT})]
+        loaded = shops[shops["action"] == ACTION_HOLD]
         n_due = int(len(due))
         hit = int(due["store_id"].astype(str).isin(billed_next).sum()) if n_due else 0
         base = int(shops["store_id"].astype(str).isin(billed_next).mean() * n_due) if n_due and len(shops) else 0
@@ -467,6 +373,10 @@ def load_action_pack(conn, period: str | None = None) -> ActionPack:
         raw_distributors=dists if dists is not None else pd.DataFrame(),
         raw_dsrs=dsrs if dsrs is not None else pd.DataFrame(),
         raw_backtest=back if back is not None else pd.DataFrame(),
+        pipeline=_present_pipeline(_sql_shops_to_raw(shops)),
+        sales_head=_present_sales_head(_sql_shops_to_raw(shops)),
+        beat=_present_beat_plan(_sql_shops_to_raw(shops)),
+        lost_doors=_present_lost_doors(_sql_shops_to_raw(shops)),
     )
 
 
@@ -702,52 +612,7 @@ def _attach_calls(shops: pd.DataFrame, visits: pd.DataFrame | None, period: str)
 
 
 def _classify_actions(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
-    out = shops.copy()
-    cycle = pd.to_numeric(out["cycle_days"], errors="coerce").replace(0, np.nan).fillna(30)
-    days_since = pd.to_numeric(out["days_since_bill"], errors="coerce")
-    cover = pd.to_numeric(out["cover_left_days"], errors="coerce")
-    billed = pd.to_numeric(out["billed_mt"], errors="coerce").fillna(0)
-    remaining = pd.to_numeric(out["remaining_mt"], errors="coerce").fillna(0)
-    drop = pd.to_numeric(out["typical_drop_mt"], errors="coerce").fillna(0)
-    trend = pd.to_numeric(out.get("trend_pct"), errors="coerce")
-    last_month = pd.to_numeric(out.get("last_month_mt"), errors="coerce").fillna(0)
-    ams = pd.to_numeric(out["ams_3m"], errors="coerce").fillna(0)
-    visited = out["call_status"].eq("Visited · not billed")
-    unvisited = out["call_status"].eq("Unvisited")
-
-    expected = pd.to_numeric(out["expected_mt"], errors="coerce").fillna(0)
-    has_cover = cover.fillna(0) > COVER_HOLD_DAYS
-    loaded = (last_month >= (LOADED_MONTHS * ams)) & has_cover
-    due = days_since.notna() & (days_since >= cycle * 0.9) & ~has_cover
-    material = (remaining >= SHOP_FLOOR_MT) | (drop >= SHOP_FLOOR_MT) | (ams >= SHOP_FLOOR_MT)
-    prior3 = pd.to_numeric(out.get("prior3_mt"), errors="coerce").fillna(0)
-    unbilled = billed <= 0.005
-    lapse = (days_since.fillna(0) >= (cycle * LAPSE_CYCLES)) & unbilled & ~has_cover
-    lapse = lapse | (
-        (trend <= DECLINE_PCT)
-        & (prior3 >= SHOP_FLOOR_MT)
-        & unbilled
-        & (days_since.fillna(99) >= cycle)
-        & ~has_cover
-    )
-    short_month = (~unbilled) & (remaining >= SHOP_FLOOR_MT) & (billed < 0.5 * expected.clip(lower=SHOP_FLOOR_MT))
-    cycle_again = days_since.fillna(0) >= cycle * 0.8
-    just_bought = days_since.fillna(0) < np.maximum(5.0, cycle * 0.5)
-    stub = (~unbilled) & (drop > 0) & (billed < 0.4 * drop) & ~just_bought
-    light = short_month & ~has_cover & (cycle_again | stub)
-
-    out["action"] = ACTION_HOLD
-    out.loc[material & due & unvisited & ~lapse, "action"] = ACTION_CALL
-    out.loc[material & due & visited & ~lapse, "action"] = ACTION_CONVERT
-    out.loc[material & light, "action"] = ACTION_LIFT
-    out.loc[material & lapse, "action"] = ACTION_RECOVER
-    out.loc[loaded & ~lapse, "action"] = ACTION_HOLD
-    if not open_mtd:
-        out.loc[out["action"].isin({ACTION_CALL, ACTION_CONVERT}), "action"] = ACTION_RECOVER
-    whitespace = unvisited & unbilled & (ams <= 1e-9)
-    out.loc[whitespace, "action"] = ACTION_CALL
-    out["instruction"] = [_instruction(r) for r in out.itertuples(index=False)]
-    return out
+    return classify_demand_actions(shops, open_mtd)
 
 
 def _instruction(row: Any) -> str:
@@ -756,62 +621,51 @@ def _instruction(row: Any) -> str:
     cycle = getattr(row, "cycle_days", None)
     since = getattr(row, "days_since_bill", None)
     cover = getattr(row, "cover_left_days", None)
-    pred = getattr(row, "next_drop_mt", None)
-    if pred is not None and pd.notna(pred) and float(pred) > 0:
-        drop = float(pred)
-    else:
-        drop = float(getattr(row, "typical_drop_mt", 0) or 0)
+    drop = float(getattr(row, "expected_drop_mt", 0) or getattr(row, "typical_drop_mt", 0) or 0)
     last_drop = float(getattr(row, "last_drop_mt", 0) or 0)
     billed = float(getattr(row, "billed_mt", 0) or 0)
-    expected = float(getattr(row, "expected_mt", 0) or 0)
-    last_month = float(getattr(row, "last_month_mt", 0) or 0)
     ams = float(getattr(row, "ams_3m", 0) or 0)
     last = str(getattr(row, "last_bill_date", "") or "")
-    trend = getattr(row, "trend_pct", None)
     cycle_s = f"{int(round(float(cycle)))} days" if pd.notna(cycle) else "its usual gap"
     since_s = f"{int(round(float(since)))} days" if pd.notna(since) else "unknown"
-    cover_s = f"{int(round(float(cover)))} days of cover left" if pd.notna(cover) else "cover unknown"
     last_bit = f" Last billed {last}." if last else ""
     if action == ACTION_CALL:
-        if ams <= 1e-9:
+        if ams <= 1e-9 and float(getattr(row, "expected_drop_mt", 0) or 0) <= 1e-9:
             return (
-                f"Call {name}. Universe door with no last-3-month AMS. "
+                f"Call {name}. Universe door with no purchase history. "
                 f"Unvisited this month — still part of the beat.{last_bit}"
             )
+        rec = str(getattr(row, "recommended_action", "") or "Reorder due")
         return (
-            f"Call {name}. Usually buys every {cycle_s}; it has been {since_s} with no bill. "
-            f"Close about {_kg_text(drop)}. Not visited this month.{last_bit}"
+            f"{rec}: {name}. Usually buys every {cycle_s}; it has been {since_s} with no bill. "
+            f"Ask {_kg_text(drop)} (90-day expected drop). Not visited this month.{last_bit}"
         )
     if action == ACTION_CONVERT:
+        rec = str(getattr(row, "recommended_action", "") or "Reorder due")
         return (
-            f"{name} was visited and did not buy. Cycle is {cycle_s} and it has been {since_s}. "
-            f"Close {_kg_text(drop)}."
+            f"{rec}: {name} was visited and did not buy. Cycle is {cycle_s} and it has been {since_s}. "
+            f"Ask {_kg_text(drop)}."
         )
     if action == ACTION_LIFT:
+        rec = str(getattr(row, "recommended_action", "") or "Recover lost volume")
         return (
-            f"{name} billed only {_kg_text(billed)} this month versus {_kg_text(expected)} Expected. "
-            f"Usual drop {_kg_text(drop)} every {cycle_s}; last drop {_kg_text(last_drop)} {since_s} ago. "
-            f"Worth another visit."
+            f"{rec}: {name} billed {_kg_text(billed)} this month versus {_kg_text(drop)} expected drop. "
+            f"Usual drop {_kg_text(drop)} every {cycle_s}; last drop {_kg_text(last_drop)} {since_s} ago."
         )
     if action == ACTION_RECOVER:
-        fading = pd.notna(trend) and float(trend) <= DECLINE_PCT
-        verb = "is fading" if fading else "has been quiet"
-        trend_s = f" Last three months are {float(trend)*100:.0f}% versus the three before." if pd.notna(trend) else ""
-        return (
-            f"{name} {verb} — {since_s} since the last bill (usual cycle {cycle_s}).{trend_s} "
-            f"Get this door back on the beat.{last_bit}"
-        )
+        if pd.notna(cycle):
+            cut = f"(cut-off is {int(LAPSE_MULTIPLIER)}× the {cycle_s} cycle)"
+        else:
+            cut = "(no purchase in the last 90 days)"
+        return f"Lapsed — lost door: {name} has been quiet {since_s} {cut}. Ask is 0.{last_bit}"
     coming = bool(getattr(row, "coming_due", False))
     until = getattr(row, "days_until_due", None)
     if coming and action == ACTION_HOLD:
         until_s = f"{int(round(float(until)))} days" if until is not None and pd.notna(until) else "a few days"
         return (
             f"{name} comes due in {until_s} (cycle {cycle_s}). "
-            f"Close about {_kg_text(drop)} before month-end.{last_bit}"
+            f"Expected drop {_kg_text(drop)} sits in Not yet due — Ask today is 0.{last_bit}"
         )
-    if pd.notna(cover) and float(cover) > COVER_HOLD_DAYS:
-        why = f"Last drop {_kg_text(last_drop)}" if last_drop else f"Last month {_kg_text(last_month)} versus AMS {_kg_text(ams)}"
-        return f"Hold {name}. {why} — {cover_s}. Do not pull the beat here.{last_bit}"
     return f"{name} is inside its {cycle_s} cycle ({since_s} since last bill). Leave it."
 
 
@@ -840,71 +694,35 @@ def _attach_rest_of_month(
     open_mtd: bool = True,
     days_in_month: int = 31,
 ) -> pd.DataFrame:
-    """Ask = typical drops that can still land before month-end, capped at remaining-to-Expected.
-
-    Today's call list is not the rest of the month. A once-a-month door that last
-    billed on 31 July is not 'due' on day 22, but it will buy again before
-    month-end — that drop is most of the country hole. Loaded cover that lasts
-    past month-end stays at 0. Hitting Expected already stays at 0.
-    """
-    out = shops.copy()
-    drop = pd.to_numeric(out.get("next_drop_mt"), errors="coerce")
-    drop = drop.fillna(pd.to_numeric(out.get("typical_drop_mt"), errors="coerce")).fillna(0)
-    remaining = pd.to_numeric(out.get("remaining_mt"), errors="coerce").fillna(0)
-    ams = pd.to_numeric(out.get("ams_3m"), errors="coerce").fillna(0)
-    cycle = pd.to_numeric(out.get("cycle_days"), errors="coerce").replace(0, np.nan).fillna(30).clip(lower=1)
-    days_since = pd.to_numeric(out.get("days_since_bill"), errors="coerce")
-    cover = pd.to_numeric(out.get("cover_left_days"), errors="coerce")
-    last_month = pd.to_numeric(out.get("last_month_mt"), errors="coerce").fillna(0)
-    days = max(int(days_left), 0)
-    work_now = out["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT, ACTION_RECOVER})
-    cycle_elapsed = days_since.notna() & (days_since >= cycle * 0.9)
-    due_now = work_now | cycle_elapsed
-    until_cycle = (cycle - days_since.fillna(cycle)).clip(lower=0)
-    until_cover = cover.fillna(0).clip(lower=0)
-    days_until = np.maximum(until_cycle, until_cover)
-    first_in = pd.Series(np.where(due_now, 0.0, days_until), index=out.index)
-    loaded = (ams > 0) & (last_month >= LOADED_MONTHS * ams)
-    stocked = cover.fillna(0) > float(days)
-    if open_mtd and days > 0:
-        leftover = (float(days) - first_in).clip(lower=0)
-        n_orders = np.where(first_in <= days, 1.0 + np.floor(leftover / cycle), 0.0)
-        n_orders = np.minimum(n_orders, 3.0)
-    else:
-        n_orders = np.where(due_now, 1.0, 0.0)
-    n_orders = pd.Series(np.where(loaded | stocked, 0.0, n_orders), index=out.index)
-    closable = drop * n_orders
-    ask = pd.Series(np.minimum(remaining.to_numpy(), closable.to_numpy()), index=out.index).clip(lower=0)
-    out["week_target_mt"] = ask
-    out["n_orders_left"] = n_orders
-    out["days_until_due"] = first_in
-    out["coming_due"] = (~work_now) & (ask > 0)
-    return out
+    """Ask = expected drop when due; not-yet-due volume is a pipeline pillar, not Ask."""
+    del days_in_month
+    return attach_pipeline(shops, days_left=days_left, open_mtd=open_mtd)
 
 
 def _value_score(shops: pd.DataFrame) -> pd.Series:
     ask = pd.to_numeric(shops["week_target_mt"], errors="coerce").fillna(0)
     overdue = pd.to_numeric(shops.get("days_overdue"), errors="coerce").fillna(0)
     cycle = pd.to_numeric(shops.get("cycle_days"), errors="coerce").replace(0, np.nan).fillna(30)
-    cover = pd.to_numeric(shops.get("cover_left_days"), errors="coerce").fillna(0)
     trend = pd.to_numeric(shops.get("trend_pct"), errors="coerce").fillna(0)
     unvisited = shops["call_status"].eq("Unvisited")
     score = ask * (1.0 + overdue / cycle.clip(lower=7))
     score = score + (-trend.clip(upper=0) * pd.to_numeric(shops["ams_3m"], errors="coerce").fillna(0))
     score = score.where(~unvisited, score * 1.35)
-    score = score.where(cover <= COVER_HOLD_DAYS, score * 0.1)
     hold = shops["action"].eq(ACTION_HOLD)
     coming = shops["coming_due"].fillna(False) if "coming_due" in shops.columns else False
+    nyd = pd.to_numeric(shops.get("not_yet_due_mt"), errors="coerce").fillna(0) if "not_yet_due_mt" in shops.columns else 0.0
     score = score.where(~hold, 0.0)
-    score = score.where(~(hold & coming), ask * 0.45)
+    score = score.where(~(hold & coming), nyd * 0.45 if isinstance(nyd, pd.Series) else 0.0)
     return score.fillna(0.0)
 
 
 def action_buckets(shops: pd.DataFrame) -> dict[str, float]:
-    """Partition rest-of-month Ask by action. The five Ask tons add back to week_target_mt.
+    """Immediate Ask plus the four pipeline pillars.
 
-    Unvisited + due visited + another visit + lapsing + coming due = Ask.
-    Doors to visit is the work-now subtotal (the first four), not a sixth slice.
+    Immediate Ask = Due unvisited + Due visited + Another visit.
+    Lapsed Ask is 0. Coming due is Not yet due, not Ask.
+
+    Pipeline Expected = Billed + Due unvisited + Drop variance + Not yet due.
     """
     empty = {
         "n_call": 0,
@@ -914,6 +732,9 @@ def action_buckets(shops: pd.DataFrame) -> dict[str, float]:
         "n_coming": 0,
         "n_doors": 0,
         "n_hold": 0,
+        "n_due": 0,
+        "n_lapsed": 0,
+        "n_universe": 0,
         "ask_call": 0.0,
         "ask_convert": 0.0,
         "ask_lift": 0.0,
@@ -925,6 +746,11 @@ def action_buckets(shops: pd.DataFrame) -> dict[str, float]:
         "ams_3m": 0.0,
         "billed_mt": 0.0,
         "remaining_mt": 0.0,
+        "due_unvisited_mt": 0.0,
+        "drop_variance_mt": 0.0,
+        "not_yet_due_mt": 0.0,
+        "pipeline_expected_mt": 0.0,
+        "n_due_visited": 0,
     }
     if shops is None or shops.empty:
         return empty
@@ -946,28 +772,45 @@ def action_buckets(shops: pd.DataFrame) -> dict[str, float]:
     n_call, ask_call = _n_ask(action.eq(ACTION_CALL))
     n_convert, ask_convert = _n_ask(action.eq(ACTION_CONVERT))
     n_lift, ask_lift = _n_ask(action.eq(ACTION_LIFT))
-    n_lapse, ask_lapse = _n_ask(action.eq(ACTION_RECOVER))
-    n_coming, ask_coming = _n_ask(coming)
+    n_lapse, _ = _n_ask(action.eq(ACTION_RECOVER))
+    n_coming, _ = _n_ask(coming)
     n_hold, _ = _n_ask(action.eq(ACTION_HOLD))
+    due_mask = action.isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT})
+    visited_due = due_mask & g["call_status"].isin({"Visited · not billed", "Billed"}) if "call_status" in g.columns else due_mask & action.eq(ACTION_CONVERT)
+    nyd = _sum("not_yet_due_mt")
+    billed = _sum("billed_mt")
+    due_u = _sum("due_unvisited_mt")
+    var = _sum("drop_variance_mt")
+    pipe = _sum("pipeline_expected_mt")
+    if pipe <= 0 and (billed or due_u or var or nyd):
+        pipe = billed + due_u + var + nyd
     return {
         "n_call": n_call,
         "n_convert": n_convert,
         "n_lift": n_lift,
         "n_lapse": n_lapse,
         "n_coming": n_coming,
-        "n_doors": n_call + n_convert + n_lift + n_lapse,
+        "n_doors": n_call + n_convert + n_lift,
         "n_hold": n_hold,
+        "n_due": int(due_mask.sum()),
+        "n_lapsed": n_lapse,
+        "n_universe": int(len(g)),
+        "n_due_visited": int(visited_due.sum()) if hasattr(visited_due, "sum") else 0,
         "ask_call": ask_call,
         "ask_convert": ask_convert,
         "ask_lift": ask_lift,
-        "ask_lapse": ask_lapse,
-        "ask_coming": ask_coming,
-        "ask_doors": ask_call + ask_convert + ask_lift + ask_lapse,
+        "ask_lapse": 0.0,
+        "ask_coming": nyd,
+        "ask_doors": ask_call + ask_convert + ask_lift,
         "week_target_mt": float(ask.sum()),
         "expected_mt": _sum("expected_mt"),
         "ams_3m": _sum("ams_3m"),
-        "billed_mt": _sum("billed_mt"),
+        "billed_mt": billed,
         "remaining_mt": _sum("remaining_mt"),
+        "due_unvisited_mt": due_u,
+        "drop_variance_mt": var,
+        "not_yet_due_mt": nyd,
+        "pipeline_expected_mt": pipe,
     }
 
 
@@ -989,12 +832,15 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
         remaining = float(buckets["remaining_mt"])
         n_doors = int(buckets["n_doors"])
         coming_bit = f", {n_coming} more come due before month-end" if n_coming else ""
+        lapse_bit = f", {n_lapse} lapsed (Ask 0)" if n_lapse else ""
         instruction = (
             f"Push {name}: {n_doors} doors to work now "
             f"({n_call} due and unvisited, {n_convert} due but already visited, "
-            f"{n_lift} another visit, {n_lapse} lapsing){coming_bit}. "
-            f"Ask {_kg_text(week)} for the rest of the month "
-            f"({_kg_text(remaining)} still to Expected)."
+            f"{n_lift} another visit){coming_bit}{lapse_bit}. "
+            f"Immediate Ask {_kg_text(week)} "
+            f"(unvisited due {_kg_text(buckets['due_unvisited_mt'])}, "
+            f"variance {_kg_text(buckets['drop_variance_mt'])}, "
+            f"not yet due {_kg_text(buckets['not_yet_due_mt'])})."
         )
         row = {
             "grain_id": str(name),
@@ -1005,6 +851,9 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
             "n_lift": n_lift,
             "n_lapse": n_lapse,
             "n_hold": int(buckets["n_hold"]),
+            "n_due": int(buckets["n_due"]),
+            "n_universe": int(buckets["n_universe"]),
+            "n_due_visited": int(buckets["n_due_visited"]),
             "ask_call": buckets["ask_call"],
             "ask_convert": buckets["ask_convert"],
             "ask_lift": buckets["ask_lift"],
@@ -1018,6 +867,10 @@ def _roll_units(shops: pd.DataFrame, key: str, extra_city: bool = False, extra_d
             "behind_pace_mt": remaining,
             "remaining_mt": remaining,
             "week_target_mt": week,
+            "due_unvisited_mt": float(buckets["due_unvisited_mt"]),
+            "drop_variance_mt": float(buckets["drop_variance_mt"]),
+            "not_yet_due_mt": float(buckets["not_yet_due_mt"]),
+            "pipeline_expected_mt": float(buckets["pipeline_expected_mt"]),
             "instruction": instruction,
             "value_score": float(pd.to_numeric(g["value_score"], errors="coerce").fillna(0).sum()) if "value_score" in g.columns else 0.0,
         }
@@ -1069,25 +922,32 @@ def _units_with_work(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _country_row(shops: pd.DataFrame, as_of: int, days: int, days_left: int, open_mtd: bool, source: str) -> dict[str, Any]:
+    b = action_buckets(shops)
     return {
-        "billed_mt": float(shops["billed_mt"].sum()),
-        "expected_mt": float(shops["expected_mt"].sum()),
-        "ams_3m": float(pd.to_numeric(shops.get("ams_3m"), errors="coerce").fillna(0).sum()),
-        "should_have_mt": float(shops["expected_mt"].sum()),
-        "behind_pace_mt": float(shops["remaining_mt"].sum()),
-        "remaining_mt": float(shops["remaining_mt"].sum()),
-        "week_target_mt": float(shops["week_target_mt"].sum()),
+        "billed_mt": b["billed_mt"],
+        "expected_mt": b["expected_mt"],
+        "ams_3m": b["ams_3m"],
+        "should_have_mt": b["expected_mt"],
+        "behind_pace_mt": b["remaining_mt"],
+        "remaining_mt": b["remaining_mt"],
+        "week_target_mt": b["week_target_mt"],
+        "due_unvisited_mt": b["due_unvisited_mt"],
+        "drop_variance_mt": b["drop_variance_mt"],
+        "not_yet_due_mt": b["not_yet_due_mt"],
+        "pipeline_expected_mt": b["pipeline_expected_mt"],
         "as_of_day": as_of,
         "days_in_month": days,
         "days_left": days_left,
         "open_mtd": open_mtd,
-        "n_call": int((shops["action"] == ACTION_CALL).sum()),
-        "n_convert": int((shops["action"] == ACTION_CONVERT).sum()),
-        "n_lift": int((shops["action"] == ACTION_LIFT).sum()),
-        "n_lapse": int((shops["action"] == ACTION_RECOVER).sum()),
-        "n_hold": int((shops["action"] == ACTION_HOLD).sum()),
-        "n_doors": int((shops["action"] != ACTION_HOLD).sum()),
-        "n_coming": int(shops["coming_due"].fillna(False).sum()) if "coming_due" in shops.columns else 0,
+        "n_call": b["n_call"],
+        "n_convert": b["n_convert"],
+        "n_lift": b["n_lift"],
+        "n_lapse": b["n_lapse"],
+        "n_hold": b["n_hold"],
+        "n_doors": b["n_doors"],
+        "n_coming": b["n_coming"],
+        "n_due": b["n_due"],
+        "n_universe": b["n_universe"],
         "source": source,
     }
 
@@ -1100,26 +960,27 @@ def _headline(country: dict[str, Any], open_mtd: bool, has_daily: bool) -> str:
     n_coming = int(country.get("n_coming") or 0)
     week = float(country.get("week_target_mt") or 0)
     billed = float(country.get("billed_mt") or 0)
-    expected = float(country.get("expected_mt") or 0)
-    remaining = float(country.get("remaining_mt") or 0)
+    pipe = float(country.get("pipeline_expected_mt") or country.get("expected_mt") or 0)
+    due_u = float(country.get("due_unvisited_mt") or 0)
+    var = float(country.get("drop_variance_mt") or 0)
+    nyd = float(country.get("not_yet_due_mt") or 0)
     coming_bit = f", {n_coming} come due before month-end" if n_coming else ""
     hole = (
-        f"billed {_kg_text(billed)} vs {_kg_text(expected)} Expected "
-        f"({_kg_text(remaining)} still to go). "
+        f"billed {_kg_text(billed)} of {_kg_text(pipe)} pipeline "
+        f"(due unvisited {_kg_text(due_u)}, variance {_kg_text(var)}, "
+        f"not yet due {_kg_text(nyd)}). "
     )
     if not has_daily:
         return (
             f"No billed days in the warehouse — cycles fall back to monthly gaps. "
             f"{hole}{n_call} due, {n_convert} due and already visited, {n_lift} another visit, "
-            f"{n_lapse} lapsing{coming_bit}. Ask {_kg_text(week)} for the rest of the month "
-            f"(drops that still fit — not the whole hole)."
+            f"{n_lapse} lapsed{coming_bit}. Immediate Ask {_kg_text(week)}."
         )
     when = f"Day {country.get('as_of_day')}/{country.get('days_in_month')}" if open_mtd else "Month closed"
     return (
         f"{when}: {hole}{n_call} due and unvisited, {n_convert} due but already seen, "
-        f"{n_lift} another visit, {n_lapse} lapsing{coming_bit}. "
-        f"Ask {_kg_text(week)} for the rest of the month "
-        f"(drops that still fit — not the {_kg_text(remaining)} hole)."
+        f"{n_lift} another visit, {n_lapse} lapsed{coming_bit}. "
+        f"Immediate Ask {_kg_text(week)} (expected drop when ratio ≥ {DUE_RATIO:.1f}, not remaining-to-Expected)."
     )
 
 
@@ -1136,10 +997,14 @@ def _take_action(shops: pd.DataFrame, action: str, n: int) -> pd.DataFrame:
 
 COUNTRY_VIEW = [
     ("billed_mt", "Billed (KG)"),
+    ("pipeline_expected_mt", "Pipeline expected (KG)"),
+    ("week_target_mt", "Ask rest of month (KG)"),
+    ("due_unvisited_mt", "Due unvisited (KG)"),
+    ("drop_variance_mt", "Volume lost to variance (KG)"),
+    ("not_yet_due_mt", "Not yet due (KG)"),
     ("expected_mt", "Expected this month (KG)"),
     ("ams_3m", "AMS (KG)"),
     ("remaining_mt", "Still to Expected (KG)"),
-    ("week_target_mt", "Ask rest of month (KG)"),
     ("as_of_day", "As of day"),
     ("days_left", "Days left"),
     ("n_doors", "Doors"),
@@ -1154,16 +1019,20 @@ SHOP_VIEW = [
     ("store_name", "Shop"),
     ("store_id", "POP"),
     ("city", "City"),
+    ("section", "Area"),
     ("distributor", "Distributor"),
     ("dsr_name", "DSR"),
     ("action", "Action"),
+    ("recommended_action", "Recommended action"),
     ("coming_due", "Coming due"),
     ("week_target_mt", "Ask rest of month (KG)"),
+    ("expected_drop_mt", "Target drop (KG)"),
     ("billed_mt", "Billed (KG)"),
     ("ams_3m", "AMS (KG)"),
     ("days_since_bill", "Days since bill"),
     ("cycle_days", "Usual cycle (days)"),
     ("days_overdue", "Days overdue"),
+    ("depletion_ratio", "Depletion ratio"),
     ("cover_left_days", "Cover left (days)"),
     ("last_drop_mt", "Last drop (KG)"),
     ("typical_drop_mt", "Typical drop (KG)"),
@@ -1178,26 +1047,27 @@ SHOP_VIEW = [
 
 SHOP_PDF_COLS = [
     "Shop",
-    "City",
+    "Area",
     "DSR",
     "Action",
+    "Recommended action",
     "Ask rest of month (KG)",
-    "Next order (KG)",
+    "Target drop (KG)",
     "Billed (KG)",
-    "AMS (KG)",
-    "Days since bill",
-    "Usual cycle (days)",
-    "Cover left (days)",
+    "Days overdue",
+    "Last billed",
     "Do this",
 ]
 
 COUNTRY_PDF_COLS = [
     "Billed (KG)",
+    "Pipeline expected (KG)",
+    "Ask rest of month (KG)",
+    "Due unvisited (KG)",
+    "Volume lost to variance (KG)",
+    "Not yet due (KG)",
     "Expected this month (KG)",
     "AMS (KG)",
-    "Still to Expected (KG)",
-    "Ask rest of month (KG)",
-    "Days left",
     "Doors",
     "Coming due",
     "Due · unvisited",
@@ -1294,6 +1164,11 @@ def _present(df: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
         "Last drop (KG)",
         "Typical drop (KG)",
         "Next order (KG)",
+        "Target drop (KG)",
+        "Pipeline expected (KG)",
+        "Due unvisited (KG)",
+        "Volume lost to variance (KG)",
+        "Not yet due (KG)",
     }
     for src, label in view:
         if src not in df.columns:
@@ -1306,6 +1181,8 @@ def _present(df: pd.DataFrame, view: list[tuple[str, str]]) -> pd.DataFrame:
             out[label] = ["Yes" if bool(v) and not (isinstance(v, float) and pd.isna(v)) else "" for v in col]
         elif label in {"Usual cycle (days)", "Days since bill", "Days overdue", "Cover left (days)"}:
             out[label] = [None if pd.isna(v) else int(round(float(v))) for v in col]
+        elif label == "Depletion ratio":
+            out[label] = [None if pd.isna(v) else round(float(v), 2) for v in col]
         elif label == "Trend vs prior 3m":
             out[label] = [None if pd.isna(v) else int(round(float(v) * 100)) for v in col]
         elif label in {"Due precision %", "Random precision %"}:
@@ -1361,6 +1238,142 @@ def _present_backtest(df: pd.DataFrame) -> pd.DataFrame:
     return _present(df, BACKTEST_VIEW)
 
 
+def _present_pipeline(shops: pd.DataFrame) -> pd.DataFrame:
+    """Tier 1 — city pipeline bridge."""
+    if shops is None or shops.empty or "city" not in shops.columns:
+        return pd.DataFrame(
+            columns=[
+                "City",
+                "Pipeline expected (MT)",
+                "Billed (MT)",
+                "Immediate Due / Ask (MT)",
+                "Not yet due (MT)",
+                "Volume lost to variance (MT)",
+            ]
+        )
+    rows = []
+    for city, g in shops.groupby(shops["city"].astype(str)):
+        b = action_buckets(g)
+        rows.append(
+            {
+                "City": str(city),
+                "Pipeline expected (MT)": round(float(b["pipeline_expected_mt"]), 1),
+                "Billed (MT)": round(float(b["billed_mt"]), 1),
+                "Immediate Due / Ask (MT)": round(float(b["week_target_mt"]), 1),
+                "Not yet due (MT)": round(float(b["not_yet_due_mt"]), 1),
+                "Volume lost to variance (MT)": round(float(b["drop_variance_mt"]), 1),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    return out.sort_values("Pipeline expected (MT)", ascending=False).reset_index(drop=True)
+
+
+def _present_sales_head(shops: pd.DataFrame) -> pd.DataFrame:
+    """Tier 2 — distributor × DSR execution."""
+    from sndintel.identity import dsr_display_name, dsr_unit_id
+
+    cols = [
+        "Distributor",
+        "DSR",
+        "City",
+        "Active universe",
+        "Shops due for reorder",
+        "Due shops visited %",
+        "Unvisited due Ask (MT)",
+        "Drop variance (MT)",
+        "Lapsed / churned",
+    ]
+    if shops is None or shops.empty or "dsr_name" not in shops.columns:
+        return pd.DataFrame(columns=cols)
+    work = shops.copy()
+    for col, default in (("city", ""), ("distributor", ""), ("dsr_name", "")):
+        if col not in work.columns:
+            work[col] = default
+        work[col] = work[col].fillna(default).astype(str)
+    work["_dsr_id"] = [
+        dsr_unit_id(c, d, n) for c, d, n in zip(work["city"], work["distributor"], work["dsr_name"])
+    ]
+    rows = []
+    for gid, g in work.groupby("_dsr_id"):
+        b = action_buckets(g)
+        n_due = int(b["n_due"])
+        visited_pct = (100.0 * b["n_due_visited"] / n_due) if n_due else None
+        lapsed = g["is_lapsed"].fillna(False).astype(bool) if "is_lapsed" in g.columns else g["action"].eq(ACTION_RECOVER)
+        active = int((~lapsed).sum()) if hasattr(lapsed, "sum") else int(b["n_universe"])
+        rows.append(
+            {
+                "Distributor": str(g["distributor"].iloc[0]),
+                "DSR": dsr_display_name(gid),
+                "City": str(g["city"].iloc[0]),
+                "Active universe": active,
+                "Shops due for reorder": n_due,
+                "Due shops visited %": None if visited_pct is None else int(round(visited_pct)),
+                "Unvisited due Ask (MT)": round(float(b["due_unvisited_mt"]), 1),
+                "Drop variance (MT)": round(float(b["drop_variance_mt"]), 1),
+                "Lapsed / churned": int(b["n_lapse"]),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows).sort_values(["Unvisited due Ask (MT)", "Drop variance (MT)"], ascending=False).reset_index(drop=True)
+
+
+def _present_beat_plan(shops: pd.DataFrame) -> pd.DataFrame:
+    """Tier 3 — today's reorder list (due, not lapsed)."""
+    cols = [
+        "Shop",
+        "Area",
+        "City",
+        "DSR",
+        "Last purchased",
+        "Days overdue",
+        "Target drop (KG)",
+        "Recommended action",
+    ]
+    if shops is None or shops.empty:
+        return pd.DataFrame(columns=cols)
+    due = shops[shops["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT})].copy()
+    if due.empty:
+        return pd.DataFrame(columns=cols)
+    due = due.sort_values(["week_target_mt", "days_overdue"], ascending=False)
+    return pd.DataFrame(
+        {
+            "Shop": list(due.get("store_name", due.get("store_id"))),
+            "Area": list(due.get("section", [""] * len(due))),
+            "City": list(due.get("city", [""] * len(due))),
+            "DSR": list(due.get("dsr_name", [""] * len(due))),
+            "Last purchased": list(due.get("last_bill_date", [""] * len(due))),
+            "Days overdue": [None if pd.isna(v) else int(round(float(v))) for v in due.get("days_overdue", [])],
+            "Target drop (KG)": [_round_kg(v) for v in due.get("expected_drop_mt", due.get("typical_drop_mt", []))],
+            "Recommended action": list(due.get("recommended_action", due.get("action", []))),
+        }
+    )
+
+
+def _present_lost_doors(shops: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Shop", "City", "DSR", "Distributor", "Last purchased", "Days since bill", "Usual cycle (days)", "Do this"]
+    if shops is None or shops.empty:
+        return pd.DataFrame(columns=cols)
+    lost = shops[shops["action"] == ACTION_RECOVER].copy()
+    if lost.empty:
+        return pd.DataFrame(columns=cols)
+    lost = lost.sort_values("days_since_bill", ascending=False)
+    return pd.DataFrame(
+        {
+            "Shop": list(lost.get("store_name", lost.get("store_id"))),
+            "City": list(lost.get("city", [""] * len(lost))),
+            "DSR": list(lost.get("dsr_name", [""] * len(lost))),
+            "Distributor": list(lost.get("distributor", [""] * len(lost))),
+            "Last purchased": list(lost.get("last_bill_date", [""] * len(lost))),
+            "Days since bill": [None if pd.isna(v) else int(round(float(v))) for v in lost.get("days_since_bill", [])],
+            "Usual cycle (days)": [None if pd.isna(v) else int(round(float(v))) for v in lost.get("cycle_days", [])],
+            "Do this": list(lost.get("instruction", [""] * len(lost))),
+        }
+    )
+
+
 def _take_present(shops: pd.DataFrame, action: str, n: int) -> pd.DataFrame:
     if shops is None or shops.empty:
         return shops if shops is not None else pd.DataFrame()
@@ -1377,6 +1390,9 @@ def _sql_shops_to_raw(df: pd.DataFrame | None) -> pd.DataFrame:
     out = df.copy()
     if "coming_due" in out.columns:
         out["coming_due"] = pd.to_numeric(out["coming_due"], errors="coerce").fillna(0).astype(bool)
+    for flag in ("is_lapsed", "is_cold_start"):
+        if flag in out.columns:
+            out[flag] = pd.to_numeric(out[flag], errors="coerce").fillna(0).astype(bool)
     return out
 
 
@@ -1385,6 +1401,9 @@ def _raw_shops_to_sql(df: pd.DataFrame, period: str) -> pd.DataFrame:
         return pd.DataFrame()
     out = df.copy()
     out["period"] = period
+    for flag in ("coming_due", "is_lapsed", "is_cold_start"):
+        if flag in out.columns:
+            out[flag] = pd.to_numeric(out[flag], errors="coerce").fillna(0).astype(int)
     cols = [
         "period",
         "store_id",
@@ -1422,6 +1441,18 @@ def _raw_shops_to_sql(df: pd.DataFrame, period: str) -> pd.DataFrame:
         "coming_due",
         "days_until_due",
         "n_orders_left",
+        "expected_drop_mt",
+        "api_days",
+        "depletion_ratio",
+        "n_purchases_90d",
+        "n_purchases_ever",
+        "is_cold_start",
+        "is_lapsed",
+        "due_unvisited_mt",
+        "drop_variance_mt",
+        "not_yet_due_mt",
+        "pipeline_expected_mt",
+        "recommended_action",
     ]
     for col in cols:
         if col not in out.columns:
@@ -1465,6 +1496,13 @@ def _raw_units_to_sql(df: pd.DataFrame, period: str, grain: str) -> pd.DataFrame
         "behind_pace_mt",
         "remaining_mt",
         "week_target_mt",
+        "due_unvisited_mt",
+        "drop_variance_mt",
+        "not_yet_due_mt",
+        "pipeline_expected_mt",
+        "n_due",
+        "n_universe",
+        "n_due_visited",
         "instruction",
         "value_score",
     ]
@@ -1554,6 +1592,10 @@ def _brief_to_sql(pack: ActionPack) -> dict[str, Any]:
         "n_lapse": b.get("n_lapse"),
         "n_doors": b.get("n_doors"),
         "n_coming": b.get("n_coming"),
+        "pipeline_expected_mt": b.get("pipeline_expected_mt"),
+        "due_unvisited_mt": b.get("due_unvisited_mt"),
+        "drop_variance_mt": b.get("drop_variance_mt"),
+        "not_yet_due_mt": b.get("not_yet_due_mt"),
         "has_daily": int(pack.has_daily),
         "headline": pack.headline,
         "source": pack.source,

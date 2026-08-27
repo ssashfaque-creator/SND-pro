@@ -117,8 +117,14 @@ def build_monday_pack(
         (
             "06 Highlighted stores",
             "6. Highlighted stores",
-            "Volume doors (AMS or last drop ≥ 1 MT). Shop figures are KG.",
+            "Volume doors (AMS or last drop ≥ 1 MT). Shop figures are KG. Target drop is the 90-day expected drop.",
             highlighted_stores,
+        ),
+        (
+            "07 Lost doors",
+            "7. Lost doors",
+            "DSLP > 3× API. Ask is 0. Recovery drive — not the daily beat.",
+            _lost_doors_table(shops),
         ),
     ]
     cities = []
@@ -179,9 +185,7 @@ def build_dsr_beat_pack(action: ActionPack, per_dsr: int | None = None) -> OpsPa
     shops = action.raw_shops if action.raw_shops is not None and not action.raw_shops.empty else pd.DataFrame()
     if shops.empty:
         return OpsPack(period=action.period, label=action.label, kind="dsr", headline="No DSR beat list.")
-    work = shops[shops["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT, ACTION_RECOVER})].copy()
-    coming = shops[shops.get("coming_due").fillna(False)] if "coming_due" in shops.columns else shops.iloc[0:0]
-    work = pd.concat([work, coming], ignore_index=True)
+    work = shops[shops["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT})].copy()
     if "store_id" in work.columns:
         work = work.drop_duplicates("store_id")
     work = cap_shops_per_dsr(work, per_dsr=per_dsr or DSR_DAY_CAP)
@@ -863,9 +867,32 @@ def _present_whale_ops(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _lost_doors_table(shops: pd.DataFrame) -> pd.DataFrame:
+    if shops is None or shops.empty or "action" not in shops.columns:
+        return pd.DataFrame(columns=["Shop", "City", "DSR", "Last purchased", "Days since bill", "Do this"])
+    lost = shops[shops["action"] == ACTION_RECOVER]
+    if lost.empty:
+        return pd.DataFrame(columns=["Shop", "City", "DSR", "Last purchased", "Days since bill", "Do this"])
+    return pd.DataFrame(
+        {
+            "Shop": list(lost.get("store_name", lost.get("store_id"))),
+            "City": list(lost.get("city", [""] * len(lost))),
+            "DSR": list(lost.get("dsr_name", [""] * len(lost))),
+            "Last purchased": list(lost.get("last_bill_date", [""] * len(lost))),
+            "Days since bill": [None if pd.isna(v) else int(round(float(v))) for v in lost.get("days_since_bill", [])],
+            "Do this": list(lost.get("instruction", [""] * len(lost))),
+        }
+    )
+
+
 def _present_beat(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+    drop = df["expected_drop_mt"] if "expected_drop_mt" in df.columns else df.get("week_target_mt")
+    overdue = df["days_overdue"] if "days_overdue" in df.columns else pd.Series([None] * len(df))
+    last = df["last_bill_date"] if "last_bill_date" in df.columns else pd.Series([""] * len(df))
+    rec = df["recommended_action"] if "recommended_action" in df.columns else df.get("action")
+    since = df["days_since_bill"] if "days_since_bill" in df.columns else pd.Series([None] * len(df))
     out = pd.DataFrame(
         {
             "DSR": list(df.get("dsr_name", [])),
@@ -874,9 +901,11 @@ def _present_beat(df: pd.DataFrame) -> pd.DataFrame:
             "Shop": list(df.get("store_name", [])),
             "Action": list(df.get("action", [])),
             "Ask rest of month (KG)": [_round_kg(v) for v in df.get("week_target_mt", [])],
-            "Next order (KG)": [_round_kg(v) for v in df.get("next_drop_mt", [])],
-            "Days since bill": [None if pd.isna(v) else int(round(float(v))) for v in df.get("days_since_bill", [])],
-            "Cover left (days)": [None if pd.isna(v) else int(round(float(v))) for v in df.get("cover_left_days", [])],
+            "Target drop (KG)": [_round_kg(v) for v in drop],
+            "Last purchased": list(last),
+            "Days overdue": [None if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v) else int(round(float(v))) for v in overdue],
+            "Recommended action": list(rec),
+            "Days since bill": [None if v is None or pd.isna(v) else int(round(float(v))) for v in since],
             "Owner": list(df.get("dsr_name", [])),
             "Do this": list(df.get("instruction", [])),
         }

@@ -189,7 +189,7 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
 
     assert "DUE1" in raw.index
     assert "GHOST" in raw.index
-    assert raw.loc["GHOST", "action"] == ACTION_CALL
+    assert raw.loc["GHOST", "action"] == ACTION_RECOVER
     assert float(raw.loc["GHOST", "ams_3m"]) == 0
     assert float(raw.loc["GHOST", "week_target_mt"]) == 0
     assert raw.loc["GHOST", "call_status"] == "Unvisited"
@@ -197,23 +197,20 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     assert raw.loc["VIS1", "action"] == ACTION_CONVERT
     assert raw.loc["LITE1", "action"] == ACTION_LIFT
     assert raw.loc["LAPSE1", "action"] == ACTION_RECOVER
-    assert raw.loc["DOWN1", "action"] == ACTION_RECOVER
-    assert raw.loc["HOLD1", "action"] == ACTION_HOLD
+    assert raw.loc["DOWN1", "action"] == ACTION_CALL
+    assert raw.loc["HOLD1", "action"] == ACTION_CALL
 
     assert float(raw.loc["DUE1", "cycle_days"]) < 20
     assert float(raw.loc["DUE1", "days_since_bill"]) >= 15
-    assert float(raw.loc["HOLD1", "cover_left_days"]) > 7
-    assert float(raw.loc["HOLD1", "last_month_mt"]) >= 3.2
     assert float(raw.loc["LITE1", "billed_mt"]) < 0.5
     assert float(raw.loc["LITE1", "week_target_mt"]) >= SHOP_FLOOR_MT
     assert float(raw.loc["DUE1", "week_target_mt"]) >= SHOP_FLOOR_MT
+    assert float(raw.loc["LAPSE1", "week_target_mt"]) == 0
 
     assert "Due Mart" in str(raw.loc["DUE1", "instruction"])
     assert "not visited" in str(raw.loc["DUE1", "instruction"]).lower()
     assert "KG" in str(raw.loc["DUE1", "instruction"])
-    assert "another visit" in str(raw.loc["LITE1", "instruction"]).lower()
-    assert "Hold Mart" in str(raw.loc["HOLD1", "instruction"])
-    assert pack.source == "cycle"
+    assert pack.source == "demand"
     assert "Ask rest of month (KG)" in pack.calls.columns
     assert "Billed (KG)" in pack.calls.columns
     assert "AMS (KG)" in pack.calls.columns
@@ -224,17 +221,14 @@ def test_cycle_cover_and_lapse_name_the_right_doors():
     assert "Doors" in pack.country.columns
     assert "Coming due" in pack.country.columns
     assert "Lapsing" in pack.country.columns
-    assert "still to go" in pack.headline.lower()
     due_ask = int(pack.calls.loc[pack.calls["Shop"] == "Due Mart", "Ask rest of month (KG)"].iloc[0])
     assert 700 <= due_ask <= 1300
-    assert "Next order (KG)" in pack.calls.columns
 
     assert "Due Mart" in set(pack.calls["Shop"].astype(str))
     assert "Visited Mart" in set(pack.converts["Shop"].astype(str))
     assert "Lite Mart" in set(pack.lifts["Shop"].astype(str))
     assert "Lapse Mart" in set(pack.lapses["Shop"].astype(str))
-    assert "Down Mart" in set(pack.lapses["Shop"].astype(str))
-    assert "Hold Mart" not in set(pack.calls["Shop"].astype(str))
+    assert "Ghost" in set(pack.lapses["Shop"].astype(str))
     assert "Due Mart" not in set(pack.lapses["Shop"].astype(str))
 
 
@@ -300,9 +294,7 @@ def test_dsr_instruction_names_counts_and_tonnes():
     assert "Distributor" in pack.dsrs.columns
     assert str(pack.raw_dsrs.iloc[0]["grain_id"]).startswith("Amir")
     assert "Push Amir" in str(row["Do this"])
-    assert "rest of the month" in str(row["Do this"]).lower()
     assert "doors to work" in str(row["Do this"]).lower()
-    assert "still to expected" in str(row["Do this"]).lower()
     assert "KG" in str(row["Do this"])
     assert "Ask rest of month (KG)" in pack.dsrs.columns
     assert "Coming due" in pack.dsrs.columns
@@ -314,7 +306,7 @@ def test_action_workbook_has_due_another_visit_and_lapsing():
     shop_month, stores, shop_day, ledger, visits = _panel()
     pack = build_action_pack(shop_month, stores, shop_day, visits=visits, ledger=ledger, period="2026-08")
     names = [s[0] for s in iter_action_sheets(pack)]
-    assert names == [
+    assert names[:8] == [
         "01 Country",
         "02 Distributors",
         "03 DSRs",
@@ -324,6 +316,9 @@ def test_action_workbook_has_due_another_visit_and_lapsing():
         "07 Lapsing",
         "08 Backtest",
     ]
+    assert "09 Pipeline" in names
+    assert "10 Sales head" in names
+    assert "11 Beat" in names
     raw = excel_bytes(pack)
     wb = load_workbook(BytesIO(raw))
     assert "00 Cover" in wb.sheetnames
@@ -440,13 +435,19 @@ def test_next_drop_before_month_end_is_in_rest_of_month_ask():
     raw = pack.raw_shops.set_index("store_id")
     assert raw.loc["MID1", "action"] == ACTION_HOLD
     assert bool(raw.loc["MID1", "coming_due"])
-    assert float(raw.loc["MID1", "week_target_mt"]) >= SHOP_FLOOR_MT
-    assert float(raw.loc["MID1", "week_target_mt"]) <= float(raw.loc["MID1", "remaining_mt"]) + 0.05
+    assert float(raw.loc["MID1", "week_target_mt"]) == 0.0
+    assert float(raw.loc["MID1", "not_yet_due_mt"]) >= SHOP_FLOOR_MT
     assert "comes due" in str(raw.loc["MID1", "instruction"]).lower()
     assert int(pack.country.iloc[0]["Coming due"]) >= 1
     work_ask = float(raw.loc[raw["action"] != ACTION_HOLD, "week_target_mt"].sum())
     country_ask = float(pack.raw_shops["week_target_mt"].sum())
-    assert country_ask > work_ask
+    assert abs(country_ask - work_ask) < 1e-6
+    pipe = float(raw["pipeline_expected_mt"].sum())
+    billed = float(raw["billed_mt"].sum())
+    due_u = float(raw["due_unvisited_mt"].sum())
+    var = float(raw["drop_variance_mt"].sum())
+    nyd = float(raw["not_yet_due_mt"].sum())
+    assert abs(billed + due_u + var + nyd - pipe) < 1e-6
 
 
 def test_just_billed_inside_cycle_is_not_rest_of_month_ask():

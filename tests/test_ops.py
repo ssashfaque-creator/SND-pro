@@ -241,22 +241,26 @@ def test_action_buckets_add_back_to_ask():
 
     shops = pd.DataFrame(
         [
-            {"action": ACTION_CALL, "coming_due": False, "week_target_mt": 1.0, "expected_mt": 2, "ams_3m": 2, "billed_mt": 0.2, "remaining_mt": 1.8},
-            {"action": ACTION_CONVERT, "coming_due": False, "week_target_mt": 2.0, "expected_mt": 3, "ams_3m": 3, "billed_mt": 0.5, "remaining_mt": 2.5},
-            {"action": ACTION_LIFT, "coming_due": False, "week_target_mt": 0.5, "expected_mt": 1, "ams_3m": 1, "billed_mt": 0.4, "remaining_mt": 0.6},
-            {"action": ACTION_RECOVER, "coming_due": False, "week_target_mt": 0.3, "expected_mt": 1, "ams_3m": 1, "billed_mt": 0.0, "remaining_mt": 1.0},
-            {"action": ACTION_HOLD, "coming_due": True, "week_target_mt": 0.2, "expected_mt": 1, "ams_3m": 1, "billed_mt": 0.8, "remaining_mt": 0.2},
+            {"action": ACTION_CALL, "coming_due": False, "week_target_mt": 1.0, "expected_mt": 2, "ams_3m": 2, "billed_mt": 0.2, "remaining_mt": 1.8, "due_unvisited_mt": 1.0, "drop_variance_mt": 0.0, "not_yet_due_mt": 0.0, "pipeline_expected_mt": 1.2, "call_status": "Unvisited"},
+            {"action": ACTION_CONVERT, "coming_due": False, "week_target_mt": 2.0, "expected_mt": 3, "ams_3m": 3, "billed_mt": 0.5, "remaining_mt": 2.5, "due_unvisited_mt": 0.0, "drop_variance_mt": 2.0, "not_yet_due_mt": 0.0, "pipeline_expected_mt": 2.5, "call_status": "Visited · not billed"},
+            {"action": ACTION_LIFT, "coming_due": False, "week_target_mt": 0.5, "expected_mt": 1, "ams_3m": 1, "billed_mt": 0.4, "remaining_mt": 0.6, "due_unvisited_mt": 0.0, "drop_variance_mt": 0.1, "not_yet_due_mt": 0.0, "pipeline_expected_mt": 0.5, "call_status": "Billed"},
+            {"action": ACTION_RECOVER, "coming_due": False, "week_target_mt": 0.0, "expected_mt": 1, "ams_3m": 1, "billed_mt": 0.0, "remaining_mt": 1.0, "due_unvisited_mt": 0.0, "drop_variance_mt": 0.0, "not_yet_due_mt": 0.0, "pipeline_expected_mt": 0.0, "call_status": "Unvisited"},
+            {"action": ACTION_HOLD, "coming_due": True, "week_target_mt": 0.0, "expected_mt": 1, "ams_3m": 1, "billed_mt": 0.8, "remaining_mt": 0.2, "due_unvisited_mt": 0.0, "drop_variance_mt": 0.0, "not_yet_due_mt": 0.2, "pipeline_expected_mt": 1.0, "call_status": "Billed"},
         ]
     )
     b = action_buckets(shops)
-    parts = b["ask_call"] + b["ask_convert"] + b["ask_lift"] + b["ask_lapse"] + b["ask_coming"]
-    assert abs(parts - b["week_target_mt"]) < 1e-9
-    assert abs(b["ask_doors"] + b["ask_coming"] - b["week_target_mt"]) < 1e-9
+    immediate = b["ask_call"] + b["ask_convert"] + b["ask_lift"]
+    assert abs(immediate - b["week_target_mt"]) < 1e-9
+    assert abs(b["ask_doors"] - b["week_target_mt"]) < 1e-9
+    assert b["ask_lapse"] == 0.0
+    pipe = b["billed_mt"] + b["due_unvisited_mt"] + b["drop_variance_mt"] + b["not_yet_due_mt"]
+    assert abs(pipe - b["pipeline_expected_mt"]) < 1e-9
     country = country_action_table(shops)
     assert country.iloc[0]["Unvisited"] == count_ask(1, 1.0)
     assert country.iloc[0]["Coming due"] == count_ask(1, 0.2)
     assert "Doors to visit" in country.columns
     assert "Billed (MT)" in country.columns
+    assert "Pipeline expected (MT)" in country.columns
     assert abs(float(country.iloc[0]["Billed (MT)"]) - 1.9) < 1e-9
     assert fmt_kg(67.665) == "67,665"
 

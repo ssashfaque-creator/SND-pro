@@ -796,8 +796,8 @@ def _page_this_week(data, period, mtd, ledger):
     st.title("This week")
     st.caption(
         f"**{mtd['label'] or period}** · Monday dispatch is the operating view. "
-        "Expected is still the last-three-closed-month run-rate — no day-of-month seasonality. "
-        "Rebuild scorecards after an Outlet Date Wise upload."
+        "Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8. "
+        "Official Expected on Gap cards is still last-3 / last-6 paced by the national day curve."
     )
     if mtd.get("open"):
         st.info(banner_text(ledger, period))
@@ -829,7 +829,7 @@ def _page_this_week(data, period, mtd, ledger):
     if pack.source == "monthly":
         st.caption("Daily billed days were not found — cycles fall back to monthly gaps. Upload Outlet Date Wise for exact days-between-bills.")
     else:
-        st.caption("Purchase cycle and leftover cover learned from billed days, shrunk shop → DSR → city.")
+        st.caption("90-day purchase cycle (API and expected drop). Ask is the expected drop when due; lapsed doors have Ask 0.")
 
     units = data.get("units", pd.DataFrame())
     visits = data.get("visits", pd.DataFrame())
@@ -914,23 +914,32 @@ def _page_this_week(data, period, mtd, ledger):
             )
         st.markdown("##### 1. Country this week")
         _strategy_table(pack.country, height=140)
+        st.markdown("##### Pipeline (management)")
+        st.caption("Billed + Due unvisited + Drop variance + Not yet due = Pipeline Expected.")
+        _strategy_table(pack.pipeline, height=220)
+        st.markdown("##### Sales head")
+        st.caption("Due shops, visit compliance, unvisited Ask, drop variance, lapsed count.")
+        _strategy_table(pack.sales_head, height=280)
         st.markdown("##### 2. Push these distributors")
-        st.caption("Ranked by rest-of-month ask KG. Doors = due now. Coming due = cycle lands before month-end. Ask is those drops, not the whole Expected hole.")
+        st.caption("Ranked by immediate Ask. Doors = due now. Not yet due is pipeline, not Ask.")
         _strategy_table(pack.distributors, height=320)
         st.markdown("##### 3. Push these DSRs")
         st.caption("One national list. A DSR can appear even if its distributor is not above.")
         _strategy_table(pack.dsrs, height=320)
-        st.markdown("##### 4. Due — cycle elapsed, not visited")
-        st.caption("Usually buys every N days; it has been N days with no bill. Nobody visited this month.")
+        st.markdown("##### Beat — today")
+        st.caption("Shop, area, last purchased, days overdue, target drop, recommended action.")
+        _strategy_table(pack.beat, height=360)
+        st.markdown("##### 4. Due — ratio ≥ 0.8, not visited")
+        st.caption("Usually buys every N days; it has been N days with no bill. Nobody visited this month. Ask is the 90-day expected drop.")
         _strategy_table(pack.calls, height=420)
         st.markdown("##### 5. Due · visited — called, still no bill")
         _strategy_table(pack.converts, height=280)
-        st.markdown("##### 6. Another visit — bought too little this month")
-        st.caption("Billed once (or a stub) and still short of Expected. Cycle says they should have bought again.")
+        st.markdown("##### 6. Another visit — billed and already due again")
+        st.caption("Billed this month and depletion ratio is already ≥ 0.8.")
         _strategy_table(pack.lifts, height=280)
-        st.markdown("##### 7. Lapsing — quiet too long or declining")
-        st.caption("Two cycles with no bill, or last-three months down versus the three before. Unvisited doors rank first.")
-        _strategy_table(pack.lapses, height=280)
+        st.markdown("##### 7. Lost doors — lapsed (Ask 0)")
+        st.caption("Days since last purchase > 3× API. Recovery drive, not the daily beat.")
+        _strategy_table(pack.lost_doors if pack.lost_doors is not None and not pack.lost_doors.empty else pack.lapses, height=280)
         st.markdown("##### 8. Backtest")
         st.caption("At day 15 of closed months: did shops marked due actually bill in the next 14 days?")
         _strategy_table(pack.backtest, height=160)
@@ -1302,7 +1311,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.6.3, curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.6.4, curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"

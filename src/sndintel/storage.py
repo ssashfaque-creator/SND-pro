@@ -628,9 +628,21 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("last_month_mt", "REAL"),
             ("next_drop_mt", "REAL"),
             ("next_drop_model", "TEXT"),
-            ("coming_due", "INTEGER"),
-            ("days_until_due", "REAL"),
-            ("n_orders_left", "REAL"),
+        ("coming_due", "INTEGER"),
+        ("days_until_due", "REAL"),
+        ("n_orders_left", "REAL"),
+        ("expected_drop_mt", "REAL"),
+        ("api_days", "REAL"),
+        ("depletion_ratio", "REAL"),
+        ("n_purchases_90d", "INTEGER"),
+        ("n_purchases_ever", "INTEGER"),
+        ("is_cold_start", "INTEGER"),
+        ("is_lapsed", "INTEGER"),
+        ("due_unvisited_mt", "REAL"),
+        ("drop_variance_mt", "REAL"),
+        ("not_yet_due_mt", "REAL"),
+        ("pipeline_expected_mt", "REAL"),
+        ("recommended_action", "TEXT"),
         ):
             _ensure_column(conn, "action_shops", col, ddl)
         _ensure_column(conn, "action_units", "n_lapse", "INTEGER")
@@ -641,10 +653,27 @@ def init_db(path: Optional[Path] = None) -> Path:
         _ensure_column(conn, "action_units", "label", "TEXT")
         _ensure_column(conn, "action_units", "span_unique", "REAL")
         _ensure_column(conn, "action_units", "day_cap", "INTEGER")
+        for col, ddl in (
+            ("due_unvisited_mt", "REAL"),
+            ("drop_variance_mt", "REAL"),
+            ("not_yet_due_mt", "REAL"),
+            ("pipeline_expected_mt", "REAL"),
+            ("n_due", "INTEGER"),
+            ("n_universe", "INTEGER"),
+            ("n_due_visited", "INTEGER"),
+        ):
+            _ensure_column(conn, "action_units", col, ddl)
         _ensure_column(conn, "action_brief", "n_lapse", "INTEGER")
         _ensure_column(conn, "action_brief", "n_doors", "INTEGER")
         _ensure_column(conn, "action_brief", "n_coming", "INTEGER")
         _ensure_column(conn, "action_brief", "ams_3m", "REAL")
+        for col, ddl in (
+            ("pipeline_expected_mt", "REAL"),
+            ("due_unvisited_mt", "REAL"),
+            ("drop_variance_mt", "REAL"),
+            ("not_yet_due_mt", "REAL"),
+        ):
+            _ensure_column(conn, "action_brief", col, ddl)
     return db_path
 
 
