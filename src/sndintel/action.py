@@ -653,10 +653,11 @@ def _instruction(row: Any) -> str:
             f"Usual drop {_kg_text(drop)} every {cycle_s}; last drop {_kg_text(last_drop)} {since_s} ago."
         )
     if action == ACTION_RECOVER:
-        return (
-            f"Lapsed — lost door: {name} has been quiet {since_s} "
-            f"(cut-off is {int(LAPSE_MULTIPLIER)}× the {cycle_s} cycle). Ask is 0.{last_bit}"
-        )
+        if pd.notna(cycle):
+            cut = f"(cut-off is {int(LAPSE_MULTIPLIER)}× the {cycle_s} cycle)"
+        else:
+            cut = "(no purchase in the last 90 days)"
+        return f"Lapsed — lost door: {name} has been quiet {since_s} {cut}. Ask is 0.{last_bit}"
     coming = bool(getattr(row, "coming_due", False))
     until = getattr(row, "days_until_due", None)
     if coming and action == ACTION_HOLD:
