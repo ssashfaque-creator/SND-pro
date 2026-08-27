@@ -49,7 +49,7 @@ def apply_zip_cmd(
         console.print(
             "No ZIP given and none named SND-pro*.zip in Downloads.\n"
             "In GitHub (logged in): Code → Download ZIP, then:\n"
-            "  snd-intel apply-zip ~/Downloads/SND-pro-cursor-actionable-ops-layer-2f34.zip"
+            "  snd-intel apply-zip ~/Downloads/SND-pro-cursor-demand-driven-ask-7a79.zip"
         )
         raise typer.Exit(1)
     result = apply_code_zip(archive, dest)

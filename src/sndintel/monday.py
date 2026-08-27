@@ -29,10 +29,10 @@ HIGHLIGHT_STORE_N = 30
 WHO_TO_PUSH_N = 15
 
 SUMMARY_NOTE = (
-    "Unvisited + Due visited + Another visit + Lapsing + Coming due = Ask rest of month. "
-    "Doors to visit is today's list (the first four), not a sixth slice of Ask. "
-    "Ask is typical/next drop × orders that still fit before month-end, capped at remaining-to-Expected; "
-    "loaded cover past month-end is 0."
+    "Pipeline Expected = Billed + Due unvisited + Drop variance + Not yet due. "
+    "Immediate Ask is the 90-day expected drop for shops whose depletion ratio is ≥ 0.8 "
+    "and who are not lapsed (DSLP > 3× API). Not yet due is pipeline, not today's Ask. "
+    "Scorecard Expected (last-3 / last-6 + national day curve) is unchanged."
 )
 
 
@@ -80,21 +80,23 @@ def present_action_row(name: str, name_label: str, buckets: dict[str, float], ex
     unvis = round(float(buckets.get("ask_call") or 0), 1)
     due_v = round(float(buckets.get("ask_convert") or 0), 1)
     again = round(float(buckets.get("ask_lift") or 0), 1)
-    lapse = round(float(buckets.get("ask_lapse") or 0), 1)
-    coming = round(float(buckets.get("ask_coming") or 0), 1)
-    doors_mt = round(unvis + due_v + again + lapse, 1)
-    ask_mt = round(unvis + due_v + again + lapse + coming, 1)
+    coming = round(float(buckets.get("not_yet_due_mt") or buckets.get("ask_coming") or 0), 1)
+    doors_mt = round(unvis + due_v + again, 1)
+    ask_mt = round(float(buckets.get("week_target_mt") or (unvis + due_v + again)), 1)
     row = {
         name_label: name,
         "Expected this month (MT)": round(float(buckets.get("expected_mt") or 0), 1),
+        "Pipeline expected (MT)": round(float(buckets.get("pipeline_expected_mt") or 0), 1),
         "AMS (MT)": round(float(buckets.get("ams_3m") or 0), 1),
         "Billed (MT)": round(float(buckets.get("billed_mt") or 0), 1),
         "Ask rest of month (MT)": ask_mt,
+        "Not yet due (MT)": round(float(buckets.get("not_yet_due_mt") or 0), 1),
+        "Volume lost to variance (MT)": round(float(buckets.get("drop_variance_mt") or 0), 1),
         "Doors to visit": count_ask(buckets.get("n_doors"), doors_mt),
         "Unvisited": count_ask(buckets.get("n_call"), unvis),
         "Due visited": count_ask(buckets.get("n_convert"), due_v),
         "Another visit": count_ask(buckets.get("n_lift"), again),
-        "Lapsing": count_ask(buckets.get("n_lapse"), lapse),
+        "Lapsing": count_ask(buckets.get("n_lapse"), 0.0),
         "Coming due": count_ask(buckets.get("n_coming"), coming),
     }
     if extra:
@@ -118,7 +120,7 @@ def city_action_table(shops: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for city, g in shops.groupby(shops["city"].astype(str)):
         b = action_buckets(g)
-        if b["week_target_mt"] <= 0 and b["n_doors"] <= 0:
+        if b["week_target_mt"] <= 0 and b["n_doors"] <= 0 and float(b.get("not_yet_due_mt") or 0) <= 0 and int(b.get("n_lapse") or 0) <= 0:
             continue
         rows.append(present_action_row(str(city), "City", b))
     if not rows:
@@ -133,7 +135,7 @@ def distributor_action_table(shops: pd.DataFrame, n: int | None = None) -> pd.Da
     rows = []
     for dist, g in shops.groupby(shops["distributor"].astype(str)):
         b = action_buckets(g)
-        if b["week_target_mt"] <= 0 and b["n_doors"] <= 0:
+        if b["week_target_mt"] <= 0 and b["n_doors"] <= 0 and float(b.get("not_yet_due_mt") or 0) <= 0 and int(b.get("n_lapse") or 0) <= 0:
             continue
         city = ""
         if "city" in g.columns and not g["city"].mode().empty:
@@ -339,7 +341,7 @@ def operating_shops(shops: pd.DataFrame) -> pd.DataFrame:
     if shops is None or shops.empty:
         return shops if shops is not None else pd.DataFrame()
     ask = pd.to_numeric(shops.get("week_target_mt"), errors="coerce").fillna(0)
-    work = shops["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT, ACTION_RECOVER}) if "action" in shops.columns else False
+    work = shops["action"].isin({ACTION_CALL, ACTION_CONVERT, ACTION_LIFT}) if "action" in shops.columns else False
     coming = shops["coming_due"].fillna(False) if "coming_due" in shops.columns else False
     ams = pd.to_numeric(shops.get("ams_3m"), errors="coerce").fillna(0) if "ams_3m" in shops.columns else 1.0
     return shops.loc[(ask > 0.0005) | ((work | coming) & (ams > 1e-9))].copy()

@@ -49,7 +49,7 @@ def test_mac_update_commands_use_curl_and_keep_venv():
     text = mac_update_commands()
     assert "curl -L --fail" in text
     assert zip_url() in text
-    assert "cursor/actionable-ops-layer-2f34.zip" in text
+    assert "cursor/demand-driven-ask-7a79.zip" in text
     assert "source .venv/bin/activate && pip install -e . && snd-intel app" in text
     assert 'exclude \'.venv\'' in text
     assert "Downloads" not in text

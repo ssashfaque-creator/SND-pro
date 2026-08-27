@@ -17,43 +17,51 @@ from sndintel.briefing import NAVY, SLATE, _excel_value, _sheet_table
 GLOSSARY = [
     (
         "Expected this month",
-        "Same full-month recipe as the scorecard: last three closed calendar months blended with the last-six-month median. The scorecard paces that run-rate by the national billed-by-day curve when the month is open; this pack still uses the full-month number so remaining-to-Expected is what the door still owes.",
+        "Official scorecard Expected: last three closed calendar months blended with the last-six-month median, paced by the national billed-by-day curve when the month is open. Not used to size Ask.",
     ),
     (
-        "Usual cycle / typical drop",
-        "Median days between billed days and median billed-day volume, shrunk shop → DSR → city so a thin history borrows the beat. Store Y that bills every 15 days is due when it has been ~15 days with no bill. Typical drop is that median invoice — not the next order.",
+        "Pipeline expected",
+        "Demand-driven identity: Billed + Due unvisited + Drop variance + Not yet due. This is the shop-cycle pipeline, not last-year seasonality and not the XGBoost shop-month forecast.",
     ),
     (
-        "Cover left",
-        "Last drop ÷ daily run-rate, minus days since that bill. If last month was ≥1.6× AMS (two months of stock), leftover cover uses last-month volume instead — that door is less likely to buy now.",
+        "API / usual cycle / expected drop",
+        "Rolling 90-day window. API is the median days between purchases. Expected drop is the median invoice (mean when the shop only has 1-2 purchases). A first bill uses a 14-day default API until a second invoice exists. No city shrink — cold start is 0, not a borrowed parent drop.",
+    ),
+    (
+        "Depletion ratio",
+        "Days since last purchase divided by API. Ratio < 0.8 means not due, Ask = 0. Ratio >= 0.8 means due, Ask = expected drop.",
+    ),
+    (
+        "Immediate Ask",
+        "Expected drop for due (ratio >= 0.8) shops that are not lapsed. Not remaining-to-Expected, not next-drop ML. Printed as Ask rest of month for continuity.",
+    ),
+    (
+        "Due unvisited",
+        "Volume from shops that are due and the DSR has not visited yet. Immediate coverage risk.",
+    ),
+    (
+        "Drop variance / volume lost to variance",
+        "For shops that were due and visited (or billed): max(expected drop - billed, 0). Under-buying after a call, not a coverage miss.",
+    ),
+    (
+        "Not yet due",
+        "Active shops still inside the cycle (ratio < 0.8) whose API says they will cross 0.8 before month-end. Pipeline, not today's beat.",
+    ),
+    (
+        "Lapsed / lost doors",
+        "Days since last purchase > 3 x API, or no purchase in the last 90 days despite older history. Ask is reset to 0. They leave the daily beat and sit on Lost doors.",
     ),
     (
         "AMS",
-        "Average of the three closed calendar months before this period (May + June + July when scoring August). Full-month run-rate, in KG. On every table so you can see the book next to the ask.",
+        "Average of the three closed calendar months before this period (May + June + July when scoring August). Full-month run-rate. Not Ask.",
     ),
     (
-        "Still to Expected",
-        "max(0, Expected − billed). What the door still owes the month, in KG.",
-    ),
-    (
-        "Next order",
-        "Predicted size of the next bill from a gradient-boosted model on every historical next-bill (XGBoost; HistGradientBoosting if XGBoost is missing). Features are last / prior drops, how fat the last drop was versus the shop’s own median and AMS, days overdue, leftover cover, MTD billed, and remaining-to-AMS. A fat last drop pulls the next order down; a thin last drop or a long quiet stretch pulls it up. Thin history falls back to the hierarchical median drop.",
-    ),
-    (
-        "Ask rest of month",
-        "Predicted next order × how many of those orders can still land before month-end, capped at remaining-to-Expected. Not the median invoice, and not the whole hole. Includes doors that are due now and doors that come due before month-end. Zero when leftover cover lasts past month-end, or the door already hit Expected. Printed in KG.",
-    ),
-    (
-        "Coming due",
-        "Doors that are not due today but whose cycle or leftover cover runs out before month-end. They are most of a late-month country hole. Doors is today's work list only (Due / Due visited / Another visit / Lapsing).",
-    ),
-    (
-        "Due / Due · visited / Another visit / Lapsing / Hold",
-        "Due = cycle has elapsed, cover is gone, nobody visited. Due · visited = same, but the beat already called and still no bill. Another visit = billed this month but too little, and the cycle says they should have bought again (not a drop from yesterday). Lapsing = two cycles with no bill this month, or declining last-3 vs prior-3 and unbilled this cycle. Hold = leftover cover — do not pull the beat.",
+        "Due / Due visited / Another visit / Hold",
+        "Due = ratio >= 0.8, unvisited, not lapsed. Due visited = same clock, already called, still no bill. Another visit = billed this month and already due again. Hold = ratio < 0.8.",
     ),
     (
         "Backtest",
-        "At day 15 of each closed month, mark shops whose cycle has elapsed and who no longer have cover. Precision is the share that billed in the next 14 days versus picking that many shops at random. Loaded hold = last month ≥1.6× AMS; quiet means they stayed below 0.25 MT for the rest of the month.",
+        "At day 15 of each closed month, mark shops whose depletion ratio is >= 0.8. Precision is the share that billed in the next 14 days versus picking that many shops at random.",
     ),
 ]
 
@@ -62,19 +70,20 @@ def how_to_read(pack: ActionPack, detailed: bool = False) -> list[str]:
     day = f"Day {pack.as_of_day} of {pack.days_in_month}" if pack.as_of_day else pack.period
     if detailed:
         return [
-            f"{day}. Full lists — every AMS > 0 distributor, DSR, and shop the engine scored.",
-            "Distributors ranked by rest-of-month ask KG (not Gap tons).",
-            "DSRs ranked the same way.",
-            "Every shop with an action. Do this names the door and why it is due, light, lapsing, or hold.",
+            f"{day}. Full lists — pipeline, sales-head, beat, and lost doors.",
+            "Pipeline Expected = Billed + Due unvisited + Drop variance + Not yet due.",
+            "Immediate Ask is the 90-day expected drop when depletion ratio ≥ 0.8, not remaining-to-Expected.",
+            "Lapsed doors (DSLP > 3× API) have Ask 0 and sit on Lost doors, not the beat.",
         ]
     return [
-        f"{day}. Country: billed vs Expected is the hole (Still to Expected). Ask rest of month is drops that can still land — including Coming due, not only today's call list.",
-        "One distributor push list — doors to work now, how many come due before month-end, and closable KG.",
+        f"{day}. Pipeline Expected = billed + due unvisited + drop variance + not yet due.",
+        "Immediate Ask is due shops' expected drop. Not yet due is future pipeline, not today's call list.",
+        "One distributor push list — due doors now, unvisited Ask, variance, lapsed count.",
         "One DSR push list — ride-with names, not nested under the distributors.",
-        "Due — cycle elapsed, no leftover cover, not visited this month.",
+        "Due — depletion ratio ≥ 0.8, not visited this month.",
         "Due · visited — same clock, already called, still no bill.",
-        "Another visit — bought too little this month and the cycle says they should have bought again.",
-        "Lapsing — long gap or declining volume. Unvisited overdue doors rank first.",
+        "Another visit — billed this month and already due again.",
+        "Lost doors — quieter than 3× API. Ask is 0.",
         "Backtest — whether 'due' shops actually billed in the next 14 days on closed months.",
     ]
 
@@ -112,6 +121,30 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
                 "Walk-forward cut at day 15 of closed months.",
                 pack.backtest,
             ),
+            (
+                "06 Pipeline",
+                "City pipeline (management)",
+                "Billed + Due unvisited + Drop variance + Not yet due = Pipeline Expected.",
+                pack.pipeline,
+            ),
+            (
+                "07 Sales head",
+                "Distributor / DSR execution",
+                "Due shops, visit compliance, unvisited Ask, drop variance, lapsed count.",
+                pack.sales_head,
+            ),
+            (
+                "08 Beat",
+                "Today's reorder list",
+                "Due shops only. Target drop is the 90-day expected drop.",
+                pack.beat,
+            ),
+            (
+                "09 Lost doors",
+                "Lapsed shops",
+                "DSLP > 3× API. Ask is 0. Recovery drive, not the daily beat.",
+                pack.lost_doors,
+            ),
         ]
     return [
         (
@@ -135,7 +168,7 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
         (
             "04 Due",
             "Due and unvisited",
-            "Usual cycle has elapsed, leftover cover is gone, nobody visited this month. Ask rest of month is the typical drop (or two if another cycle still fits).",
+            "Depletion ratio ≥ 0.8, not lapsed, nobody visited this month. Ask is the 90-day expected drop.",
             pack.calls,
         ),
         (
@@ -146,14 +179,14 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
         ),
         (
             "06 Another visit",
-            "Bought too little this month",
-            "Billed once (or a stub) and still short of Expected. Cycle says they should have bought again.",
+            "Due again after billing",
+            "Billed this month and depletion ratio is already ≥ 0.8. Ask is another expected drop.",
             pack.lifts,
         ),
         (
             "07 Lapsing",
-            "Quiet too long or declining",
-            "Two cycles with no bill, or last-three months down ≥25% versus the three before and unbilled this cycle.",
+            "Lost doors — quieter than 3× API",
+            "Days since last purchase > 3 × API, or nothing in the last 90 days. Ask is 0. Recovery drive, not the daily beat.",
             pack.lapses,
         ),
         (
@@ -161,6 +194,24 @@ def iter_action_sheets(pack: ActionPack, detailed: bool = False) -> list[tuple[s
             "Did due shops bill in the next 14 days?",
             "If daily history is thin this sheet stays empty. Rebuild after Outlet Date Wise is in the warehouse.",
             pack.backtest,
+        ),
+        (
+            "09 Pipeline",
+            "City pipeline (management)",
+            "Billed + Due unvisited + Drop variance + Not yet due = Pipeline Expected. Scorecard Expected stays on Gap cards.",
+            pack.pipeline,
+        ),
+        (
+            "10 Sales head",
+            "Distributor / DSR execution",
+            "Active universe, shops due, due visited %, unvisited due Ask, drop variance, lapsed count.",
+            pack.sales_head,
+        ),
+        (
+            "11 Beat",
+            "Today's reorder list",
+            "Shop, area, last purchased, days overdue, target drop, recommended action.",
+            pack.beat,
         ),
     ]
 

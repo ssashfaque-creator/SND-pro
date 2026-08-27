@@ -6,7 +6,7 @@
 set -euo pipefail
 APP_DIR="${SNDINTEL_APP_DIR:-$HOME/sndintel}"
 REPO="${SNDINTEL_GITHUB_REPO:-ssashfaque-creator/SND-pro}"
-BRANCH="${SNDINTEL_APP_BRANCH:-cursor/actionable-ops-layer-2f34}"
+BRANCH="${SNDINTEL_APP_BRANCH:-cursor/demand-driven-ask-7a79}"
 ZIP_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH}.zip"
 
 if [ ! -d "${APP_DIR}" ]; then
