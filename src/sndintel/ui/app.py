@@ -37,6 +37,7 @@ from sndintel.situation_report import (
     pdf_bytes as situation_pdf_bytes,
     scorecards_for_period,
     zip_field_packs,
+    _gap_sentence,
 )
 from sndintel import __version__
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
@@ -775,7 +776,7 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
     cfg = {}
     for col in df.columns:
         name = str(col)
-        if name in {"Remarks", "Do this", "Do this week", "Step"}:
+        if name in {"Remarks", "Do this", "Do this week", "Step", "Comment"}:
             cfg[col] = st.column_config.TextColumn(name, width="large")
         elif name == "Drop size (MT)":
             cfg[col] = st.column_config.NumberColumn(name, format="%.2f")
@@ -1172,19 +1173,19 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
         cols = st.columns(6 if has_plan else 4)
         cols[0].metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.0f}")
         cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_full_mt') or kpis.get('expected_mt') or 0):.0f}")
+        cols[2].metric("Gap vs Expected (MT)", f"{float(kpis.get('gap_mt') or 0):.0f}")
         if has_plan:
             attain = kpis.get("attain_pct")
-            cols[2].metric(
+            cols[3].metric(
                 "Monthly target (MT)",
                 f"{float(kpis.get('target_mt') or 0):.0f}",
                 delta=None if attain is None else f"{float(attain)*100:.0f}% of target",
             )
-            cols[3].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.0f}")
-            cols[4].metric("Situation", str(kpis.get("situation_label") or "—"))
-            cols[5].metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
+            cols[4].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.0f}")
+            cols[5].metric("Situation", str(kpis.get("situation_label") or "—"))
         else:
-            cols[2].metric("Situation", str(kpis.get("situation_label") or "—"))
-            cols[3].metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
+            cols[3].metric("Situation", str(kpis.get("situation_label") or "—"))
+    st.caption(_gap_sentence(kpis, pack.scope_label or "Country"))
 
     st.markdown("##### Current situation")
     for para in pack.situation:
@@ -1198,22 +1199,22 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
         for line in pack.copy_from:
             st.caption(line)
 
-    st.markdown("##### Next actions")
+    st.markdown("##### Next actions" if open_mtd else "##### Results and next month")
     _strategy_table(pack.steps, height=220)
+
+    if pack.gap_breakdown is not None and not pack.gap_breakdown.empty:
+        st.markdown("##### City gap breakdown" if kind == "national" else "##### Distributor gap breakdown")
+        _strategy_table(pack.gap_breakdown, height=320)
 
     if kind == "national":
         left, right = st.columns(2)
         with left:
-            st.markdown("##### Cities lagging")
-            _strategy_table(pack.lagging_cities, height=240)
             st.markdown("##### Distributors lagging")
             _strategy_table(pack.lagging_distributors, height=220)
         with right:
-            st.markdown("##### Cities ahead")
-            _strategy_table(pack.ahead_cities, height=240)
             st.markdown("##### Distributors ahead")
             _strategy_table(pack.ahead_distributors, height=220)
-    else:
+    elif kind == "city" and (pack.gap_breakdown is None or pack.gap_breakdown.empty):
         st.markdown("##### Distributors lagging")
         _strategy_table(pack.lagging_distributors, height=220)
         st.markdown("##### Distributors ahead")
@@ -1247,7 +1248,13 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
         mime=mime,
         type="primary",
     )
-    st.caption("Situation PDF starts with billed, projected month-end, and the monthly target — not the glossary.")
+    if open_mtd:
+        st.caption("Situation PDF starts with billed, projected month-end, and the monthly target — not the glossary.")
+    else:
+        st.caption(
+            "Closed-month PDF starts with billed, Expected, and Gap versus Expected "
+            "(split into light orders / unbilled / unvisited) — not the glossary."
+        )
 
     z1, z2 = st.columns(2)
     with z1:
@@ -1648,7 +1655,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.9.0, curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.9.1 (not 0.9.2), curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"

@@ -322,7 +322,7 @@ def test_do_this_is_short_and_plain():
     assert "velocity" not in joined.lower()
     assert "depletion clock" not in joined.lower()
     for text in blobs:
-        assert len(text) < 220
+        assert len(text) < 320
 
 
 def test_weak_areas_are_gone():
@@ -347,3 +347,135 @@ def test_closed_month_cut_has_no_projection():
     assert pack.lagging_cities.empty or "Projected month-end (MT)" not in pack.lagging_cities.columns
     assert abs(pack.kpis["projected_mt"] - pack.kpis["billed_mt"]) < 0.05
     assert pack.this_week is None or pack.this_week.empty
+
+
+def _pack_blob(pack) -> str:
+    bits = [pack.label, pack.weather, pack.headline]
+    bits.extend(pack.situation or [])
+    bits.extend(pack.plan_lines or [])
+    for df in (
+        pack.steps,
+        pack.gap_breakdown,
+        pack.lagging_cities,
+        pack.ahead_cities,
+        pack.lagging_distributors,
+        pack.ahead_distributors,
+    ):
+        if df is None or df.empty:
+            continue
+        for col in ("Do this", "Comment", "Driver", "Plan", "Step"):
+            if col in df.columns:
+                bits.extend(str(x) for x in df[col].tolist())
+    return " ".join(bits)
+
+
+def test_closed_month_comments_are_results_not_a_tracker():
+    sm, hier = _world()
+    pack = build_situation_pack(hier.units, period="2026-08")
+    assert pack.kpis["open_mtd"] is False
+    blob = _pack_blob(pack)
+    assert "at this pace" not in blob.lower()
+    assert "on track" not in blob.lower()
+    assert "mixed" not in blob.lower()
+    assert "Gap versus Expected" in blob
+    for df in (pack.gap_breakdown, pack.lagging_cities, pack.lagging_distributors, pack.steps):
+        if df is None or df.empty:
+            continue
+        for col in ("Do this", "Comment"):
+            if col not in df.columns:
+                continue
+            for text in df[col].astype(str):
+                low = text.lower()
+                assert "this week" not in low
+                assert "at this pace" not in low
+                assert "mixed" not in low
+
+
+def test_city_gap_breakdown_has_target_expected_billed_and_split():
+    sm, hier = _world()
+    pack = build_situation_pack(hier.units, period="2026-08")
+    gb = pack.gap_breakdown
+    assert not gb.empty
+    for col in (
+        "City",
+        "Target (MT)",
+        "Expected (MT)",
+        "Billed (MT)",
+        "Gap (MT)",
+        "vs Target (MT)",
+        "Light orders (MT)",
+        "Unbilled (MT)",
+        "Unvisited (MT)",
+        "Comment",
+    ):
+        assert col in gb.columns
+    assert gb.iloc[0]["City"] == "Karachi"
+    karachi = gb[gb["City"].astype(str) == "Karachi"].iloc[0]
+    assert float(karachi["Gap (MT)"]) > 0
+    split = float(karachi["Light orders (MT)"] or 0) + float(karachi["Unbilled (MT)"] or 0) + float(karachi["Unvisited (MT)"] or 0)
+    assert split > 0
+    comment = str(karachi["Comment"])
+    assert "Missed Expected" in comment
+    assert "next month" in comment.lower()
+    assert "Amir" in comment or "Karachi Weak" in comment
+
+
+def test_national_cover_explains_gap_split():
+    sm, units, ledger, _pace = _mtd_world()
+    closed_units = scorecards_for_period(sm, _stores(sm.to_dict("records")), ledger, "2026-08")
+    targets = pd.DataFrame(
+        [
+            {
+                "store_id": "K1",
+                "store_name": "Kifaya",
+                "city": "Karachi",
+                "distributor": "Eva Foods",
+                "dsr_name": "Amir",
+                "section": "Clifton",
+                "target_mt": 50.0,
+                "match_method": "id",
+            },
+            {
+                "store_id": "K2",
+                "store_name": "Quiet K",
+                "city": "Karachi",
+                "distributor": "South Dist",
+                "dsr_name": "Karachi Weak",
+                "section": "Korangi",
+                "target_mt": 40.0,
+                "match_method": "id",
+            },
+            {
+                "store_id": "L1",
+                "store_name": "Big L",
+                "city": "Lahore",
+                "distributor": "Holding Dist",
+                "dsr_name": "Lahore Ace",
+                "section": "Gulberg",
+                "target_mt": 55.0,
+                "match_method": "id",
+            },
+            {
+                "store_id": "L2",
+                "store_name": "Steady L",
+                "city": "Lahore",
+                "distributor": "North Dist",
+                "dsr_name": "Lahore Steady",
+                "section": "Model Town",
+                "target_mt": 25.0,
+                "match_method": "id",
+            },
+        ]
+    )
+    closed_units = attach_plan(closed_units, targets, pace=1.0)
+    pack = build_situation_pack(closed_units, ledger=ledger, period="2026-08")
+    blob = " ".join([pack.headline, pack.weather] + list(pack.situation) + list(pack.plan_lines))
+    assert "Gap versus Expected" in blob or "met Expected" in blob
+    assert "Missed quota" in blob or "missed the monthly target" in blob.lower()
+    assert "stretch" in blob.lower()
+    gb = pack.gap_breakdown
+    assert not gb.empty
+    assert "Target (MT)" in gb.columns
+    assert gb["Target (MT)"].notna().any()
+    sheets = [name for name, _h, _n, _df in iter_situation_sheets(pack)]
+    assert any("city gap" in s.lower() for s in sheets)
