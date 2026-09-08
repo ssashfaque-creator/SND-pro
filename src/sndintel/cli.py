@@ -70,6 +70,7 @@ def ingest(
     shops: Optional[Path] = typer.Option(None, "--shops", exists=True, help="Legacy shop master (zone / historical map)"),
     universe: Optional[Path] = typer.Option(None, "--universe", exists=True, help="Live universe shop list"),
     visits: Optional[Path] = typer.Option(None, "--visits", exists=True, help="Shop visit calls (MTD)"),
+    targets: Optional[Path] = typer.Option(None, "--targets", exists=True, help="Shop-wise sales-team targets (quota / plan)"),
     replace_sales: bool = typer.Option(
         False,
         "--replace-sales",
@@ -77,13 +78,14 @@ def ingest(
     ),
 ):
     """Clean a sales export, merge the live universe and visits, and write insights."""
-    if not sales and universe is None and visits is None and shops is None:
-        raise typer.BadParameter("Pass one or more sales files and/or --universe / --visits / --shops.")
+    if not sales and universe is None and visits is None and shops is None and targets is None:
+        raise typer.BadParameter("Pass one or more sales files and/or --universe / --visits / --shops / --targets.")
     result = run_pipeline(
         sales_paths=sales,
         shop_path=shops,
         universe_path=universe,
         visits_path=visits,
+        targets_path=targets,
         replace_sales=replace_sales,
     )
     console.print_json(data=result)

@@ -79,6 +79,14 @@ GLOSSARY = [
         "Steps to potential",
         "Ranked by volume at stake. This week’s Ask (due unvisited doors) is the closable slice; drop-size and conversion close the rest of Gap.",
     ),
+    (
+        "Target / plan",
+        "Shop-wise quota from the sales team. Not Expected. Expected is the statistical run-rate (last-3 / last-6, paced). Target is the plan. Stretch = plan − Expected. Missing stretch is not a coverage miss.",
+    ),
+    (
+        "vs Target / attainment",
+        "Billed minus paced Target (open MTD uses the same national day curve as Expected). Attainment is billed ÷ paced Target. A unit can beat Expected and still miss the plan.",
+    ),
 ]
 
 
@@ -252,28 +260,36 @@ def zip_field_packs(packs: list[tuple[str, SituationPack]], fmt: str = "pdf") ->
 
 def how_to_read(pack: SituationPack) -> list[str]:
     scope = (pack.scope or "national").lower()
+    kpis = pack.kpis or {}
     if scope == "city":
-        return [
+        lines = [
             f"{pack.scope_label} versus its own Expected. Gap is the path to potential.",
             "Distributors in this city — lagging first, then who is ahead (copy, do not raid).",
             "Salespeople — capacity label says whether the miss is headcount, visits, conversion, or drop size.",
             "Weak sections / beats, then the this-week doors if Ask is on file.",
             "Steps are ranked by volume at stake. Do those five things; ignore the tail.",
         ]
-    if scope == "distributor":
-        return [
+    elif scope == "distributor":
+        lines = [
             f"{pack.scope_label} versus its own Expected.",
             "DSRs on this book — who is lagging, who is ahead.",
             "Weak areas and this-week doors on this distributor.",
             "Steps close this distributor’s Gap, not the country’s.",
         ]
-    return [
-        "Country versus Expected. Gap is national potential still on the table.",
-        "Cities lagging their own run-rate, then cities ahead (copy those beats).",
-        "Distributors the same way — volume holes and seriousness live in the detailed scorecard.",
-        "Salespeople with a capacity label: Overloaded / not visiting / not converting / not lifting drop.",
-        "Five steps to close the Gap, ranked by MT. Send the matching city or distributor pack to the field.",
-    ]
+    else:
+        lines = [
+            "Country versus Expected. Gap is national potential still on the table.",
+            "Cities lagging their own run-rate, then cities ahead (copy those beats).",
+            "Distributors the same way — volume holes and seriousness live in the detailed scorecard.",
+            "Salespeople with a capacity label: Overloaded / not visiting / not converting / not lifting drop.",
+            "Five steps to close the Gap, ranked by MT. Send the matching city or distributor pack to the field.",
+        ]
+    if float(kpis.get("target_mt") or 0) > 0:
+        lines.append(
+            "Target is the sales-team shop-wise plan, not Expected. "
+            "Attainment is billed versus that plan. Stretch above Expected is quota, not a coverage miss."
+        )
+    return lines
 
 
 def iter_situation_sheets(pack: SituationPack) -> list[tuple[str, str, str, pd.DataFrame]]:
@@ -570,7 +586,8 @@ def _mt(value: Any) -> Any:
 
 
 def _board(df: pd.DataFrame, grain: str, lagging: bool, n: int | None) -> pd.DataFrame:
-    cols = _board_columns(grain)
+    has_plan = _has_plan(df)
+    cols = _board_columns(grain, has_plan=has_plan)
     if df is None or df.empty:
         return pd.DataFrame(columns=cols)
     work = df.copy()
@@ -605,19 +622,29 @@ def _board(df: pd.DataFrame, grain: str, lagging: bool, n: int | None) -> pd.Dat
         rec["Driver"] = _driver_label(r.get("diagnosis"))
         rec["Visit %"] = _pct(r.get("visit_rate"))
         rec["Strike %"] = _pct(r.get("strike_rate"))
+        if has_plan:
+            rec["Target (MT)"] = _mt(r.get("target_paced_mt") if pd.notna(r.get("target_paced_mt")) else r.get("target_mt"))
+            rec["vs Target (MT)"] = _mt(r.get("vs_target_mt"))
+            rec["Plan"] = str(r.get("plan_status") or "").replace("_", " ")
         rec["Do this"] = _short_action(r.get("do_this_week") or r.get("verdict"))
         rows.append(rec)
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
-def _board_columns(grain: str) -> list[str]:
+def _has_plan(df: pd.DataFrame) -> bool:
+    if df is None or df.empty or "target_mt" not in df.columns:
+        return False
+    return float(pd.to_numeric(df["target_mt"], errors="coerce").fillna(0).sum()) > 0.05
+
+
+def _board_columns(grain: str, has_plan: bool = False) -> list[str]:
     if grain == "distributor":
         head = ["Distributor", "City"]
     elif grain == "section":
         head = ["Area", "City"]
     else:
         head = ["City"]
-    return head + [
+    mid = [
         "Situation",
         "Billed this period (MT)",
         "Expected this month (MT)",
@@ -625,11 +652,14 @@ def _board_columns(grain: str) -> list[str]:
         "Driver",
         "Visit %",
         "Strike %",
-        "Do this",
     ]
+    if has_plan:
+        mid += ["Target (MT)", "vs Target (MT)", "Plan"]
+    return head + mid + ["Do this"]
 
 
 def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int | None) -> pd.DataFrame:
+    has_plan = _has_plan(dsrs)
     cols = [
         "DSR",
         "City",
@@ -642,6 +672,8 @@ def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int |
         "Visit %",
         "Do this",
     ]
+    if has_plan:
+        cols = cols[:-1] + ["Target (MT)", "Plan", "Do this"]
     if dsrs is None or dsrs.empty:
         return pd.DataFrame(columns=cols)
     work = dsrs.copy()
@@ -689,6 +721,8 @@ def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int |
                 "Expected this month (MT)": _mt(r.get("expected_mt")),
                 "Gap (MT)": _mt(max(0.0, _num(r, "gap_mt"))),
                 "Visit %": _pct(r.get("visit_rate")),
+                "Target (MT)": _mt(r.get("target_paced_mt") if pd.notna(r.get("target_paced_mt")) else r.get("target_mt")),
+                "Plan": str(r.get("plan_status") or "").replace("_", " "),
                 "Do this": _short_action(action),
             }
         )
@@ -788,6 +822,8 @@ def _steps_to_potential(
     unbill = max(0.0, _num(focus, "from_unbilled_mt"))
     drop = max(0.0, _num(focus, "from_drop_size_mt"))
     gap = max(0.0, _num(focus, "gap_mt"))
+    stretch = max(0.0, _num(focus, "stretch_mt"))
+    gap_to_target = max(0.0, _num(focus, "gap_to_target_mt"))
     ask_mt, ask_n = _action_ask_mt(action, scope, city, distributor)
     owner = {"national": "NSM", "city": "City manager", "distributor": "Distributor / ASM"}.get(scope, "NSM")
     candidates: list[dict[str, Any]] = []
@@ -855,6 +891,18 @@ def _steps_to_potential(
                 "mt": people_gap,
                 "owner": owner,
                 "do": f"{why}. Start with {', '.join(names)}. Label on the People sheet is the coaching script.",
+            }
+        )
+    if stretch >= 0.5 and gap_to_target > gap + 0.25:
+        candidates.append(
+            {
+                "title": "Close stretch versus the sales-team plan",
+                "mt": stretch,
+                "owner": owner,
+                "do": (
+                    f"{stretch:.1f} MT of the plan sits above Expected. That is quota, not a coverage miss. "
+                    "Do not print a lost-shop list for stretch. Lift drop on billed doors and hit due Ask."
+                ),
             }
         )
     if gap >= 0.25 and not candidates:
@@ -930,6 +978,19 @@ def _kpis(
         "days_in_month": mtd.get("days_in_month"),
         "country_billed_mt": float(_num(nat.iloc[0], "volume_mt")) if nat is not None and not nat.empty else billed,
         "country_gap_mt": max(0.0, float(_num(nat.iloc[0], "gap_mt"))) if nat is not None and not nat.empty else gap,
+        "target_mt": (
+            (_num(focus, "target_paced_mt") or _num(focus, "target_mt"))
+            if focus is not None and not focus.empty
+            else 0.0
+        ),
+        "target_full_mt": _num(focus, "target_mt") if focus is not None and not focus.empty else 0.0,
+        "gap_to_target_mt": max(0.0, _num(focus, "gap_to_target_mt") if focus is not None and not focus.empty else 0.0),
+        "stretch_mt": max(0.0, _num(focus, "stretch_mt") if focus is not None and not focus.empty else 0.0),
+        "attain_pct": float(focus.get("attain_pct")) if focus is not None and not focus.empty and pd.notna(focus.get("attain_pct")) else None,
+        "plan_quality": str(focus.get("plan_quality") or "") if focus is not None and not focus.empty else "",
+        "plan_status": str(focus.get("plan_status") or "") if focus is not None and not focus.empty else "",
+        "n_target_unmatched": int(_num(focus, "n_target_unmatched")) if focus is not None and not focus.empty else 0,
+        "target_book_mt": _num(focus, "target_book_mt") if focus is not None and not focus.empty else 0.0,
     }
 
 
@@ -986,6 +1047,15 @@ def _narrative(
         f"{label}: {who} billed {billed:.0f} MT against {expected:.0f} Expected "
         f"({sit.lower()}, Gap {gap:.0f} MT).{mtd_bit}"
     )
+    target = float(kpis.get("target_mt") or 0)
+    if target > 0.05:
+        attain = kpis.get("attain_pct")
+        attain_txt = f"{float(attain)*100:.0f}%" if attain is not None else "—"
+        stretch = float(kpis.get("stretch_mt") or 0)
+        weather += (
+            f" Sales-team plan {target:.0f} MT ({attain_txt} attained). "
+            f"Stretch above Expected {stretch:.0f} MT."
+        )
     if sit == "Lagging":
         headline = f"{who} is behind Expected by {gap:.0f} MT."
     elif sit == "Ahead":
@@ -1040,6 +1110,17 @@ def _narrative(
         paras.append("Path to potential: " + "; ".join(titles) + ".")
     driver = str(kpis.get("driver") or "Mixed")
     paras.append(f"Main driver on this book: {driver}.")
+    target = float(kpis.get("target_mt") or 0)
+    if target > 0.05:
+        unmatched = int(kpis.get("n_target_unmatched") or 0)
+        quality = str(kpis.get("plan_quality") or "aligned")
+        status = str(kpis.get("plan_status") or "").replace("_", " ")
+        extra = f" {unmatched} target shops did not match the universe." if unmatched else ""
+        paras.append(
+            f"Plan quality is {quality} ({status or 'on file'}). "
+            "Expected is still the run-rate; the plan is the quota."
+            + extra
+        )
     return headline, weather, paras
 
 
@@ -1094,6 +1175,7 @@ def _excel_cover(wb: Workbook, pack: SituationPack) -> None:
         ("Gap (MT)", kpis.get("gap_mt")),
         ("Situation", kpis.get("situation_label")),
         ("Driver", kpis.get("driver")),
+        ("Target (MT)", kpis.get("target_mt") if float(kpis.get("target_mt") or 0) > 0 else None),
         ("Lagging people", kpis.get("n_lagging_people")),
         ("Ahead people", kpis.get("n_ahead_people")),
     ]
@@ -1152,6 +1234,7 @@ TEXT_COLS = {
     "Situation",
     "Label",
     "Driver",
+    "Plan",
     "Call",
     "Do this",
     "Do this week",
@@ -1221,6 +1304,7 @@ def _cover_flowables(pack: SituationPack, styles: dict[str, ParagraphStyle]) -> 
         ("Billed", f"{float(kpis.get('billed_mt') or 0):.0f} MT"),
         ("Expected", f"{float(kpis.get('expected_mt') or 0):.0f} MT"),
         ("Gap to potential", f"{float(kpis.get('gap_mt') or 0):.0f} MT"),
+        ("Target / plan", f"{float(kpis.get('target_mt') or 0):.0f} MT" if float(kpis.get("target_mt") or 0) > 0 else "—"),
         ("Situation", str(kpis.get("situation_label") or "")),
         ("Driver", str(kpis.get("driver") or "")),
         ("Lagging people", str(kpis.get("n_lagging_people") or 0)),
@@ -1229,7 +1313,7 @@ def _cover_flowables(pack: SituationPack, styles: dict[str, ParagraphStyle]) -> 
         [Paragraph(xml_escape(n), styles["kpi_l"]) for n, _ in kpi_cells],
         [Paragraph(xml_escape(v), styles["kpi_v"]) for _, v in kpi_cells],
     ]
-    kpi_table = Table(kpi_data, colWidths=[45 * mm] * 6)
+    kpi_table = Table(kpi_data, colWidths=[270 * mm / max(len(kpi_cells), 1)] * len(kpi_cells))
     kpi_table.setStyle(
         TableStyle(
             [

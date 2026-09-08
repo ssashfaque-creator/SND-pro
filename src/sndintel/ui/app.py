@@ -185,6 +185,10 @@ def load_all():
             data["shop_day"] = read_sql(conn, "SELECT * FROM shop_day")
         except Exception:
             data["shop_day"] = pd.DataFrame()
+        try:
+            data["shop_targets"] = read_sql(conn, "SELECT * FROM shop_targets")
+        except Exception:
+            data["shop_targets"] = pd.DataFrame()
     return data
 
 
@@ -275,6 +279,7 @@ def _page_upload(empty: bool):
     last_uni = _last("universe")
     last_shop = _last_shop()
     last_vis = _last("visits")
+    last_tgt = _last("targets")
     has_stores = _warehouse_has_stores()
     c1, c2 = st.columns(2)
     with c1:
@@ -309,6 +314,14 @@ def _page_upload(empty: bool):
         )
         if last_vis and visits is None:
             st.caption(f"Last visit file: `{last_vis.name}` (re-upload each week)")
+        targets = st.file_uploader(
+            "Shop-wise targets (csv / xlsx) — sales-team quota / plan",
+            type=["xlsx", "xls", "xlsm", "csv"],
+            key="targets",
+            help="Region, area, distributor, DSR, shop name, target MT. Does not replace Expected. Matched to the universe by name.",
+        )
+        if last_tgt and targets is None:
+            st.caption(f"Plan on file: `{last_tgt.name}` (re-upload when quotas change)")
 
     st.markdown(
         "- **Universe** can stay in the warehouse. Re-upload only when shops/DSRs move.\n"
@@ -318,7 +331,10 @@ def _page_upload(empty: bool):
         "Do not tick replace-all for a weekly MTD refresh.\n"
         "- **Shop SKU Wise:** months in the file replace those months (August-only keeps July).\n"
         "- Every later week: **sales + visit calls**. Tick replace-all only to wipe billed history "
-        "(for example switching from Shop SKU Wise to Outlet Date Wise)."
+        "(for example switching from Shop SKU Wise to Outlet Date Wise).\n"
+        "- **Shop-wise targets** are the sales-team plan (quota), not Expected. Expected stays the "
+        "statistical run-rate. The situation pack then shows billed vs Expected vs plan, and whether "
+        "a miss is execution (behind run-rate) or stretch (behind quota)."
     )
     replace_sales = st.checkbox(
         "Replace all billed sales (keep universe and visits)",
@@ -409,7 +425,7 @@ def _page_upload(empty: bool):
             except Exception as exc:  # noqa: BLE001
                 st.exception(exc)
 
-    go = st.button("Score warehouse", type="primary", disabled=not sales_files and empty)
+    go = st.button("Score warehouse", type="primary", disabled=not sales_files and empty and targets is None)
     if not go:
         return
     universe_path = None
@@ -439,6 +455,10 @@ def _page_upload(empty: bool):
     if visits is not None:
         visits_path = _save_upload(visits, INCOMING_DIR / visits.name)
         _remember("visits", visits_path)
+    targets_path = None
+    if targets is not None:
+        targets_path = _save_upload(targets, MASTER_DIR / targets.name)
+        _remember("targets", targets_path)
     with st.spinner("Parsing files and rebuilding city → distributor → DSR → shop scorecards. Large files take a few minutes."):
         try:
             result = run_pipeline(
@@ -446,6 +466,7 @@ def _page_upload(empty: bool):
                 shop_path=shop_path,
                 universe_path=universe_path,
                 visits_path=visits_path,
+                targets_path=targets_path,
                 replace_sales=bool(replace_sales and sales_paths),
             )
         except Exception as exc:  # noqa: BLE001
@@ -463,7 +484,8 @@ def _page_upload(empty: bool):
         f"Scored {result.get('n_sales_rows')} fact rows · {result.get('n_sales_files') or 0} sales file(s) · "
         f"latest {result.get('latest_period')} · "
         f"{result.get('n_cities', 0)} cities · universe {result.get('n_universe') or '—'} · "
-        f"visits {result.get('n_visits') or '—'}. "
+        f"visits {result.get('n_visits') or '—'} · "
+        f"plan {result.get('n_plan_matched') or '—'} shops / {result.get('plan_matched_mt') or 0:.0f} MT matched. "
         f"{'Replaced all billed sales. ' if result.get('replace_sales') else overlay_note}"
         f"Months: {', '.join(result.get('replaced_periods') or []) or '—'}"
     )
@@ -1046,13 +1068,29 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
     kpis = pack.kpis or {}
     st.markdown(f"**{pack.headline}**")
     st.caption(pack.weather)
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    has_plan = float(kpis.get("target_mt") or 0) > 0.05
+    if has_plan:
+        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+    else:
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m7 = None
     m1.metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.0f}")
     m2.metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.0f}")
     m3.metric("Gap to potential (MT)", f"{float(kpis.get('gap_mt') or 0):.0f}")
-    m4.metric("Situation", str(kpis.get("situation_label") or "—"))
-    m5.metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
-    m6.metric("Ahead people", int(kpis.get("n_ahead_people") or 0))
+    if has_plan:
+        attain = kpis.get("attain_pct")
+        m4.metric(
+            "Plan (MT)",
+            f"{float(kpis.get('target_mt') or 0):.0f}",
+            delta=None if attain is None else f"{float(attain)*100:.0f}% attained",
+        )
+        m5.metric("Situation", str(kpis.get("situation_label") or "—"))
+        m6.metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
+        m7.metric("Ahead people", int(kpis.get("n_ahead_people") or 0))
+    else:
+        m4.metric("Situation", str(kpis.get("situation_label") or "—"))
+        m5.metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
+        m6.metric("Ahead people", int(kpis.get("n_ahead_people") or 0))
 
     st.markdown("##### Current situation")
     for para in pack.situation:
@@ -1482,6 +1520,19 @@ def _page_shops(data, period):
     options = (stores["store_id"].astype(str) + " · " + stores["store_name"].fillna("")).tolist()
     pick = st.selectbox("Store", options)
     sid = pick.split(" · ", 1)[0]
+    plan = data.get("shop_targets", pd.DataFrame())
+    if plan is not None and not plan.empty and "store_id" in plan.columns:
+        hit = plan[plan["store_id"].astype(str) == sid]
+        if not hit.empty:
+            rec = hit.iloc[0]
+            tgt = float(pd.to_numeric(pd.Series([rec.get("target_mt")]), errors="coerce").fillna(0).iloc[0])
+            method = str(rec.get("match_method") or "")
+            st.metric("Sales-team plan (MT)", f"{tgt:.2f}", help="Quota for this POP. Not Expected.")
+            st.caption(f"Matched as `{method}`. Expected on the board pack stays the statistical run-rate.")
+        else:
+            unmatched = plan[plan["store_name"].fillna("").astype(str).str.lower() == pick.split(" · ", 1)[-1].strip().lower()]
+            if not unmatched.empty:
+                st.caption("A target row exists for this name but did not match this POP — check Warehouse → Shop plan.")
     hist = data["shop_month"][data["shop_month"]["store_id"] == sid].sort_values("period")
     fig = px.bar(hist, x="period", y="volume_mt", labels={"volume_mt": "MT"})
     fc = data["forecasts"]
@@ -1500,7 +1551,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.7.0, curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.9.0, curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
@@ -1527,6 +1578,44 @@ def _page_warehouse(data):
         st.subheader("Learned seasonal index")
         show = season[season["grain"].isin(["national", "city"])].copy()
         st.dataframe(show.sort_values(["grain", "grain_id", "month"]), use_container_width=True, hide_index=True)
+    plan = data.get("shop_targets", pd.DataFrame())
+    if plan is not None and not plan.empty:
+        st.subheader("Shop plan (sales-team targets)")
+        method = plan["match_method"].fillna("unmatched").astype(str) if "match_method" in plan.columns else pd.Series("unmatched", index=plan.index)
+        matched = plan.loc[method.ne("unmatched") & plan.get("store_id", pd.Series("", index=plan.index)).astype(str).ne("")]
+        book_mt = float(pd.to_numeric(plan.get("target_mt"), errors="coerce").fillna(0).sum())
+        matched_mt = float(pd.to_numeric(matched.get("target_mt"), errors="coerce").fillna(0).sum()) if not matched.empty else 0.0
+        coverage = (matched_mt / book_mt) if book_mt else 0.0
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Plan shops", f"{len(plan):,}")
+        c2.metric("Matched shops", f"{len(matched):,}")
+        c3.metric("Book (MT)", f"{book_mt:.0f}")
+        c4.metric("Matched (MT)", f"{matched_mt:.0f}", delta=f"{coverage:.0%} of book")
+        st.caption(
+            "Target is the sales-team quota, not Expected. Country / city / DSR plan uses the full submitted book "
+            "(unmatched names still roll if Area matches a live city). Shop identity is conservative — whales need an exact name."
+        )
+        if "match_method" in plan.columns:
+            by = (
+                plan.assign(_m=method, _mt=pd.to_numeric(plan["target_mt"], errors="coerce").fillna(0))
+                .groupby("_m", dropna=False)
+                .agg(shops=("_mt", "count"), mt=("_mt", "sum"))
+                .reset_index()
+                .rename(columns={"_m": "Match"})
+            )
+            st.dataframe(by, use_container_width=True, hide_index=True)
+        leftover = plan.loc[method.eq("unmatched")].copy()
+        if not leftover.empty:
+            st.markdown("##### Unmatched sample")
+            show = leftover.sort_values("target_mt", ascending=False).head(40)
+            cols = [c for c in ("store_name", "city", "distributor", "dsr_name", "target_mt") if c in show.columns]
+            st.dataframe(show[cols], use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download unmatched plan rows (CSV)",
+                leftover.to_csv(index=False).encode("utf-8"),
+                file_name="shop_plan_unmatched.csv",
+                mime="text/csv",
+            )
     st.caption("Updating the app does not wipe this warehouse. Use Strategy → Rebuild scorecards if the briefing looks stale.")
     st.subheader("Replace billed sales")
     st.caption(

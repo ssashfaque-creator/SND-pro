@@ -42,6 +42,22 @@ SSRS CSVs are jagged (parameter rows have fewer columns than the tablix) and hid
 
 The master list is the **universe**. Strike rate = billed shops / universe shops. Shops on the master that never appear in sales are whitespace.
 
+### Shop-wise targets (sales-team plan)
+
+Optional. Region / area / distributor / DSR / shop name / target MT (SSRS field ids like `txt_cPOP_NAME`, `uval_TARGET_UOM`). There is usually **no POP code** and **no calendar month** — treat the file as the live quota for the period being scored.
+
+This is **not** a forecast. The model keeps three numbers the way Oracle SVP / SAP trade analytics do:
+
+| Number | Meaning |
+|---|---|
+| **Actual** | Billed secondary |
+| **Expected** (baseline) | Last-3 AMS blended with last-6 median, paced if MTD is open. Unchanged by the target file. |
+| **Target** (quota) | What the sales team wrote, rolled to city / distributor / DSR. Open MTD uses the same national day curve as Expected. |
+
+Stretch = max(0, paced Target − Expected) is ambition, not a coverage miss. Gap on the board is still billed vs Expected. Shop matching is conservative (exact city+distributor+name; whales ≥ 1 MT are never fuzzy-matched). Unmatched names still count in the city/DSR book if Area folds onto a unique live city. Warehouse → Shop plan shows match rate and unmatched rows.
+
+No extra LLM or ML is used on this file. Name-matching models mis-assign kiryana whales; XGBoost Expected already carries seasonality and national day shape.
+
 ## What the machine actually learns
 
 Monthly shop data is sparse. The pipeline does **not** pretend a neural net can “understand Excel”. It builds a stack that companies like Nielsen / IRI / FireAI-style S&D platforms use, adapted to one monthly MTD file:
@@ -78,7 +94,7 @@ pip install -e ".[dev]"
 snd-intel demo
 
 # Your own files
-snd-intel ingest path/to/Shop_SKU_Wise_Execution_Report.xlsx --shops path/to/shop_master.xlsx
+snd-intel ingest path/to/Shop_SKU_Wise_Execution_Report.xlsx --shops path/to/shop_master.xlsx --targets path/to/shopwise_targets.csv
 snd-intel brief
 snd-intel actions
 snd-intel dashboard
@@ -130,9 +146,9 @@ rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
 cd ~/sndintel && source .venv/bin/activate && pip install -e . && snd-intel app
 ```
 
-Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.8.0**. Open **Report → Situation cascade**. That is the pack you send: national HQ (overall situation, cities/distributors/people under and over, five steps to close the Gap), then one city pack and one distributor pack. This week → Monday dispatch is still the operating call list. Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8; official Expected on Gap cards is still last-3 / last-6 paced by the national day curve.
+Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.9.0**. Open **Report → Situation cascade**. That is the pack you send: national HQ (overall situation, cities/distributors/people under and over, billed vs Expected vs sales-team plan, five steps to close the Gap), then one city pack and one distributor pack. This week → Monday dispatch is still the operating call list. Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8; official Expected on Gap cards is still last-3 / last-6 paced by the national day curve.
 
-Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates). Leave **Replace all billed sales** unticked for a weekly refresh: days in the new file override the same shop-days (a later 20 Aug file replaces an incomplete 20 Aug); other days stay. Tick replace-all only when switching from Shop SKU Wise or wiping billed history. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
+Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates). Optionally drop **shop-wise targets** (quota / plan) — they do not replace Expected. Leave **Replace all billed sales** unticked for a weekly refresh: days in the new file override the same shop-days (a later 20 Aug file replaces an incomplete 20 Aug); other days stay. Tick replace-all only when switching from Shop SKU Wise or wiping billed history. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
 
 Warehouse → **Clear billed sales only** also wipes billed rows and keeps shop lists.
 
@@ -152,6 +168,7 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 | Question | Where it shows up |
 |---|---|
 | What is the national situation, and who is under / over? | Report → Situation cascade → National HQ |
+| Are we on the sales-team plan, or only on Expected? | Situation KPIs Target / attainment / stretch; Warehouse → Shop plan for match quality |
 | What should we send each city / distributor? | Same page: City pack / Distributor pack, or ZIP of every pack |
 | Which salespeople are lagging, and why? | Situation pack People sheets; capacity label is the coaching script |
 | What steps close the Gap to potential? | Situation pack → Steps to potential (ranked by MT) |
@@ -172,7 +189,9 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 src/sndintel/
   ingest/ssrs.py       SSRS chrome stripper + column inference
   ingest/shops.py      Universe parser
+  ingest/targets.py    Shop-wise sales-team quota (not a forecast)
   ingest/pipeline.py   Daily shop-day overlay (or SKU-wise month replace) → features → models → insights
+  plan.py              Attach Actual / Expected / Target without mixing them
   materiality.py       Pareto core / middle / long-tail (not every quiet shop is 'lost')
   situation_report.py  National / city / distributor sendable packs
   strategy.py          Five-play briefing
