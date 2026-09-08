@@ -42,7 +42,6 @@ from reportlab.platypus import (
 from sndintel.briefing import DRIVER_LABEL, SITUATION_LABEL, _sheet_table
 from sndintel.coverage import allocate_recoverable_drivers
 from sndintel.capacity import (
-    LABEL_FINE,
     score_dsr_capacity_from_units,
 )
 from sndintel.config import EXPECTED_FORMULA
@@ -477,7 +476,7 @@ def iter_situation_sheets(pack: SituationPack) -> list[tuple[str, str, str, pd.D
             (
                 "06 People lagging" if scope == "national" else "04 People lagging",
                 "Underperforming sales staff",
-                "A DSR is city + distributor + name. Label is capacity vs skill, not a ranking by tons.",
+                "Behind their own Expected, largest hole first. Label is the coaching script, not why they are on this list.",
                 pack.lagging_people,
             ),
             (
@@ -933,9 +932,9 @@ def _monthly_target(row: pd.Series) -> float:
 def _plan_phrase(projected: float, expected_full: float, target: float, open_mtd: bool = True) -> str:
     if target <= 0.05:
         return ""
-    if projected + 0.5 >= target:
+    if projected + 0.05 >= target:
         return "Hit target" if not open_mtd else "On track for target"
-    if projected + 0.5 >= expected_full:
+    if projected + 0.05 >= expected_full:
         return "Beat Expected, missed quota" if not open_mtd else "On run-rate, short of target"
     return "Missed Expected" if not open_mtd else "Behind run-rate"
 
@@ -1013,7 +1012,7 @@ def _people_do_this(label: str, sit: str) -> str:
     if lab == "Not lifting drop":
         return "Billed, but orders are light. Lift drop on those doors."
     if sit == "lagging":
-        return "Behind Expected. Coach from the label on this row."
+        return "Missed Expected. Ride with this DSR and work the billed / unbilled doors on this beat."
     return "On or ahead. Leave this beat. Do not load."
 
 
@@ -1181,7 +1180,7 @@ def _people_columns(has_plan: bool, open_mtd: bool) -> list[str]:
     cols = ["DSR", "City", "Distributor", "Situation", "Label", "Billed (MT)"]
     if open_mtd:
         cols.append("Projected month-end (MT)")
-    cols += ["Expected (MT)", "Visit %"]
+    cols += ["Expected (MT)", "Gap (MT)", "Visit %"]
     if has_plan:
         cols += ["Monthly target (MT)", "vs Target (MT)", "Plan"]
     cols.append("Do this")
@@ -1203,20 +1202,17 @@ def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int |
             work["_label"] = cap["label"].tolist()[: len(work)] if "label" in cap.columns else ""
     else:
         work["_label"] = ""
-    sit = work["situation"].astype(str) if "situation" in work.columns else pd.Series("", index=work.index)
-    lab = work["_label"].astype(str)
-    gap_s = _col(work, "gap_mt").fillna(0)
+    billed_s = _col(work, "volume_mt").fillna(0)
+    expected_s = _col(work, "expected_mt").fillna(0)
+    hole = expected_s - billed_s
+    ahead = billed_s - expected_s
+    work = work.assign(_hole=hole, _ahead=ahead)
     if lagging:
-        keep = (sit == "lagging") | lab.isin(
-            ["Overloaded", "Not working the beat", "Not converting", "Not lifting drop"]
-        )
-        work = work.loc[keep]
-        work = work.sort_values("gap_mt" if "gap_mt" in work.columns else "volume_mt", ascending=False)
+        # Capacity labels (not converting / low visit %) are a coaching script.
+        # They are not a second definition of underperforming — those people often beat Expected.
+        work = work[work["_hole"] >= 0.5].sort_values("_hole", ascending=False)
     else:
-        keep = (sit == "outperforming") | ((lab == LABEL_FINE) & (gap_s <= 0) & (sit != "lagging"))
-        work = work.loc[keep]
-        iso = _col(work, "isolated_mt")
-        work = work.assign(_iso=iso.fillna(0)).sort_values("_iso", ascending=False)
+        work = work[work["_ahead"] >= 0.5].sort_values("_ahead", ascending=False)
     if n:
         work = work.head(int(n))
     rows = []
@@ -1225,16 +1221,21 @@ def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int |
         projected = _projected(r, open_mtd)
         expected_full = _expected_full(r, open_mtd)
         target = _monthly_target(r)
+        billed = _num(r, "volume_mt")
+        expected_now = _num(r, "expected_mt") if open_mtd else expected_full
+        gap = expected_now - billed
+        sit_show = "Lagging" if gap >= 0.5 else ("Ahead" if -gap >= 0.5 else _sit_label(r.get("situation")))
         rec: dict[str, Any] = {
             "DSR": str(name or ""),
             "City": str(r.get("city") or ""),
             "Distributor": str(r.get("distributor") or ""),
-            "Situation": _sit_label(r.get("situation")),
+            "Situation": sit_show,
             "Label": str(r.get("_label") or ""),
             "Billed (MT)": _mt(r.get("volume_mt")),
-            "Expected (MT)": _mt(expected_full),
+            "Expected (MT)": _mt(expected_full if not open_mtd else expected_now),
+            "Gap (MT)": _mt(gap),
             "Visit %": _pct(r.get("visit_rate")),
-            "Do this": _people_do_this(str(r.get("_label") or ""), str(r.get("situation") or "")),
+            "Do this": _people_do_this(str(r.get("_label") or ""), "lagging" if gap >= 0.5 else str(r.get("situation") or "")),
         }
         if open_mtd:
             rec["Projected month-end (MT)"] = _mt(projected)
@@ -1390,9 +1391,9 @@ def _steps_to_potential(
         names = [str(x) for x in lag_people["DSR"].head(4).tolist()] if "DSR" in lag_people.columns else []
         people_gap = _people_stake_mt(lag_people)
         labels = []
-        if cap is not None and not cap.empty and "label" in cap.columns:
+        if "Label" in lag_people.columns:
             for lab in ("Overloaded", "Not working the beat", "Not converting", "Not lifting drop"):
-                n_lab = int((cap["label"].astype(str) == lab).sum())
+                n_lab = int((lag_people["Label"].astype(str) == lab).sum())
                 if n_lab:
                     labels.append(f"{n_lab} {lab.lower()}")
         start = f"Start with {', '.join(names)}." if names else "Coach the named DSRs."
@@ -1463,11 +1464,15 @@ def _steps_to_potential(
 def _people_stake_mt(lag_people: pd.DataFrame) -> float:
     if lag_people is None or lag_people.empty:
         return 0.0
+    if "Gap (MT)" in lag_people.columns:
+        return float(pd.to_numeric(lag_people["Gap (MT)"], errors="coerce").fillna(0).clip(lower=0).head(8).sum())
+    if "Expected (MT)" in lag_people.columns and "Billed (MT)" in lag_people.columns:
+        exp = pd.to_numeric(lag_people["Expected (MT)"], errors="coerce").fillna(0)
+        billed = pd.to_numeric(lag_people["Billed (MT)"], errors="coerce").fillna(0)
+        return float((exp - billed).clip(lower=0).head(8).sum())
     if "vs Target (MT)" in lag_people.columns:
         vs = pd.to_numeric(lag_people["vs Target (MT)"], errors="coerce").fillna(0)
         return float((-vs.clip(upper=0)).head(8).sum())
-    if "Gap (MT)" in lag_people.columns:
-        return float(pd.to_numeric(lag_people["Gap (MT)"], errors="coerce").fillna(0).head(8).sum())
     return 0.0
 
 

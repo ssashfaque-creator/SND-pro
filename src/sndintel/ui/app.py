@@ -1655,7 +1655,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.9.1 (not 0.9.2), curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.9.2 (not 0.9.3), curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"

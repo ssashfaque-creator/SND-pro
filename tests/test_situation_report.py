@@ -122,7 +122,16 @@ def test_national_pack_lists_underperforming_people():
     assert names.intersection({"Amir", "Karachi Weak"})
     # Lahore Ace held or beat Expected — not a coaching target.
     ahead = set(pack.ahead_people["DSR"].astype(str)) if not pack.ahead_people.empty else set()
-    assert "Lahore Ace" not in names or "Lahore Ace" in ahead
+    assert "Lahore Ace" not in names
+    assert "Lahore Ace" in ahead or pack.ahead_people.empty
+    people = pack.lagging_people
+    assert "Gap (MT)" in people.columns
+    billed = pd.to_numeric(people["Billed (MT)"], errors="coerce").fillna(0)
+    expected = pd.to_numeric(people["Expected (MT)"], errors="coerce").fillna(0)
+    assert (billed <= expected).all()
+    gap = pd.to_numeric(people["Gap (MT)"], errors="coerce").fillna(0)
+    assert (gap >= 0).all()
+    assert gap.is_monotonic_decreasing or len(people) <= 1
 
 
 def test_city_pack_is_scoped_and_has_local_steps():
