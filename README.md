@@ -83,12 +83,14 @@ snd-intel brief
 snd-intel actions
 snd-intel dashboard
 snd-intel export-excel SND_intelligence_brief.xlsx
+snd-intel situation
+snd-intel export-situation SND_situation.pdf
 
 # Drop-folder: copy new extracts into data/incoming/
 snd-intel watch --once
 ```
 
-JSON API (for a future agent): `snd-intel serve-api` then `GET /brief`, `/insights`, `/focus`, `/shops/{id}`, `/search?q=trade+loading`.
+JSON API (for a future agent): `snd-intel serve-api` then `GET /brief`, `/insights`, `/focus`, `/situation`, `/shops/{id}`, `/search?q=trade+loading`.
 
 ## Install on a Mac (curl, keep `.venv`)
 
@@ -103,7 +105,7 @@ Git is not required. Update is `curl` the branch ZIP, `rsync` over `~/sndintel`,
 ```bash
 rm -rf /tmp/sndintel-dl
 mkdir -p /tmp/sndintel-dl "$HOME/sndintel"
-curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/demand-driven-ask-7a79.zip" -o /tmp/sndintel-dl/app.zip
+curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/situation-cascade-eccd.zip" -o /tmp/sndintel-dl/app.zip
 unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
 SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
 rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
@@ -121,14 +123,14 @@ In the app: **Upload files** → shop list once, then the sales extract. Later m
 ```bash
 rm -rf /tmp/sndintel-dl
 mkdir -p /tmp/sndintel-dl
-curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/demand-driven-ask-7a79.zip" -o /tmp/sndintel-dl/app.zip
+curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/situation-cascade-eccd.zip" -o /tmp/sndintel-dl/app.zip
 unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
 SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
 rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
 cd ~/sndintel && source .venv/bin/activate && pip install -e . && snd-intel app
 ```
 
-Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.7.0**. The app opens on **This week → Monday dispatch**. Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8; official Expected on Gap cards is still last-3 / last-6 paced by the national day curve.
+Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.8.0**. Open **Report → Situation cascade**. That is the pack you send: national HQ (overall situation, cities/distributors/people under and over, five steps to close the Gap), then one city pack and one distributor pack. This week → Monday dispatch is still the operating call list. Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8; official Expected on Gap cards is still last-3 / last-6 paced by the national day curve.
 
 Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates). Leave **Replace all billed sales** unticked for a weekly refresh: days in the new file override the same shop-days (a later 20 Aug file replaces an incomplete 20 Aug); other days stay. Tick replace-all only when switching from Shop SKU Wise or wiping billed history. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
 
@@ -149,16 +151,20 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 
 | Question | Where it shows up |
 |---|---|
-| How is each city doing vs what it should be billing? | Strategy city waterfall |
-| Which distributor / DSR / shop in that city? | Open the city card; Named targets CSV |
-| Which areas/shops must we focus on this week? | Strategy must-visit + Focus slice by gap |
-| What are we doing well, so we can copy it? | Positive insights, DSR wins, local outperformance |
+| What is the national situation, and who is under / over? | Report → Situation cascade → National HQ |
+| What should we send each city / distributor? | Same page: City pack / Distributor pack, or ZIP of every pack |
+| Which salespeople are lagging, and why? | Situation pack People sheets; capacity label is the coaching script |
+| What steps close the Gap to potential? | Situation pack → Steps to potential (ranked by MT) |
+| How is each city doing vs what it should be billing? | Situation cities; Strategy city waterfall for the full scorecard |
+| Which distributor / DSR / shop in that city? | City pack; named targets; detailed scorecards |
+| Which areas/shops must we focus on this week? | Situation this-week doors + Monday dispatch |
+| What are we doing well, so we can copy it? | Situation “ahead” sheets and Copy from overperformers |
 | Did salespeople dump stock into a shop? | Trade-loading anomalies (spike vs that shop’s own 6-month median) |
-| Is a section dying while the city is fine? | Divergence insights |
-| Are we covering the universe or just the same 30 shops? | Strike rate by DSR, whitespace |
+| Is a section dying while the city is fine? | Situation weak areas; divergence insights |
+| Are we covering the universe or just the same 30 shops? | Strike rate by DSR, whitespace, coverage driver |
 | Is 5L oil growth real or stealing 16kg tin? | Cannibalization / substitution |
 | Are we over-dependent on a handful of accounts? | Pareto / concentration |
-| Who on the team is actually productive? | DSR scorecard (strike × drop size × MoM) |
+| Who on the team is actually productive? | People ahead + DSR capacity Fine |
 
 ## Project layout
 
@@ -168,6 +174,7 @@ src/sndintel/
   ingest/shops.py      Universe parser
   ingest/pipeline.py   Daily shop-day overlay (or SKU-wise month replace) → features → models → insights
   materiality.py       Pareto core / middle / long-tail (not every quiet shop is 'lost')
+  situation_report.py  National / city / distributor sendable packs
   strategy.py          Five-play briefing
   ui/app.py            Local app: upload + strategy pack
   mtd.py               Closed vs open MTD from SSRS execution date

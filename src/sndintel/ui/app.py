@@ -29,6 +29,14 @@ from sndintel.briefing import (
     pdf_bytes,
     pdf_bytes_detailed,
 )
+from sndintel.situation_report import (
+    build_field_packs,
+    build_situation_pack,
+    excel_bytes as situation_excel_bytes,
+    list_situation_entities,
+    pdf_bytes as situation_pdf_bytes,
+    zip_field_packs,
+)
 from sndintel import __version__
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
@@ -740,7 +748,7 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
     cfg = {}
     for col in df.columns:
         name = str(col)
-        if name in {"Remarks", "Do this"}:
+        if name in {"Remarks", "Do this", "Do this week", "Step"}:
             cfg[col] = st.column_config.TextColumn(name, width="large")
         elif name == "Drop size (MT)":
             cfg[col] = st.column_config.NumberColumn(name, format="%.2f")
@@ -950,18 +958,200 @@ def _page_this_week(data, period, mtd, ledger):
     _rescore_button()
 
 
+def _load_action(data, period, ledger):
+    brief = data.get("action_brief", pd.DataFrame())
+    if brief is not None and not brief.empty:
+        with connect() as conn:
+            pack = load_action_pack(conn, period)
+        if pack is not None and pack.headline:
+            return pack
+    shop_month = data.get("shop_month", pd.DataFrame())
+    if shop_month is None or shop_month.empty:
+        return None
+    return build_action_pack(
+        shop_month,
+        data.get("stores"),
+        shop_day=data.get("shop_day"),
+        visits=data.get("visits"),
+        ledger=ledger,
+        period=period,
+    )
+
+
 def _page_report(data, _latest, period, mtd, ledger):
     st.title("Report")
     st.caption(
-        f"**{mtd['label'] or period}** · Pick a report, then a city / distributor / DSR if needed, then PDF or Excel. "
-        "National PDF starts with the glossary, then the AI executive summary, then the tables. "
-        "Figures are whole numbers. Remarks are bullets in the last column."
+        f"**{mtd['label'] or period}** · Situation cascade is the pack you send: national HQ first, "
+        "then one city pack and one distributor pack. No API key. Detailed scorecards stay as the working file."
     )
     units = data.get("units", pd.DataFrame())
     if units is None or units.empty:
         st.warning("No scorecards yet. Rebuild from the warehouse or upload files.")
         _rescore_button()
         return
+    mode = st.radio(
+        "Pack",
+        ["Situation cascade", "Detailed scorecards"],
+        horizontal=True,
+        index=0,
+        key="report_mode",
+    )
+    if mode == "Situation cascade":
+        _page_situation_cascade(data, units, period, mtd, ledger)
+    else:
+        _page_detailed_scorecard(data, period, mtd, ledger)
+    _rescore_button()
+
+
+def _page_situation_cascade(data, units, period, mtd, ledger):
+    action = _load_action(data, period, ledger)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        report_type = st.selectbox("1. Send to", ["National HQ", "City", "Distributor"], key="sit_report_type")
+    kind = {"National HQ": "national", "City": "city", "Distributor": "distributor"}[report_type]
+    entity = None
+    with c2:
+        if kind == "national":
+            st.selectbox("2. Scope", ["Whole country"], disabled=True, key="sit_scope_national")
+        else:
+            options = list_situation_entities(units, kind)
+            q = st.text_input("Search", placeholder=f"Type to filter {kind}s", key="sit_search")
+            filtered = [o for o in options if not q or q.lower() in o.lower()]
+            if not options:
+                st.selectbox(f"2. {report_type}", ["No options in the warehouse"], disabled=True, key="sit_entity_empty")
+            elif not filtered:
+                st.selectbox(f"2. {report_type}", [f"No match for “{q}”"], disabled=True, key="sit_entity_nomatch")
+            else:
+                entity = st.selectbox(f"2. {report_type}", filtered, index=0, key="sit_entity")
+    with c3:
+        fmt = st.selectbox("3. Format", ["PDF", "Excel"], key="sit_format")
+
+    if kind != "national" and not entity:
+        st.info("Choose a city or distributor — type in Search to narrow the list.")
+        return
+
+    city = dist = None
+    if kind == "city":
+        city = entity
+    elif kind == "distributor" and entity:
+        parts = [p.strip() for p in str(entity).split(" · ") if p.strip()]
+        if len(parts) >= 2:
+            city, dist = parts[0], " · ".join(parts[1:])
+        else:
+            dist = entity
+
+    pack = build_situation_pack(
+        units, action=action, ledger=ledger, period=period, scope=kind, city=city, distributor=dist
+    )
+    kpis = pack.kpis or {}
+    st.markdown(f"**{pack.headline}**")
+    st.caption(pack.weather)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.0f}")
+    m2.metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.0f}")
+    m3.metric("Gap to potential (MT)", f"{float(kpis.get('gap_mt') or 0):.0f}")
+    m4.metric("Situation", str(kpis.get("situation_label") or "—"))
+    m5.metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
+    m6.metric("Ahead people", int(kpis.get("n_ahead_people") or 0))
+
+    st.markdown("##### Current situation")
+    for para in pack.situation:
+        st.write(para)
+    if pack.copy_from:
+        st.markdown("##### Copy from overperformers")
+        for line in pack.copy_from:
+            st.caption(line)
+
+    st.markdown("##### Steps to reach potential")
+    _strategy_table(pack.steps, height=220)
+
+    if kind == "national":
+        left, right = st.columns(2)
+        with left:
+            st.markdown("##### Cities lagging")
+            _strategy_table(pack.lagging_cities, height=240)
+            st.markdown("##### Distributors lagging")
+            _strategy_table(pack.lagging_distributors, height=220)
+        with right:
+            st.markdown("##### Cities ahead")
+            _strategy_table(pack.ahead_cities, height=240)
+            st.markdown("##### Distributors ahead")
+            _strategy_table(pack.ahead_distributors, height=220)
+    else:
+        st.markdown("##### Distributors lagging")
+        _strategy_table(pack.lagging_distributors, height=220)
+        st.markdown("##### Distributors ahead")
+        _strategy_table(pack.ahead_distributors, height=180)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("##### Underperforming sales staff")
+        _strategy_table(pack.lagging_people, height=260)
+    with right:
+        st.markdown("##### Overperforming sales staff")
+        _strategy_table(pack.ahead_people, height=260)
+
+    st.markdown("##### Weak areas")
+    _strategy_table(pack.weak_areas, height=200)
+    st.markdown("##### This-week doors")
+    _strategy_table(pack.this_week, height=200)
+
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(pack.scope_label))[:60]
+    if fmt == "Excel":
+        payload = situation_excel_bytes(pack)
+        name = f"SND_situation_{kind}_{safe}_{period}.xlsx"
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        payload = situation_pdf_bytes(pack)
+        name = f"SND_situation_{kind}_{safe}_{period}.pdf"
+        mime = "application/pdf"
+    st.download_button(
+        f"Download {report_type.lower()} situation pack ({fmt})",
+        payload,
+        file_name=name,
+        mime=mime,
+        type="primary",
+    )
+    st.caption("Situation PDF starts with the situation and the five steps, not the glossary.")
+
+    z1, z2 = st.columns(2)
+    with z1:
+        if st.button("Build ZIP of every city pack (PDF)", key="sit_zip_cities"):
+            with st.spinner("Writing one PDF per city."):
+                packs = build_field_packs(units, action=action, ledger=ledger, period=period, kind="city")
+                st.session_state["sit_city_zip"] = zip_field_packs(packs, fmt="pdf")
+                st.session_state["sit_city_zip_n"] = len(packs)
+        if st.session_state.get("sit_city_zip"):
+            n = int(st.session_state.get("sit_city_zip_n") or 0)
+            st.download_button(
+                f"Download {n} city packs",
+                st.session_state["sit_city_zip"],
+                file_name=f"SND_city_packs_{period}.zip",
+                mime="application/zip",
+                key="sit_zip_cities_dl",
+            )
+    with z2:
+        if st.button("Build ZIP of every distributor pack (PDF)", key="sit_zip_dists"):
+            with st.spinner("Writing one PDF per distributor."):
+                packs = build_field_packs(units, action=action, ledger=ledger, period=period, kind="distributor")
+                st.session_state["sit_dist_zip"] = zip_field_packs(packs, fmt="pdf")
+                st.session_state["sit_dist_zip_n"] = len(packs)
+        if st.session_state.get("sit_dist_zip"):
+            n = int(st.session_state.get("sit_dist_zip_n") or 0)
+            st.download_button(
+                f"Download {n} distributor packs",
+                st.session_state["sit_dist_zip"],
+                file_name=f"SND_distributor_packs_{period}.zip",
+                mime="application/zip",
+                key="sit_zip_dists_dl",
+            )
+
+
+def _page_detailed_scorecard(data, period, mtd, ledger):
+    st.caption(
+        "Working file: every city / distributor / DSR / shop versus Expected. "
+        "National PDF still starts with the glossary. Use Situation cascade to send a briefing."
+    )
     pack = _strategy_pack(data, period, ledger)
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -1064,7 +1254,6 @@ def _page_report(data, _latest, period, mtd, ledger):
         type="primary",
     )
     st.caption("PDF is a real PDF (not HTML). Excel keeps one sheet per layer for filters.")
-    _rescore_button()
 
 
 def _rescore_button():
@@ -1311,7 +1500,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.6.4, curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.7.0, curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"

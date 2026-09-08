@@ -53,10 +53,11 @@ Each module writes rows into `insights` with `type`, `severity`, `entity_*`, `na
 - **Warehouse position** — closed YTD plus open MTD run-rate vs last year. Always ranked first so the briefing is the overall book, not “what was in the latest file”.
 - **Volume bridge** — like-for-like vs new vs lost, split by Pareto **core / middle / tail**. Micro shops are one coverage KPI (weighted distribution), not a lost-account dump. Irregular billers are not treated as lapses.
 - **Strategy plays** — at most five: close the month, protect the base, recover material volume, fix the beat, long-tail coverage / mix / people. Must-visit lists are material shops only.
+- **Situation cascade** — sendable packs, no API key. National HQ names under- and over-performing cities, distributors, and DSRs, then five steps that close Gap versus Expected. Each city and each distributor gets the same skeleton, scoped, so it can be emailed. Detailed scorecards stay as the working file.
 
 ## 4. Execution
 
-- CLI `snd-intel app` / `ingest` / `watch` / `demo` / `brief` / `where`.
+- CLI `snd-intel app` / `ingest` / `watch` / `demo` / `brief` / `situation` / `where`.
 - On a Mac the warehouse is `~/Library/Application Support/SND Intelligence/warehouse.db` so unzipping a new app build does not wipe history.
 - Local UI: upload shop list once, then incremental sales extracts. Drop folder `incoming/` still works.
 - Delta scoring is implicit: months in the new file replace that month’s facts, features use the full history as baseline, and insights are rebuilt for the **overall warehouse**.
