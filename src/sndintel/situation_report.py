@@ -4,10 +4,9 @@ The existing strategy PDF is a scorecard dump (glossary first, lagging-only
 top-N, no overperformers, no path to potential). This module answers the
 operating questions in order:
 
-1. What is the situation versus Expected (potential)?
+1. What has billed so far, what will month-end look like, and what is the quota?
 2. Who is underperforming, who is overperforming?
-3. Which areas (cities / distributors / sections / people) are weak?
-4. What are the few steps that close the Gap?
+3. What are the few next actions?
 
 National pack goes to the sales head. City and distributor packs are the
 same skeleton, scoped, so they can be emailed without a covering note.
@@ -61,7 +60,15 @@ RUN_RATE_FLOOR = 0.05
 GLOSSARY = [
     (
         "Expected / potential",
-        "What this unit should have billed: last-three-month run-rate blended with the last-six-month median, paced if the month is still open. Gap is the hole versus that number — the volume that comes back if the unit billed its recent run-rate.",
+        "Full-month run-rate (last-three-month AMS blended with last-six-month median). On an open month the cover also shows where we should be by today (that run-rate × the national day curve).",
+    ),
+    (
+        "Projected month-end",
+        "Open month only. Billed so far ÷ the same national day-curve fraction used for Expected. If we keep this pace, this is month-end billed.",
+    ),
+    (
+        "Monthly target",
+        "Sales-team shop-wise quota for the full month. Not paced. Attainment on an open month is projected month-end ÷ this target.",
     ),
     (
         "Lagging / Ahead / On expected",
@@ -76,16 +83,8 @@ GLOSSARY = [
         "Overloaded (too many doors for the call budget), Not working the beat (spare capacity, weak visit %), Not converting (visits happened, shops did not buy), Not lifting drop (billed, order size is light), Fine.",
     ),
     (
-        "Steps to potential",
-        "Ranked by volume at stake. This week’s Ask (due unvisited doors) is the closable slice; drop-size and conversion close the rest of Gap.",
-    ),
-    (
-        "Target / plan",
-        "Shop-wise quota from the sales team. Not Expected. Expected is the statistical run-rate (last-3 / last-6, paced). Target is the plan. Stretch = plan − Expected. Missing stretch is not a coverage miss.",
-    ),
-    (
-        "vs Target / attainment",
-        "Billed minus paced Target (open MTD uses the same national day curve as Expected). Attainment is billed ÷ paced Target. A unit can beat Expected and still miss the plan.",
+        "Plan and next actions",
+        "What to do this week, in order, with the MT at stake. Short bullets — not a scorecard dump.",
     ),
 ]
 
@@ -110,10 +109,85 @@ class SituationPack:
     weak_areas: pd.DataFrame = field(default_factory=pd.DataFrame)
     this_week: pd.DataFrame = field(default_factory=pd.DataFrame)
     copy_from: list[str] = field(default_factory=list)
+    plan_lines: list[str] = field(default_factory=list)
 
 
 def empty_situation_pack(period: str = "") -> SituationPack:
     return SituationPack(period=period or "", label=period or "")
+
+
+def scorecards_for_period(
+    shop_month: pd.DataFrame,
+    stores: pd.DataFrame | None,
+    ledger: pd.DataFrame | None,
+    period: str,
+    shop_targets: pd.DataFrame | None = None,
+    visits: pd.DataFrame | None = None,
+    shop_day: pd.DataFrame | None = None,
+    facts: pd.DataFrame | None = None,
+    mtd_obs: pd.DataFrame | None = None,
+    cached_units: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Units for one calendar month. Reuses the live scorecards when they already match."""
+    period = str(period or "")
+    if cached_units is not None and not cached_units.empty and "period" in cached_units.columns:
+        stored = str(cached_units["period"].dropna().astype(str).max() or "")
+        if stored == period:
+            return cached_units
+    from sndintel.hierarchy import build_hierarchy_pack
+    from sndintel.plan import attach_plan
+
+    pack = build_hierarchy_pack(
+        shop_month,
+        stores,
+        None,
+        ledger,
+        facts=facts,
+        mtd_obs=mtd_obs,
+        visits=visits,
+        shop_day=shop_day,
+        period=period,
+    )
+    mtd = period_state(ledger, period)
+    pace = 1.0
+    if pack.units is not None and not pack.units.empty and "intra_month_frac" in pack.units.columns:
+        pace = float(pd.to_numeric(pack.units["intra_month_frac"], errors="coerce").dropna().max() or 1.0)
+    if not mtd.get("open"):
+        pace = 1.0
+    return attach_plan(pack.units, shop_targets, pace=pace)
+
+
+def load_units_for_period(conn: Any, period: str) -> pd.DataFrame:
+    """Warehouse scorecards for one month. Rebuilds when the cached units are a different month."""
+    from sndintel.storage import read_sql
+
+    period = str(period or "")
+    try:
+        units = read_sql(conn, "SELECT * FROM unit_scorecards")
+    except Exception:
+        units = pd.DataFrame()
+    if units is not None and not units.empty and "period" in units.columns:
+        stored = str(units["period"].dropna().astype(str).max() or "")
+        if stored == period:
+            return units
+
+    def _table(sql: str) -> pd.DataFrame:
+        try:
+            return read_sql(conn, sql)
+        except Exception:
+            return pd.DataFrame()
+
+    return scorecards_for_period(
+        _table("SELECT * FROM shop_month"),
+        _table("SELECT * FROM stores"),
+        _table("SELECT * FROM period_ledger ORDER BY period"),
+        period,
+        shop_targets=_table("SELECT * FROM shop_targets"),
+        visits=_table("SELECT * FROM shop_visits"),
+        shop_day=_table("SELECT * FROM shop_day"),
+        mtd_obs=_table("SELECT * FROM mtd_observations"),
+        cached_units=units,
+    )
 
 
 def build_situation_pack(
@@ -140,9 +214,9 @@ def build_situation_pack(
     cities = _active(_grain(scoped, "city"))
     dists = _active(_grain(scoped, "distributor"))
     dsrs = _active(_grain(scoped, "dsr"))
-    sections = _active(_grain(scoped, "section"))
     nat = _grain(units, "national")
     focus = _focus_row(scoped, units, scope, city, distributor)
+    open_mtd = bool(mtd.get("open"))
 
     cap = (
         score_dsr_capacity_from_units(dsrs, as_of, days_m)
@@ -150,20 +224,20 @@ def build_situation_pack(
         else pd.DataFrame()
     )
 
-    lag_c = _board(cities, "city", lagging=True, n=LAG_N if scope == "national" else None)
-    ahead_c = _board(cities, "city", lagging=False, n=AHEAD_N if scope == "national" else None)
-    lag_d = _board(dists, "distributor", lagging=True, n=LAG_N if scope == "national" else None)
-    ahead_d = _board(dists, "distributor", lagging=False, n=AHEAD_N if scope == "national" else None)
-    lag_p = _people_board(dsrs, cap, lagging=True, n=PEOPLE_LAG_N if scope == "national" else None)
-    ahead_p = _people_board(dsrs, cap, lagging=False, n=PEOPLE_AHEAD_N if scope == "national" else None)
-    weak = _weak_areas(sections, cities, dists, scope)
-    doors = _this_week_doors(action, scope, city, distributor)
-    steps = _steps_to_potential(focus, lag_p, cap, action, scope, city, distributor)
+    lag_c = _board(cities, "city", lagging=True, n=LAG_N if scope == "national" else None, open_mtd=open_mtd)
+    ahead_c = _board(cities, "city", lagging=False, n=AHEAD_N if scope == "national" else None, open_mtd=open_mtd)
+    lag_d = _board(dists, "distributor", lagging=True, n=LAG_N if scope == "national" else None, open_mtd=open_mtd)
+    ahead_d = _board(dists, "distributor", lagging=False, n=AHEAD_N if scope == "national" else None, open_mtd=open_mtd)
+    lag_p = _people_board(dsrs, cap, lagging=True, n=PEOPLE_LAG_N if scope == "national" else None, open_mtd=open_mtd)
+    ahead_p = _people_board(dsrs, cap, lagging=False, n=PEOPLE_AHEAD_N if scope == "national" else None, open_mtd=open_mtd)
+    doors = _this_week_doors(action, scope, city, distributor) if open_mtd else pd.DataFrame()
+    steps = _steps_to_potential(focus, lag_p, cap, action, scope, city, distributor, open_mtd=open_mtd)
     kpis = _kpis(focus, nat, cities, dists, dsrs, lag_p, ahead_p, mtd, scope)
     copy_from = _copy_lines(ahead_c, ahead_d, ahead_p, scope)
     headline, weather, paras = _narrative(
         focus, kpis, lag_c, ahead_c, lag_d, ahead_d, lag_p, ahead_p, steps, scope, city, distributor, label
     )
+    plan_lines = _plan_lines(kpis, steps, open_mtd)
     scope_label = {
         "national": "Country",
         "city": city or "City",
@@ -186,9 +260,10 @@ def build_situation_pack(
         ahead_distributors=ahead_d,
         lagging_people=lag_p,
         ahead_people=ahead_p,
-        weak_areas=weak,
+        weak_areas=pd.DataFrame(),
         this_week=doors,
         copy_from=copy_from,
+        plan_lines=plan_lines,
     )
 
 
@@ -261,45 +336,53 @@ def zip_field_packs(packs: list[tuple[str, SituationPack]], fmt: str = "pdf") ->
 def how_to_read(pack: SituationPack) -> list[str]:
     scope = (pack.scope or "national").lower()
     kpis = pack.kpis or {}
-    if scope == "city":
+    open_mtd = bool(kpis.get("open_mtd"))
+    if open_mtd:
         lines = [
-            f"{pack.scope_label} versus its own Expected. Gap is the path to potential.",
-            "Distributors in this city — lagging first, then who is ahead (copy, do not raid).",
-            "Salespeople — capacity label says whether the miss is headcount, visits, conversion, or drop size.",
-            "Weak sections / beats, then the this-week doors if Ask is on file.",
-            "Steps are ranked by volume at stake. Do those five things; ignore the tail.",
-        ]
-    elif scope == "distributor":
-        lines = [
-            f"{pack.scope_label} versus its own Expected.",
-            "DSRs on this book — who is lagging, who is ahead.",
-            "Weak areas and this-week doors on this distributor.",
-            "Steps close this distributor’s Gap, not the country’s.",
+            "This is the in-month (MTD) pack. Billed is so far; projected month-end is that billed ÷ the national day curve.",
+            "Monthly target is the full sales-team quota, not a paced slice.",
+            "A unit can be ahead of today’s Expected and still miss the month-end target.",
         ]
     else:
         lines = [
-            "Country versus Expected. Gap is national potential still on the table.",
-            "Cities lagging their own run-rate, then cities ahead (copy those beats).",
-            "Distributors the same way — volume holes and seriousness live in the detailed scorecard.",
-            "Salespeople with a capacity label: Overloaded / not visiting / not converting / not lifting drop.",
-            "Five steps to close the Gap, ranked by MT. Send the matching city or distributor pack to the field.",
+            "This is the closed-month pack. Billed, Expected, and Target are full-month numbers.",
+            "No month-end projection — the month is finished.",
         ]
-    if float(kpis.get("target_mt") or 0) > 0:
-        lines.append(
-            "Target is the sales-team shop-wise plan, not Expected. "
-            "Attainment is billed versus that plan. Stretch above Expected is quota, not a coverage miss."
-        )
+    if scope == "city":
+        lines += [
+            f"{pack.scope_label} versus its own Expected.",
+            "Distributors lagging first, then who is ahead (copy, do not raid).",
+            "Plan and next actions are the week’s work, in order.",
+        ]
+    elif scope == "distributor":
+        lines += [
+            f"{pack.scope_label} versus its own Expected.",
+            "DSRs on this book — who is lagging, who is ahead.",
+            "Plan and next actions close this distributor’s Gap, not the country’s.",
+        ]
+    else:
+        lines += [
+            "Cities and distributors behind their own run-rate, then who is ahead.",
+            "Salespeople: the label is the coaching script (too many doors / not visiting / not converting / light orders).",
+            "Plan and next actions are ranked by MT. Send the matching city or distributor pack to the field.",
+        ]
     return lines
 
 
 def iter_situation_sheets(pack: SituationPack) -> list[tuple[str, str, str, pd.DataFrame]]:
     scope = (pack.scope or "national").lower()
     label = pack.scope_label or scope
+    open_mtd = bool((pack.kpis or {}).get("open_mtd"))
+    plan_note = (
+        "What to do this week, in order. MT is volume at stake."
+        if open_mtd
+        else "What to do next on this closed month. MT is volume at stake."
+    )
     sheets: list[tuple[str, str, str, pd.DataFrame]] = [
         (
-            "01 Path to potential",
-            "Steps that close the Gap",
-            "Ranked by volume at stake. This-week Ask is the closable slice; conversion and drop size close the rest.",
+            "01 Plan and next actions",
+            "Plan and next actions",
+            plan_note,
             pack.steps,
         )
     ]
@@ -363,20 +446,17 @@ def iter_situation_sheets(pack: SituationPack) -> list[tuple[str, str, str, pd.D
                 "Ride with these names. Copy the beat; do not load extra stock.",
                 pack.ahead_people,
             ),
-            (
-                "08 Weak areas" if scope == "national" else "06 Weak areas",
-                "Weak areas / beats",
-                "Sections behind their own Expected. Area = beat, not a map.",
-                pack.weak_areas,
-            ),
-            (
-                "09 This week" if scope == "national" else "07 This week",
-                "This-week doors",
-                "Due / due-visited shops when the Ask engine has daily billed days. Empty if only monthly files are on disk.",
-                pack.this_week,
-            ),
         ]
     )
+    if pack.this_week is not None and not pack.this_week.empty:
+        sheets.append(
+            (
+                "08 This week" if scope == "national" else "06 This week",
+                "This-week doors",
+                "Call these shops this week. Ask is the reorder size.",
+                pack.this_week,
+            )
+        )
     return sheets
 
 
@@ -585,21 +665,104 @@ def _mt(value: Any) -> Any:
         return None
 
 
-def _board(df: pd.DataFrame, grain: str, lagging: bool, n: int | None) -> pd.DataFrame:
+def _pace(row: pd.Series | dict[str, Any]) -> float:
+    frac = _num(row, "intra_month_frac", 1.0)
+    return frac if frac > 1e-6 else 1.0
+
+
+def _projected(row: pd.Series, open_mtd: bool) -> float:
+    billed = _num(row, "volume_mt")
+    if not open_mtd:
+        return billed
+    return billed / _pace(row)
+
+
+def _expected_full(row: pd.Series, open_mtd: bool) -> float:
+    exp = _num(row, "expected_mt")
+    if not open_mtd:
+        return exp
+    return exp / _pace(row)
+
+
+def _monthly_target(row: pd.Series) -> float:
+    return _num(row, "target_mt")
+
+
+def _plan_phrase(projected: float, expected_full: float, target: float) -> str:
+    if target <= 0.05:
+        return ""
+    if projected + 0.5 >= target:
+        return "On track for target"
+    if projected + 0.5 >= expected_full:
+        return "On run-rate, short of target"
+    return "Behind run-rate"
+
+
+def _unit_do_this(row: pd.Series, open_mtd: bool) -> str:
+    sit = str(row.get("situation") or "")
+    diag = str(row.get("diagnosis") or "")
+    projected = _projected(row, open_mtd)
+    expected_full = _expected_full(row, open_mtd)
+    target = _monthly_target(row)
+    if sit == "lagging":
+        if diag == "drop_size":
+            return "Orders on billed shops are light. Lift drop this week."
+        if diag == "coverage":
+            return "Too few shops billed. Call the named doors."
+        if diag == "whitespace":
+            return "Universe not billed. Cover new doors this week."
+        return "Behind Expected. Work the named doors this week."
+    if sit == "outperforming":
+        if target > 0.05 and projected + 0.5 < target:
+            return "Ahead of Expected, still short of the monthly target. Keep drop. Hit due shops."
+        return "Ahead. Protect drop. Do not load extra stock."
+    if target > 0.05 and projected + 0.5 < target:
+        return "On Expected. Still short of the monthly target."
+    return "On Expected. Hold drop. Do not load."
+
+
+def _people_do_this(label: str, sit: str) -> str:
+    lab = str(label or "")
+    if lab == "Overloaded":
+        return "Too many doors for the call budget. Split the beat or add a DSR."
+    if lab == "Not working the beat":
+        return "Visit % is low. Ride with this DSR and audit calls."
+    if lab == "Not converting":
+        return "Visiting but not selling. Convert named shops — do not add coverage."
+    if lab == "Not lifting drop":
+        return "Billed, but orders are light. Lift drop on those doors."
+    if sit == "lagging":
+        return "Behind Expected. Coach from the label on this row."
+    return "On or ahead. Leave this beat. Do not load."
+
+
+def _door_do_this(call: str, ask_kg: int | None) -> str:
+    ask = f"Ask {ask_kg:,} KG." if ask_kg else "Call this week."
+    text = str(call or "").lower()
+    if "not billed" in text or "visited" in text:
+        return f"Visited, did not buy. Call again this week. {ask}"
+    if "unvisited" in text or "unvisit" in text:
+        return f"Due and not visited. Call this week. {ask}"
+    return f"Call this week. {ask}"
+
+
+def _board(df: pd.DataFrame, grain: str, lagging: bool, n: int | None, open_mtd: bool = False) -> pd.DataFrame:
     has_plan = _has_plan(df)
-    cols = _board_columns(grain, has_plan=has_plan)
+    cols = _board_columns(grain, has_plan=has_plan, open_mtd=open_mtd)
     if df is None or df.empty:
         return pd.DataFrame(columns=cols)
     work = df.copy()
     sit = work["situation"].astype(str) if "situation" in work.columns else pd.Series("", index=work.index)
     if lagging:
         work = work[sit == "lagging"]
-        work = work.sort_values("gap_mt" if "gap_mt" in work.columns else "isolated_mt", ascending=False)
+        sort_col = "gap_mt" if "gap_mt" in work.columns else "isolated_mt"
+        if sort_col in work.columns:
+            work = work.sort_values(sort_col, ascending=False)
     else:
         work = work[sit == "outperforming"]
         iso = _col(work, "isolated_mt")
         if iso.empty:
-            work = work.sort_values("gap_mt")
+            work = work.sort_values("gap_mt") if "gap_mt" in work.columns else work
         else:
             work = work.assign(_iso=iso).sort_values("_iso", ascending=False)
     if n:
@@ -612,21 +775,21 @@ def _board(df: pd.DataFrame, grain: str, lagging: bool, n: int | None) -> pd.Dat
         elif grain == "distributor":
             rec["Distributor"] = str(r.get("distributor") or r.get("grain_id") or "")
             rec["City"] = str(r.get("city") or "")
-        elif grain == "section":
-            rec["Area"] = str(r.get("section") or r.get("grain_id") or "")
-            rec["City"] = str(r.get("city") or "")
         rec["Situation"] = _sit_label(r.get("situation"))
-        rec["Billed this period (MT)"] = _mt(r.get("volume_mt"))
-        rec["Expected this month (MT)"] = _mt(r.get("expected_mt"))
-        rec["Gap (MT)"] = _mt(max(0.0, _num(r, "gap_mt")))
+        rec["Billed (MT)"] = _mt(r.get("volume_mt"))
+        projected = _projected(r, open_mtd)
+        expected_full = _expected_full(r, open_mtd)
+        target = _monthly_target(r)
+        if open_mtd:
+            rec["Projected month-end (MT)"] = _mt(projected)
+        rec["Expected (MT)"] = _mt(expected_full)
         rec["Driver"] = _driver_label(r.get("diagnosis"))
         rec["Visit %"] = _pct(r.get("visit_rate"))
-        rec["Strike %"] = _pct(r.get("strike_rate"))
         if has_plan:
-            rec["Target (MT)"] = _mt(r.get("target_paced_mt") if pd.notna(r.get("target_paced_mt")) else r.get("target_mt"))
-            rec["vs Target (MT)"] = _mt(r.get("vs_target_mt"))
-            rec["Plan"] = str(r.get("plan_status") or "").replace("_", " ")
-        rec["Do this"] = _short_action(r.get("do_this_week") or r.get("verdict"))
+            rec["Monthly target (MT)"] = _mt(target)
+            rec["vs Target (MT)"] = _mt(projected - target)
+            rec["Plan"] = _plan_phrase(projected, expected_full, target)
+        rec["Do this"] = _unit_do_this(r, open_mtd)
         rows.append(rec)
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
@@ -637,43 +800,34 @@ def _has_plan(df: pd.DataFrame) -> bool:
     return float(pd.to_numeric(df["target_mt"], errors="coerce").fillna(0).sum()) > 0.05
 
 
-def _board_columns(grain: str, has_plan: bool = False) -> list[str]:
+def _board_columns(grain: str, has_plan: bool = False, open_mtd: bool = False) -> list[str]:
     if grain == "distributor":
         head = ["Distributor", "City"]
-    elif grain == "section":
-        head = ["Area", "City"]
     else:
         head = ["City"]
-    mid = [
-        "Situation",
-        "Billed this period (MT)",
-        "Expected this month (MT)",
-        "Gap (MT)",
-        "Driver",
-        "Visit %",
-        "Strike %",
-    ]
+    mid = ["Situation", "Billed (MT)"]
+    if open_mtd:
+        mid.append("Projected month-end (MT)")
+    mid += ["Expected (MT)", "Driver", "Visit %"]
     if has_plan:
-        mid += ["Target (MT)", "vs Target (MT)", "Plan"]
+        mid += ["Monthly target (MT)", "vs Target (MT)", "Plan"]
     return head + mid + ["Do this"]
 
 
-def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int | None) -> pd.DataFrame:
-    has_plan = _has_plan(dsrs)
-    cols = [
-        "DSR",
-        "City",
-        "Distributor",
-        "Situation",
-        "Label",
-        "Billed this period (MT)",
-        "Expected this month (MT)",
-        "Gap (MT)",
-        "Visit %",
-        "Do this",
-    ]
+def _people_columns(has_plan: bool, open_mtd: bool) -> list[str]:
+    cols = ["DSR", "City", "Distributor", "Situation", "Label", "Billed (MT)"]
+    if open_mtd:
+        cols.append("Projected month-end (MT)")
+    cols += ["Expected (MT)", "Visit %"]
     if has_plan:
-        cols = cols[:-1] + ["Target (MT)", "Plan", "Do this"]
+        cols += ["Monthly target (MT)", "vs Target (MT)", "Plan"]
+    cols.append("Do this")
+    return cols
+
+
+def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int | None, open_mtd: bool = False) -> pd.DataFrame:
+    has_plan = _has_plan(dsrs)
+    cols = _people_columns(has_plan, open_mtd)
     if dsrs is None or dsrs.empty:
         return pd.DataFrame(columns=cols)
     work = dsrs.copy()
@@ -681,15 +835,11 @@ def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int |
         key = "grain_id" if "grain_id" in work.columns and "grain_id" in cap.columns else None
         if key:
             labels = cap.set_index(key)["label"] if "label" in cap.columns else pd.Series(dtype=object)
-            whys = cap.set_index(key)["why"] if "why" in cap.columns else pd.Series(dtype=object)
             work["_label"] = work[key].map(labels)
-            work["_why"] = work[key].map(whys)
         else:
             work["_label"] = cap["label"].tolist()[: len(work)] if "label" in cap.columns else ""
-            work["_why"] = ""
     else:
         work["_label"] = ""
-        work["_why"] = ""
     sit = work["situation"].astype(str) if "situation" in work.columns else pd.Series("", index=work.index)
     lab = work["_label"].astype(str)
     gap_s = _col(work, "gap_mt").fillna(0)
@@ -709,36 +859,28 @@ def _people_board(dsrs: pd.DataFrame, cap: pd.DataFrame, lagging: bool, n: int |
     rows = []
     for _, r in work.iterrows():
         name = r.get("dsr_name") or dsr_display_name(r.get("grain_id"))
-        action = r.get("_why") or r.get("do_this_week") or ""
-        rows.append(
-            {
-                "DSR": str(name or ""),
-                "City": str(r.get("city") or ""),
-                "Distributor": str(r.get("distributor") or ""),
-                "Situation": _sit_label(r.get("situation")),
-                "Label": str(r.get("_label") or ""),
-                "Billed this period (MT)": _mt(r.get("volume_mt")),
-                "Expected this month (MT)": _mt(r.get("expected_mt")),
-                "Gap (MT)": _mt(max(0.0, _num(r, "gap_mt"))),
-                "Visit %": _pct(r.get("visit_rate")),
-                "Target (MT)": _mt(r.get("target_paced_mt") if pd.notna(r.get("target_paced_mt")) else r.get("target_mt")),
-                "Plan": str(r.get("plan_status") or "").replace("_", " "),
-                "Do this": _short_action(action),
-            }
-        )
+        projected = _projected(r, open_mtd)
+        expected_full = _expected_full(r, open_mtd)
+        target = _monthly_target(r)
+        rec: dict[str, Any] = {
+            "DSR": str(name or ""),
+            "City": str(r.get("city") or ""),
+            "Distributor": str(r.get("distributor") or ""),
+            "Situation": _sit_label(r.get("situation")),
+            "Label": str(r.get("_label") or ""),
+            "Billed (MT)": _mt(r.get("volume_mt")),
+            "Expected (MT)": _mt(expected_full),
+            "Visit %": _pct(r.get("visit_rate")),
+            "Do this": _people_do_this(str(r.get("_label") or ""), str(r.get("situation") or "")),
+        }
+        if open_mtd:
+            rec["Projected month-end (MT)"] = _mt(projected)
+        if has_plan:
+            rec["Monthly target (MT)"] = _mt(target)
+            rec["vs Target (MT)"] = _mt(projected - target)
+            rec["Plan"] = _plan_phrase(projected, expected_full, target)
+        rows.append(rec)
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
-
-
-def _weak_areas(
-    sections: pd.DataFrame, cities: pd.DataFrame, dists: pd.DataFrame, scope: str
-) -> pd.DataFrame:
-    if sections is not None and not sections.empty:
-        board = _board(sections, "section", lagging=True, n=SECTION_N)
-        if not board.empty:
-            return board
-    if scope == "national":
-        return _board(cities, "city", lagging=True, n=SECTION_N)
-    return _board(dists, "distributor", lagging=True, n=SECTION_N)
 
 
 def _this_week_doors(action: Any | None, scope: str, city: str | None, distributor: str | None) -> pd.DataFrame:
@@ -774,16 +916,16 @@ def _this_week_doors(action: Any | None, scope: str, city: str | None, distribut
         call = r.get("call_status") or r.get("Call") or r.get("recommended_action") or ""
         ask_mt = _num(r, "_ask") if "_ask" in r.index else _num(r, "week_target_mt")
         ask_kg = int(round(ask_mt * 1000)) if ask_mt else None
-        do = r.get("instruction") or r.get("Do this") or ""
+        call = str(call)
         rows.append(
             {
                 "Shop": str(shop),
                 "City": str(r.get("city") or r.get("City") or ""),
                 "Distributor": str(r.get("distributor") or r.get("Distributor") or ""),
                 "DSR": str(dsr),
-                "Call": str(call),
+                "Call": call,
                 "Ask (KG)": ask_kg,
-                "Do this": _short_action(do, 120),
+                "Do this": _door_do_this(call, ask_kg),
             }
         )
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
@@ -814,8 +956,9 @@ def _steps_to_potential(
     scope: str,
     city: str | None,
     distributor: str | None,
+    open_mtd: bool = False,
 ) -> pd.DataFrame:
-    cols = ["Step", "Volume at stake (MT)", "Owner", "Do this week"]
+    cols = ["Step", "Volume at stake (MT)", "Who", "Do this"]
     if focus is None or focus.empty:
         return pd.DataFrame(columns=cols)
     unvis = max(0.0, _num(focus, "from_unvisited_mt"))
@@ -824,85 +967,74 @@ def _steps_to_potential(
     gap = max(0.0, _num(focus, "gap_mt"))
     stretch = max(0.0, _num(focus, "stretch_mt"))
     gap_to_target = max(0.0, _num(focus, "gap_to_target_mt"))
-    ask_mt, ask_n = _action_ask_mt(action, scope, city, distributor)
+    ask_mt, ask_n = (0.0, 0)
+    if open_mtd:
+        ask_mt, ask_n = _action_ask_mt(action, scope, city, distributor)
     owner = {"national": "NSM", "city": "City manager", "distributor": "Distributor / ASM"}.get(scope, "NSM")
+    when = "this week" if open_mtd else "next"
     candidates: list[dict[str, Any]] = []
     if ask_mt >= 0.05:
         candidates.append(
             {
-                "title": "Call due doors that have not been visited",
+                "title": "Call due shops that have not been visited",
                 "mt": ask_mt,
                 "owner": "DSRs",
-                "do": (
-                    f"{ask_n} due shops. Immediate Ask {ask_mt:.1f} MT — depletion clock, not remaining-to-Expected. "
-                    "This is the closable slice this week."
-                ),
+                "do": f"{ask_n} shops are due. Call them {when}. Ask {ask_mt:.1f} MT.",
             }
         )
     if unvis >= 0.25:
         candidates.append(
             {
-                "title": "Close coverage — universe doors not visited",
+                "title": "Cover shops not yet visited",
                 "mt": unvis,
                 "owner": owner,
-                "do": (
-                    f"{unvis:.1f} MT sits on unvisited doors. Ride with DSRs labelled Not working the beat. "
-                    "Do not print a lost-account list of the long tail."
-                ),
+                "do": f"{unvis:.1f} MT sits on unvisited shops. Ride with DSRs who are not working the beat.",
             }
         )
     if unbill >= 0.25:
         candidates.append(
             {
-                "title": "Convert visited doors that did not buy",
+                "title": "Convert shops that were visited but did not buy",
                 "mt": unbill,
                 "owner": "DSRs",
-                "do": (
-                    f"{unbill:.1f} MT is visits with no bill. Second call this week on those doors; "
-                    "check stock and pack, not a new beat."
-                ),
+                "do": f"{unbill:.1f} MT is visits with no bill. Call those shops again {when}.",
             }
         )
     if drop >= 0.25:
         candidates.append(
             {
-                "title": "Lift drop size on billed doors",
+                "title": "Lift drop size on billed shops",
                 "mt": drop,
                 "owner": owner,
-                "do": (
-                    f"{drop:.1f} MT is smaller orders on doors that already billed. "
-                    "Protect core / whale doors; do not dump stock."
-                ),
+                "do": f"{drop:.1f} MT is smaller orders on shops that already billed. Increase drop. Do not dump stock.",
             }
         )
     if lag_people is not None and not lag_people.empty:
-        names = [str(x) for x in lag_people["DSR"].head(4).tolist()]
-        people_gap = float(pd.to_numeric(lag_people.get("Gap (MT)"), errors="coerce").fillna(0).head(8).sum())
+        names = [str(x) for x in lag_people["DSR"].head(4).tolist()] if "DSR" in lag_people.columns else []
+        people_gap = _people_stake_mt(lag_people)
         labels = []
         if cap is not None and not cap.empty and "label" in cap.columns:
             for lab in ("Overloaded", "Not working the beat", "Not converting", "Not lifting drop"):
                 n_lab = int((cap["label"].astype(str) == lab).sum())
                 if n_lab:
                     labels.append(f"{n_lab} {lab.lower()}")
-        why = ", ".join(labels) if labels else "named people behind their Expected"
+        start = f"Start with {', '.join(names)}." if names else "Coach the named DSRs."
+        why = f"{', '.join(labels)}. " if labels else ""
         candidates.append(
             {
                 "title": "Coach lagging salespeople",
                 "mt": people_gap,
                 "owner": owner,
-                "do": f"{why}. Start with {', '.join(names)}. Label on the People sheet is the coaching script.",
+                "do": f"{why}{start}",
             }
         )
     if stretch >= 0.5 and gap_to_target > gap + 0.25:
         candidates.append(
             {
-                "title": "Close stretch versus the sales-team plan",
+                "title": "Close the stretch to the monthly target",
                 "mt": stretch,
                 "owner": owner,
-                "do": (
-                    f"{stretch:.1f} MT of the plan sits above Expected. That is quota, not a coverage miss. "
-                    "Do not print a lost-shop list for stretch. Lift drop on billed doors and hit due Ask."
-                ),
+                "do": f"Target is {stretch:.1f} MT above Expected. Lift drop and hit due shops. Do not print a lost-shop list.",
             }
         )
     if gap >= 0.25 and not candidates:
@@ -911,7 +1043,7 @@ def _steps_to_potential(
                 "title": "Close the Gap versus Expected",
                 "mt": gap,
                 "owner": owner,
-                "do": f"{gap:.1f} MT behind Expected. Work named distributors and DSRs on this pack, not the tail.",
+                "do": f"{gap:.1f} MT behind Expected. Work the named distributors and DSRs on this pack.",
             }
         )
     candidates.append(
@@ -919,7 +1051,7 @@ def _steps_to_potential(
             "title": "Protect and copy overperformers",
             "mt": 0.01,
             "owner": owner,
-            "do": "Do not raid winning cities, distributors, or DSRs for a firefight. Copy their beat and mix.",
+            "do": "Do not pull people or stock from winning beats. Copy their call cadence and mix.",
         }
     )
     ranked = sorted(candidates, key=lambda p: float(p.get("mt") or 0), reverse=True)[:STEP_N]
@@ -929,11 +1061,49 @@ def _steps_to_potential(
             {
                 "Step": f"{i}. {step['title']}",
                 "Volume at stake (MT)": _mt(step["mt"]) if float(step["mt"]) >= 0.5 else "—",
-                "Owner": step["owner"],
-                "Do this week": step["do"],
+                "Who": step["owner"],
+                "Do this": step["do"],
             }
         )
     return pd.DataFrame(rows, columns=cols)
+
+
+def _people_stake_mt(lag_people: pd.DataFrame) -> float:
+    if lag_people is None or lag_people.empty:
+        return 0.0
+    if "vs Target (MT)" in lag_people.columns:
+        vs = pd.to_numeric(lag_people["vs Target (MT)"], errors="coerce").fillna(0)
+        return float((-vs.clip(upper=0)).head(8).sum())
+    if "Gap (MT)" in lag_people.columns:
+        return float(pd.to_numeric(lag_people["Gap (MT)"], errors="coerce").fillna(0).head(8).sum())
+    return 0.0
+
+
+def _plan_lines(kpis: dict[str, Any], steps: pd.DataFrame, open_mtd: bool) -> list[str]:
+    billed = float(kpis.get("billed_mt") or 0)
+    projected = float(kpis.get("projected_mt") or billed)
+    target = float(kpis.get("target_mt") or 0)
+    expected_today = float(kpis.get("expected_today_mt") or 0)
+    expected_full = float(kpis.get("expected_full_mt") or kpis.get("expected_mt") or 0)
+    vs_t = float(kpis.get("vs_target_mt") if kpis.get("vs_target_mt") is not None else (projected - target))
+    lines: list[str] = []
+    if open_mtd:
+        lines.append(f"Billed so far {billed:.0f} MT. Projected month-end {projected:.0f} MT.")
+        if expected_today > 0.05:
+            lines.append(f"Should have billed {expected_today:.0f} MT by today.")
+        if target > 0.05:
+            if vs_t >= -0.5:
+                lines.append(f"On track for the monthly target of {target:.0f} MT.")
+            else:
+                lines.append(f"Short of the monthly target ({target:.0f} MT) by {abs(vs_t):.0f} MT at this pace.")
+    else:
+        lines.append(f"Closed month billed {billed:.0f} MT. Expected was {expected_full:.0f} MT.")
+        if target > 0.05:
+            if billed + 0.5 >= target:
+                lines.append(f"Hit the monthly target of {target:.0f} MT.")
+            else:
+                lines.append(f"Missed the monthly target ({target:.0f} MT) by {max(0.0, target - billed):.0f} MT.")
+    return lines
 
 
 def _kpis(
@@ -955,12 +1125,21 @@ def _kpis(
     billed = _num(focus, "volume_mt") if focus is not None and not focus.empty else 0.0
     expected = _num(focus, "expected_mt") if focus is not None and not focus.empty else 0.0
     gap = max(0.0, _num(focus, "gap_mt") if focus is not None and not focus.empty else 0.0)
+    open_mtd = bool(mtd.get("open"))
+    projected = _projected(focus, open_mtd) if focus is not None and not focus.empty else billed
+    expected_full = _expected_full(focus, open_mtd) if focus is not None and not focus.empty else expected
+    target = _num(focus, "target_mt") if focus is not None and not focus.empty else 0.0
+    vs_target = projected - target
+    attain = (projected / target) if target > 0.05 else None
     return {
         "scope": scope,
         "situation": sit,
         "situation_label": _sit_label(sit),
         "billed_mt": billed,
         "expected_mt": expected,
+        "expected_today_mt": expected if open_mtd else expected_full,
+        "expected_full_mt": expected_full,
+        "projected_mt": projected,
         "gap_mt": gap,
         "ly_mt": _num(focus, "ly_mt") if focus is not None and not focus.empty else 0.0,
         "visit_pct": _pct(focus.get("visit_rate") if focus is not None and not focus.empty else None),
@@ -973,20 +1152,17 @@ def _kpis(
         "n_lagging_people": int(len(lag_p)) if lag_p is not None else 0,
         "n_ahead_people": int(len(ahead_p)) if ahead_p is not None else 0,
         "n_dsrs": int(len(dsrs)) if dsrs is not None and not dsrs.empty else 0,
-        "open_mtd": bool(mtd.get("open")),
+        "open_mtd": open_mtd,
         "as_of_day": mtd.get("as_of_day"),
         "days_in_month": mtd.get("days_in_month"),
         "country_billed_mt": float(_num(nat.iloc[0], "volume_mt")) if nat is not None and not nat.empty else billed,
         "country_gap_mt": max(0.0, float(_num(nat.iloc[0], "gap_mt"))) if nat is not None and not nat.empty else gap,
-        "target_mt": (
-            (_num(focus, "target_paced_mt") or _num(focus, "target_mt"))
-            if focus is not None and not focus.empty
-            else 0.0
-        ),
-        "target_full_mt": _num(focus, "target_mt") if focus is not None and not focus.empty else 0.0,
-        "gap_to_target_mt": max(0.0, _num(focus, "gap_to_target_mt") if focus is not None and not focus.empty else 0.0),
+        "target_mt": target,
+        "target_full_mt": target,
+        "vs_target_mt": vs_target,
+        "gap_to_target_mt": max(0.0, -vs_target),
         "stretch_mt": max(0.0, _num(focus, "stretch_mt") if focus is not None and not focus.empty else 0.0),
-        "attain_pct": float(focus.get("attain_pct")) if focus is not None and not focus.empty and pd.notna(focus.get("attain_pct")) else None,
+        "attain_pct": attain,
         "plan_quality": str(focus.get("plan_quality") or "") if focus is not None and not focus.empty else "",
         "plan_status": str(focus.get("plan_status") or "") if focus is not None and not focus.empty else "",
         "n_target_unmatched": int(_num(focus, "n_target_unmatched")) if focus is not None and not focus.empty else 0,
@@ -1034,29 +1210,45 @@ def _narrative(
     label: str,
 ) -> tuple[str, str, list[str]]:
     billed = float(kpis.get("billed_mt") or 0)
-    expected = float(kpis.get("expected_mt") or 0)
+    expected_today = float(kpis.get("expected_today_mt") or kpis.get("expected_mt") or 0)
+    expected_full = float(kpis.get("expected_full_mt") or kpis.get("expected_mt") or 0)
     gap = float(kpis.get("gap_mt") or 0)
+    projected = float(kpis.get("projected_mt") or billed)
+    target = float(kpis.get("target_mt") or 0)
+    vs_t = float(kpis.get("vs_target_mt") if kpis.get("vs_target_mt") is not None else (projected - target))
     sit = str(kpis.get("situation_label") or "On expected")
+    open_mtd = bool(kpis.get("open_mtd"))
     who = {"national": "Country", "city": city or "City", "distributor": distributor or "Distributor"}.get(
         scope, "Country"
     )
-    mtd_bit = ""
-    if kpis.get("open_mtd") and kpis.get("as_of_day"):
-        mtd_bit = f" Open MTD day {kpis.get('as_of_day')}/{kpis.get('days_in_month')}."
-    weather = (
-        f"{label}: {who} billed {billed:.0f} MT against {expected:.0f} Expected "
-        f"({sit.lower()}, Gap {gap:.0f} MT).{mtd_bit}"
-    )
-    target = float(kpis.get("target_mt") or 0)
-    if target > 0.05:
-        attain = kpis.get("attain_pct")
-        attain_txt = f"{float(attain)*100:.0f}%" if attain is not None else "—"
-        stretch = float(kpis.get("stretch_mt") or 0)
-        weather += (
-            f" Sales-team plan {target:.0f} MT ({attain_txt} attained). "
-            f"Stretch above Expected {stretch:.0f} MT."
+    attain = kpis.get("attain_pct")
+    attain_txt = f"{float(attain)*100:.0f}%" if attain is not None else "—"
+
+    if open_mtd:
+        weather = (
+            f"{label}: {who} billed {billed:.0f} MT so far. "
+            f"Projected month-end {projected:.0f} MT"
         )
-    if sit == "Lagging":
+        if target > 0.05:
+            weather += f" versus monthly target {target:.0f} MT ({attain_txt})."
+        else:
+            weather += "."
+        if expected_today > 0.05:
+            weather += f" Should have billed {expected_today:.0f} MT by today ({sit.lower()})."
+        else:
+            weather += f" {sit}."
+    else:
+        weather = (
+            f"{label}: {who} billed {billed:.0f} MT versus Expected {expected_full:.0f} MT "
+            f"({sit.lower()})."
+        )
+        if target > 0.05:
+            weather += f" Monthly target {target:.0f} MT ({attain_txt})."
+
+    short_target = target > 0.05 and vs_t < -0.5
+    if short_target:
+        headline = f"{who} is short of the monthly target by {abs(vs_t):.0f} MT at this pace."
+    elif sit == "Lagging":
         headline = f"{who} is behind Expected by {gap:.0f} MT."
     elif sit == "Ahead":
         headline = f"{who} is ahead of Expected. Protect the base."
@@ -1067,14 +1259,13 @@ def _narrative(
     if scope == "national":
         lag_names = _join_col(lag_c, "City")
         ahead_names = _join_col(ahead_c, "City")
-        city_line = (
+        paras.append(
             f"{int(kpis.get('n_lagging_cities') or 0)} cities lagging"
             + (f" ({lag_names})" if lag_names else "")
             + f"; {int(kpis.get('n_ahead_cities') or 0)} ahead"
             + (f" ({ahead_names})" if ahead_names else "")
-            + ". A city that moved with the country is not a hit-list."
+            + "."
         )
-        paras.append(city_line)
         dist_lag = _join_col(lag_d, "Distributor")
         dist_ahead = _join_col(ahead_d, "Distributor")
         paras.append(
@@ -1103,24 +1294,17 @@ def _narrative(
         + (f" ({people_lag})" if people_lag else "")
         + f"; {int(kpis.get('n_ahead_people') or 0)} to copy"
         + (f" ({people_ahead})" if people_ahead else "")
-        + ". Label is Overloaded / not visiting / not converting / not lifting drop — that is the coaching script."
+        + "."
     )
-    if steps is not None and not steps.empty:
+    if steps is not None and not steps.empty and "Step" in steps.columns:
         titles = [str(x).split(". ", 1)[-1] for x in steps["Step"].tolist()[:4]]
-        paras.append("Path to potential: " + "; ".join(titles) + ".")
+        paras.append("Next actions: " + "; ".join(titles) + ".")
     driver = str(kpis.get("driver") or "Mixed")
     paras.append(f"Main driver on this book: {driver}.")
-    target = float(kpis.get("target_mt") or 0)
     if target > 0.05:
         unmatched = int(kpis.get("n_target_unmatched") or 0)
-        quality = str(kpis.get("plan_quality") or "aligned")
-        status = str(kpis.get("plan_status") or "").replace("_", " ")
         extra = f" {unmatched} target shops did not match the universe." if unmatched else ""
-        paras.append(
-            f"Plan quality is {quality} ({status or 'on file'}). "
-            "Expected is still the run-rate; the plan is the quota."
-            + extra
-        )
+        paras.append("Expected is the run-rate. Target is the quota." + extra)
     return headline, weather, paras
 
 
@@ -1169,13 +1353,27 @@ def _excel_cover(wb: Workbook, pack: SituationPack) -> None:
     ws.merge_cells("A3:H3")
     row = 5
     kpis = pack.kpis or {}
-    metric_row = [
-        ("Billed (MT)", kpis.get("billed_mt")),
-        ("Expected (MT)", kpis.get("expected_mt")),
-        ("Gap (MT)", kpis.get("gap_mt")),
-        ("Situation", kpis.get("situation_label")),
-        ("Driver", kpis.get("driver")),
-        ("Target (MT)", kpis.get("target_mt") if float(kpis.get("target_mt") or 0) > 0 else None),
+    open_mtd = bool(kpis.get("open_mtd"))
+    has_plan = float(kpis.get("target_mt") or 0) > 0.05
+    if open_mtd:
+        metric_row = [
+            ("Billed so far (MT)", kpis.get("billed_mt")),
+            ("Projected month-end (MT)", kpis.get("projected_mt")),
+            ("Monthly target (MT)", kpis.get("target_mt") if has_plan else None),
+            ("vs Target (MT)", kpis.get("vs_target_mt") if has_plan else None),
+            ("Situation", kpis.get("situation_label")),
+            ("Driver", kpis.get("driver")),
+        ]
+    else:
+        metric_row = [
+            ("Billed (MT)", kpis.get("billed_mt")),
+            ("Expected (MT)", kpis.get("expected_full_mt") or kpis.get("expected_mt")),
+            ("Monthly target (MT)", kpis.get("target_mt") if has_plan else None),
+            ("vs Target (MT)", kpis.get("vs_target_mt") if has_plan else None),
+            ("Situation", kpis.get("situation_label")),
+            ("Driver", kpis.get("driver")),
+        ]
+    metric_row += [
         ("Lagging people", kpis.get("n_lagging_people")),
         ("Ahead people", kpis.get("n_ahead_people")),
     ]
@@ -1183,9 +1381,15 @@ def _excel_cover(wb: Workbook, pack: SituationPack) -> None:
         cell = ws.cell(row, i, name)
         cell.font = Font(bold=True, color="FFFFFF", size=9)
         cell.fill = _fill(HEX_NAVY)
-        v = ws.cell(row + 1, i, _mt(val) if isinstance(val, (int, float)) and name.endswith("(MT)") else val)
+        show_mt = isinstance(val, (int, float)) and name.endswith("(MT)")
+        v = ws.cell(row + 1, i, _mt(val) if show_mt else val)
         v.font = Font(size=12, bold=True)
     row = 8
+    if open_mtd and float(kpis.get("expected_today_mt") or 0) > 0.05:
+        ws.cell(row, 1, f"Should have billed {float(kpis.get('expected_today_mt') or 0):.0f} MT by today (Expected × day curve).")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.cell(row, 1).font = Font(size=9, italic=True, color=HEX_SLATE)
+        row += 1
     ws.cell(row, 1, "Current situation")
     ws.cell(row, 1).font = Font(bold=True, size=12, color=HEX_NAVY)
     row += 1
@@ -1194,6 +1398,16 @@ def _excel_cover(wb: Workbook, pack: SituationPack) -> None:
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
         ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
         ws.row_dimensions[row].height = 48
+        row += 1
+    if pack.plan_lines:
+        row += 1
+        ws.cell(row, 1, "Plan")
+        ws.cell(row, 1).font = Font(bold=True, size=12, color=HEX_NAVY)
+        row += 1
+        for line in pack.plan_lines:
+            ws.cell(row, 1, "• " + line)
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+            row += 1
         row += 1
     row += 1
     ws.cell(row, 1, "Copy from overperformers")
@@ -1240,6 +1454,7 @@ TEXT_COLS = {
     "Do this week",
     "Step",
     "Owner",
+    "Who",
 }
 
 
@@ -1300,15 +1515,29 @@ def _cover_flowables(pack: SituationPack, styles: dict[str, ParagraphStyle]) -> 
         Paragraph(xml_escape(pack.headline or ""), styles["headline"]),
     ]
     kpis = pack.kpis or {}
-    kpi_cells = [
-        ("Billed", f"{float(kpis.get('billed_mt') or 0):.0f} MT"),
-        ("Expected", f"{float(kpis.get('expected_mt') or 0):.0f} MT"),
-        ("Gap to potential", f"{float(kpis.get('gap_mt') or 0):.0f} MT"),
-        ("Target / plan", f"{float(kpis.get('target_mt') or 0):.0f} MT" if float(kpis.get("target_mt") or 0) > 0 else "—"),
-        ("Situation", str(kpis.get("situation_label") or "")),
-        ("Driver", str(kpis.get("driver") or "")),
-        ("Lagging people", str(kpis.get("n_lagging_people") or 0)),
-    ]
+    open_mtd = bool(kpis.get("open_mtd"))
+    has_plan = float(kpis.get("target_mt") or 0) > 0.05
+    billed = f"{float(kpis.get('billed_mt') or 0):.0f} MT"
+    projected = f"{float(kpis.get('projected_mt') or 0):.0f} MT"
+    expected = f"{float(kpis.get('expected_full_mt') or kpis.get('expected_mt') or 0):.0f} MT"
+    target = f"{float(kpis.get('target_mt') or 0):.0f} MT" if has_plan else "—"
+    vs_t = f"{float(kpis.get('vs_target_mt') or 0):.0f} MT" if has_plan else "—"
+    if open_mtd:
+        kpi_cells = [
+            ("Billed so far", billed),
+            ("Projected month-end", projected),
+            ("Monthly target", target),
+            ("vs Target", vs_t),
+            ("Situation", str(kpis.get("situation_label") or "")),
+        ]
+    else:
+        kpi_cells = [
+            ("Billed", billed),
+            ("Expected", expected),
+            ("Monthly target", target),
+            ("vs Target", vs_t),
+            ("Situation", str(kpis.get("situation_label") or "")),
+        ]
     kpi_data = [
         [Paragraph(xml_escape(n), styles["kpi_l"]) for n, _ in kpi_cells],
         [Paragraph(xml_escape(v), styles["kpi_v"]) for _, v in kpi_cells],
@@ -1328,10 +1557,25 @@ def _cover_flowables(pack: SituationPack, styles: dict[str, ParagraphStyle]) -> 
         )
     )
     story.append(kpi_table)
+    if open_mtd and float(kpis.get("expected_today_mt") or 0) > 0.05:
+        story.append(Spacer(1, 4))
+        story.append(
+            Paragraph(
+                xml_escape(
+                    f"Should have billed {float(kpis.get('expected_today_mt') or 0):.0f} MT by today "
+                    "(Expected × the national day curve)."
+                ),
+                styles["note"],
+            )
+        )
     story.append(Spacer(1, 8))
     story.append(Paragraph("Current situation", styles["h2"]))
     for para in pack.situation:
         story.append(Paragraph(xml_escape(para), styles["body"]))
+    if pack.plan_lines:
+        story.append(Paragraph("Plan", styles["h3"]))
+        for line in pack.plan_lines:
+            story.append(Paragraph(xml_escape("• " + line), styles["body"]))
     if pack.copy_from:
         story.append(Paragraph("Copy from overperformers", styles["h3"]))
         for line in pack.copy_from:
@@ -1383,7 +1627,7 @@ def _pdf_table(df: pd.DataFrame, styles: dict[str, ParagraphStyle], usable: floa
             val = row.get(h)
             text = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val)
             style = styles["td"] if h in TEXT_COLS else styles["td_right"]
-            cells.append(Paragraph(xml_escape(text), style))
+            cells.append(Paragraph(xml_escape(text).replace("\n", "<br/>"), style))
         data.append(cells)
         sit = str(row.get("Situation") or "")
         if sit == "Lagging":
@@ -1426,8 +1670,10 @@ def _col_widths(headers: list[str], usable: float) -> list[float]:
             weights.append(3.2)
         elif h in {"Shop", "Distributor", "DSR", "Area"}:
             weights.append(1.6)
-        elif h in {"Situation", "Label", "Driver", "Call"}:
+        elif h in {"Situation", "Label", "Driver", "Call", "Who", "Plan"}:
             weights.append(1.3)
+        elif "Projected" in h or "Monthly target" in h:
+            weights.append(1.15)
         else:
             weights.append(1.0)
     total = sum(weights) or 1.0

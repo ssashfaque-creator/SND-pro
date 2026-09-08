@@ -155,25 +155,33 @@ def focus():
 
 
 @app.get("/situation")
-def situation(scope: str = "national", city: Optional[str] = None, distributor: Optional[str] = None):
-    """Sendable situation cascade: under/over performers and steps to potential."""
-    from sndintel.situation_report import build_situation_pack
+def situation(
+    scope: str = "national",
+    city: Optional[str] = None,
+    distributor: Optional[str] = None,
+    period: Optional[str] = None,
+):
+    """Sendable situation cascade: under/over performers and next actions."""
+    from sndintel.situation_report import build_situation_pack, load_units_for_period
 
     with connect() as conn:
-        units = read_sql(conn, "SELECT * FROM unit_scorecards")
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
         period_df = read_sql(conn, "SELECT MAX(period) AS period FROM shop_month")
-    period = str(period_df.iloc[0]["period"]) if period_df is not None and not period_df.empty else ""
+        latest = str(period_df.iloc[0]["period"]) if period_df is not None and not period_df.empty else ""
+        period = period or latest
+        units = load_units_for_period(conn, period)
     pack = build_situation_pack(
         units, ledger=ledger, period=period, scope=scope, city=city, distributor=distributor
     )
     return {
         "period": pack.period,
+        "label": pack.label,
         "scope": pack.scope,
         "scope_label": pack.scope_label,
         "headline": pack.headline,
         "weather": pack.weather,
         "situation": pack.situation,
+        "plan": pack.plan_lines,
         "kpis": pack.kpis,
         "steps": pack.steps.to_dict(orient="records") if pack.steps is not None else [],
         "lagging_cities": pack.lagging_cities.to_dict(orient="records") if pack.lagging_cities is not None else [],

@@ -9,12 +9,15 @@ import pandas as pd
 
 from sndintel.briefing import build_strategy_pack
 from sndintel.hierarchy import build_hierarchy_pack
+from sndintel.plan import attach_plan
 from sndintel.situation_report import (
     build_field_packs,
     build_situation_pack,
     excel_bytes,
+    iter_situation_sheets,
     list_situation_entities,
     pdf_bytes,
+    scorecards_for_period,
     zip_field_packs,
 )
 
@@ -191,3 +194,156 @@ def test_situation_pack_does_not_need_strategy_pack():
     assert "Situation" not in strategy.cities.columns
     assert "Situation" in sit.lagging_cities.columns or sit.lagging_cities.empty
     assert sit.kpis.get("gap_mt", 0) >= 0
+
+
+def _mtd_world():
+    """September 2026 open through day 8 of a 30-day month."""
+    rows = []
+    rows.append(_row("K1", "2026-09", 8.0, "Karachi", "Eva Foods", "Amir", name="Kifaya", section="Clifton"))
+    rows.append(_row("K1", "2025-09", 40.0, "Karachi", "Eva Foods", "Amir", name="Kifaya", section="Clifton"))
+    rows.append(_row("K2", "2026-09", 6.0, "Karachi", "South Dist", "Karachi Weak", name="Quiet K", section="Korangi"))
+    rows.append(_row("K2", "2025-09", 30.0, "Karachi", "South Dist", "Karachi Weak", name="Quiet K", section="Korangi"))
+    rows.append(_row("L1", "2026-09", 12.0, "Lahore", "Holding Dist", "Lahore Ace", name="Big L", section="Gulberg"))
+    rows.append(_row("L1", "2025-09", 40.0, "Lahore", "Holding Dist", "Lahore Ace", name="Big L", section="Gulberg"))
+    rows.append(_row("L2", "2026-09", 5.0, "Lahore", "North Dist", "Lahore Steady", name="Steady L", section="Model Town"))
+    rows.append(_row("L2", "2025-09", 18.0, "Lahore", "North Dist", "Lahore Steady", name="Steady L", section="Model Town"))
+    extra = []
+    for r in list(rows):
+        if r["period"] != "2026-09":
+            continue
+        hist = {"K1": 40.0, "K2": 30.0, "L1": 42.0, "L2": 19.0}[r["store_id"]]
+        for per in ("2026-06", "2026-07", "2026-08"):
+            extra.append({**r, "period": per, "year": int(per[:4]), "month": int(per[5:7]), "volume_mt": hist})
+    sm = pd.DataFrame(rows + extra)
+    ledger = pd.DataFrame(
+        [
+            {"period": "2026-08", "status": "closed", "as_of_day": 31, "days_in_month": 31},
+            {
+                "period": "2026-09",
+                "status": "mtd_open",
+                "as_of_day": 8,
+                "days_in_month": 30,
+                "execution_date": "2026-09-08",
+            },
+        ]
+    )
+    hier = build_hierarchy_pack(sm, _stores(rows + extra), ledger=ledger, period="2026-09")
+    targets = pd.DataFrame(
+        [
+            {
+                "store_id": "K1",
+                "store_name": "Kifaya",
+                "city": "Karachi",
+                "distributor": "Eva Foods",
+                "dsr_name": "Amir",
+                "section": "Clifton",
+                "target_mt": 50.0,
+                "match_method": "id",
+            },
+            {
+                "store_id": "K2",
+                "store_name": "Quiet K",
+                "city": "Karachi",
+                "distributor": "South Dist",
+                "dsr_name": "Karachi Weak",
+                "section": "Korangi",
+                "target_mt": 40.0,
+                "match_method": "id",
+            },
+            {
+                "store_id": "L1",
+                "store_name": "Big L",
+                "city": "Lahore",
+                "distributor": "Holding Dist",
+                "dsr_name": "Lahore Ace",
+                "section": "Gulberg",
+                "target_mt": 55.0,
+                "match_method": "id",
+            },
+            {
+                "store_id": "L2",
+                "store_name": "Steady L",
+                "city": "Lahore",
+                "distributor": "North Dist",
+                "dsr_name": "Lahore Steady",
+                "section": "Model Town",
+                "target_mt": 25.0,
+                "match_method": "id",
+            },
+        ]
+    )
+    pace = 1.0
+    if hier.units is not None and not hier.units.empty and "intra_month_frac" in hier.units.columns:
+        pace = float(pd.to_numeric(hier.units["intra_month_frac"], errors="coerce").dropna().max() or 1.0)
+    units = attach_plan(hier.units, targets, pace=pace)
+    return sm, units, ledger, pace
+
+
+def test_open_mtd_label_is_not_a_calendar_date():
+    sm, units, ledger, _pace = _mtd_world()
+    pack = build_situation_pack(units, ledger=ledger, period="2026-09")
+    blob = " ".join([pack.label, pack.weather, pack.headline] + list(pack.situation) + list(pack.plan_lines))
+    assert "8/30" not in blob
+    assert "8/30" not in pack.label
+    assert "Sep 2026" in pack.label
+    assert "8 Sep" in pack.label
+    assert "30-day" in pack.label
+
+
+def test_mtd_projects_month_end_against_full_monthly_target():
+    sm, units, ledger, pace = _mtd_world()
+    pack = build_situation_pack(units, ledger=ledger, period="2026-09")
+    kpis = pack.kpis
+    billed = float(kpis["billed_mt"])
+    assert kpis["open_mtd"] is True
+    assert kpis["target_mt"] == 170
+    assert kpis["target_mt"] != kpis.get("target_paced_mt")
+    assert abs(kpis["projected_mt"] - billed / pace) < 0.6
+    assert abs(kpis["vs_target_mt"] - (kpis["projected_mt"] - 170)) < 0.6
+    assert "Projected month-end (MT)" in pack.lagging_cities.columns or pack.lagging_cities.empty or "Projected month-end (MT)" in pack.ahead_cities.columns
+    assert pack.plan_lines
+    assert any("Projected month-end" in line for line in pack.plan_lines)
+    assert any("monthly target" in line.lower() for line in pack.plan_lines)
+
+
+def test_do_this_is_short_and_plain():
+    sm, units, ledger, _pace = _mtd_world()
+    pack = build_situation_pack(units, ledger=ledger, period="2026-09")
+    blobs = []
+    for df in (pack.lagging_cities, pack.lagging_distributors, pack.lagging_people, pack.steps, pack.ahead_cities):
+        if df is None or df.empty:
+            continue
+        col = "Do this" if "Do this" in df.columns else ("Do this week" if "Do this week" in df.columns else None)
+        if not col:
+            continue
+        blobs.extend(str(x) for x in df[col].tolist())
+    joined = " ".join(blobs)
+    assert "Drivers:" not in joined
+    assert "velocity" not in joined.lower()
+    assert "depletion clock" not in joined.lower()
+    for text in blobs:
+        assert len(text) < 220
+
+
+def test_weak_areas_are_gone():
+    sm, hier = _world()
+    pack = build_situation_pack(hier.units, period="2026-08")
+    headings = [heading for _sheet, heading, _note, _df in iter_situation_sheets(pack)]
+    assert not any("weak" in h.lower() for h in headings)
+    xls = excel_bytes(pack)
+    from openpyxl import load_workbook
+
+    wb = load_workbook(BytesIO(xls))
+    assert not any("weak" in s.lower() for s in wb.sheetnames)
+    assert any("plan" in s.lower() and "action" in s.lower() for s in wb.sheetnames)
+
+
+def test_closed_month_cut_has_no_projection():
+    sm, units, ledger, _pace = _mtd_world()
+    closed_units = scorecards_for_period(sm, _stores(sm.to_dict("records")), ledger, "2026-08")
+    pack = build_situation_pack(closed_units, ledger=ledger, period="2026-08")
+    assert pack.kpis["open_mtd"] is False
+    assert "closed month" in pack.label.lower()
+    assert pack.lagging_cities.empty or "Projected month-end (MT)" not in pack.lagging_cities.columns
+    assert abs(pack.kpis["projected_mt"] - pack.kpis["billed_mt"]) < 0.05
+    assert pack.this_week is None or pack.this_week.empty

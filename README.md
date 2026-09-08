@@ -146,7 +146,7 @@ rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
 cd ~/sndintel && source .venv/bin/activate && pip install -e . && snd-intel app
 ```
 
-Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.9.0**. Open **Report → Situation cascade**. That is the pack you send: national HQ (overall situation, cities/distributors/people under and over, billed vs Expected vs sales-team plan, five steps to close the Gap), then one city pack and one distributor pack. This week → Monday dispatch is still the operating call list. Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8; official Expected on Gap cards is still last-3 / last-6 paced by the national day curve.
+Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.9.1**. Open **Report → Situation cascade**. Choose **MTD (this month)** for the in-month pack (billed so far, projected month-end, full monthly target) or **Monthly closing** and pick a finished month. National HQ first, then one city pack and one distributor pack. Weak-area pages are gone. Do this is a short next action, not a scorecard essay. This week → Monday dispatch is still the operating call list. Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8; official Expected on Gap cards is still last-3 / last-6 paced by the national day curve.
 
 Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates). Optionally drop **shop-wise targets** (quota / plan) — they do not replace Expected. Leave **Replace all billed sales** unticked for a weekly refresh: days in the new file override the same shop-days (a later 20 Aug file replaces an incomplete 20 Aug); other days stay. Tick replace-all only when switching from Shop SKU Wise or wiping billed history. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
 
@@ -167,11 +167,11 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 
 | Question | Where it shows up |
 |---|---|
-| What is the national situation, and who is under / over? | Report → Situation cascade → National HQ |
-| Are we on the sales-team plan, or only on Expected? | Situation KPIs Target / attainment / stretch; Warehouse → Shop plan for match quality |
+| What is the national situation, and who is under / over? | Report → Situation cascade → National HQ (MTD or Monthly closing) |
+| Are we on the monthly target, or only on Expected? | Situation KPIs: projected month-end vs full monthly target |
 | What should we send each city / distributor? | Same page: City pack / Distributor pack, or ZIP of every pack |
 | Which salespeople are lagging, and why? | Situation pack People sheets; capacity label is the coaching script |
-| What steps close the Gap to potential? | Situation pack → Steps to potential (ranked by MT) |
+| What is the plan, and what do we do next? | Situation pack → Plan and next actions |
 | How is each city doing vs what it should be billing? | Situation cities; Strategy city waterfall for the full scorecard |
 | Which distributor / DSR / shop in that city? | City pack; named targets; detailed scorecards |
 | Which areas/shops must we focus on this week? | Situation this-week doors + Monday dispatch |

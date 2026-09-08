@@ -35,12 +35,13 @@ from sndintel.situation_report import (
     excel_bytes as situation_excel_bytes,
     list_situation_entities,
     pdf_bytes as situation_pdf_bytes,
+    scorecards_for_period,
     zip_field_packs,
 )
 from sndintel import __version__
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
-from sndintel.mtd import banner_text, period_state
+from sndintel.mtd import banner_text, format_period_label, period_state
 from sndintel.monday import monday_summary_sheets
 from sndintel.ops import (
     beat_owner_options,
@@ -189,6 +190,10 @@ def load_all():
             data["shop_targets"] = read_sql(conn, "SELECT * FROM shop_targets")
         except Exception:
             data["shop_targets"] = pd.DataFrame()
+        try:
+            data["mtd_obs"] = read_sql(conn, "SELECT * FROM mtd_observations")
+        except Exception:
+            data["mtd_obs"] = pd.DataFrame()
     return data
 
 
@@ -781,7 +786,7 @@ def _strategy_table(df: pd.DataFrame, height: int = 320):
         elif name in {"Billed shops", "Visited shops", "Universe", "Visits MTD"}:
             cfg[col] = st.column_config.NumberColumn(name, format="%.0f")
     n = max(3, len(df))
-    row_h = 56 if "Remarks" in df.columns else 28
+    row_h = 56 if "Remarks" in df.columns else (40 if "Do this" in df.columns else 28)
     st.dataframe(
         df,
         use_container_width=True,
@@ -1003,8 +1008,8 @@ def _load_action(data, period, ledger):
 def _page_report(data, _latest, period, mtd, ledger):
     st.title("Report")
     st.caption(
-        f"**{mtd['label'] or period}** · Situation cascade is the pack you send: national HQ first, "
-        "then one city pack and one distributor pack. No API key. Detailed scorecards stay as the working file."
+        f"**{mtd['label'] or period}** · Situation cascade is the pack you send. "
+        "MTD is the in-month cut. Monthly closing is a finished month you pick."
     )
     units = data.get("units", pd.DataFrame())
     if units is None or units.empty:
@@ -1025,8 +1030,82 @@ def _page_report(data, _latest, period, mtd, ledger):
     _rescore_button()
 
 
+def _closed_periods(ledger, shop_month) -> list[str]:
+    periods: list[str] = []
+    if shop_month is not None and not shop_month.empty and "period" in shop_month.columns:
+        periods = sorted({str(p) for p in shop_month["period"].dropna().astype(str)})
+    elif ledger is not None and not ledger.empty and "period" in ledger.columns:
+        periods = sorted({str(p) for p in ledger["period"].dropna().astype(str)})
+    return [p for p in periods if not period_state(ledger, p).get("open")]
+
+
+def _open_period(ledger, fallback: str) -> str | None:
+    if ledger is not None and not ledger.empty and "status" in ledger.columns:
+        open_rows = ledger[ledger["status"].astype(str) == "mtd_open"]
+        if not open_rows.empty and "period" in open_rows.columns:
+            return str(open_rows["period"].astype(str).max())
+    if fallback and period_state(ledger, fallback).get("open"):
+        return str(fallback)
+    return None
+
+
+def _units_for_situation(data, live_units, live_period: str, selected: str):
+    selected = str(selected or "")
+    if selected and selected == str(live_period or "") and live_units is not None and not live_units.empty:
+        return live_units
+    shop_month = data.get("shop_month", pd.DataFrame())
+    fp = f"{selected}:{0 if shop_month is None or shop_month.empty else len(shop_month)}"
+    cached = st.session_state.get("sit_units_cache")
+    if isinstance(cached, dict) and cached.get("fp") == fp and cached.get("units") is not None:
+        return cached["units"]
+    with st.spinner(f"Building {selected} scorecards…"):
+        units = scorecards_for_period(
+            shop_month,
+            data.get("stores"),
+            data.get("ledger"),
+            selected,
+            shop_targets=data.get("shop_targets"),
+            visits=data.get("visits"),
+            shop_day=data.get("shop_day"),
+            mtd_obs=data.get("mtd_obs"),
+            cached_units=live_units,
+        )
+    st.session_state["sit_units_cache"] = {"fp": fp, "units": units}
+    return units
+
+
 def _page_situation_cascade(data, units, period, mtd, ledger):
-    action = _load_action(data, period, ledger)
+    open_period = _open_period(ledger, period)
+    closed = _closed_periods(ledger, data.get("shop_month"))
+    cut_options = ["MTD (this month)", "Monthly closing"]
+    default_cut = 0 if open_period else 1
+    cut = st.radio("Report cut", cut_options, horizontal=True, index=default_cut, key="sit_cut")
+
+    sit_period = period
+    if cut == "MTD (this month)":
+        if not open_period:
+            st.info("No open month in the warehouse. Use Monthly closing to pick a finished month.")
+            return
+        sit_period = open_period
+    else:
+        if not closed:
+            st.info("No closed month in the warehouse yet.")
+            return
+        labels = {p: format_period_label(p, open_=False) or p for p in closed}
+        default_i = len(closed) - 1
+        sit_period = st.selectbox(
+            "Month",
+            closed,
+            index=default_i,
+            format_func=lambda p: labels.get(p, p),
+            key="sit_closed_month",
+        )
+
+    sit_units = _units_for_situation(data, units, period, sit_period)
+    sit_mtd = period_state(ledger, sit_period)
+    open_mtd = bool(sit_mtd.get("open"))
+    action = _load_action(data, sit_period, ledger) if open_mtd else None
+
     c1, c2, c3 = st.columns(3)
     with c1:
         report_type = st.selectbox("1. Send to", ["National HQ", "City", "Distributor"], key="sit_report_type")
@@ -1036,7 +1115,7 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
         if kind == "national":
             st.selectbox("2. Scope", ["Whole country"], disabled=True, key="sit_scope_national")
         else:
-            options = list_situation_entities(units, kind)
+            options = list_situation_entities(sit_units, kind)
             q = st.text_input("Search", placeholder=f"Type to filter {kind}s", key="sit_search")
             filtered = [o for o in options if not q or q.lower() in o.lower()]
             if not options:
@@ -1063,44 +1142,63 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
             dist = entity
 
     pack = build_situation_pack(
-        units, action=action, ledger=ledger, period=period, scope=kind, city=city, distributor=dist
+        sit_units, action=action, ledger=ledger, period=sit_period, scope=kind, city=city, distributor=dist
     )
     kpis = pack.kpis or {}
     st.markdown(f"**{pack.headline}**")
     st.caption(pack.weather)
     has_plan = float(kpis.get("target_mt") or 0) > 0.05
-    if has_plan:
-        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+    if open_mtd:
+        cols = st.columns(6 if has_plan else 4)
+        cols[0].metric("Billed so far (MT)", f"{float(kpis.get('billed_mt') or 0):.0f}")
+        cols[1].metric("Projected month-end (MT)", f"{float(kpis.get('projected_mt') or 0):.0f}")
+        if has_plan:
+            attain = kpis.get("attain_pct")
+            cols[2].metric(
+                "Monthly target (MT)",
+                f"{float(kpis.get('target_mt') or 0):.0f}",
+                delta=None if attain is None else f"{float(attain)*100:.0f}% of target",
+            )
+            cols[3].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.0f}")
+            cols[4].metric("Situation", str(kpis.get("situation_label") or "—"))
+            cols[5].metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
+        else:
+            cols[2].metric("Situation", str(kpis.get("situation_label") or "—"))
+            cols[3].metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
+        today = float(kpis.get("expected_today_mt") or 0)
+        if today > 0.05:
+            st.caption(f"Should have billed {today:.0f} MT by today (Expected × the national day curve).")
     else:
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m7 = None
-    m1.metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.0f}")
-    m2.metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.0f}")
-    m3.metric("Gap to potential (MT)", f"{float(kpis.get('gap_mt') or 0):.0f}")
-    if has_plan:
-        attain = kpis.get("attain_pct")
-        m4.metric(
-            "Plan (MT)",
-            f"{float(kpis.get('target_mt') or 0):.0f}",
-            delta=None if attain is None else f"{float(attain)*100:.0f}% attained",
-        )
-        m5.metric("Situation", str(kpis.get("situation_label") or "—"))
-        m6.metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
-        m7.metric("Ahead people", int(kpis.get("n_ahead_people") or 0))
-    else:
-        m4.metric("Situation", str(kpis.get("situation_label") or "—"))
-        m5.metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
-        m6.metric("Ahead people", int(kpis.get("n_ahead_people") or 0))
+        cols = st.columns(6 if has_plan else 4)
+        cols[0].metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.0f}")
+        cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_full_mt') or kpis.get('expected_mt') or 0):.0f}")
+        if has_plan:
+            attain = kpis.get("attain_pct")
+            cols[2].metric(
+                "Monthly target (MT)",
+                f"{float(kpis.get('target_mt') or 0):.0f}",
+                delta=None if attain is None else f"{float(attain)*100:.0f}% of target",
+            )
+            cols[3].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.0f}")
+            cols[4].metric("Situation", str(kpis.get("situation_label") or "—"))
+            cols[5].metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
+        else:
+            cols[2].metric("Situation", str(kpis.get("situation_label") or "—"))
+            cols[3].metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
 
     st.markdown("##### Current situation")
     for para in pack.situation:
         st.write(para)
+    if pack.plan_lines:
+        st.markdown("##### Plan")
+        for line in pack.plan_lines:
+            st.write("• " + line)
     if pack.copy_from:
         st.markdown("##### Copy from overperformers")
         for line in pack.copy_from:
             st.caption(line)
 
-    st.markdown("##### Steps to reach potential")
+    st.markdown("##### Next actions")
     _strategy_table(pack.steps, height=220)
 
     if kind == "national":
@@ -1129,19 +1227,18 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
         st.markdown("##### Overperforming sales staff")
         _strategy_table(pack.ahead_people, height=260)
 
-    st.markdown("##### Weak areas")
-    _strategy_table(pack.weak_areas, height=200)
-    st.markdown("##### This-week doors")
-    _strategy_table(pack.this_week, height=200)
+    if pack.this_week is not None and not pack.this_week.empty:
+        st.markdown("##### This-week doors")
+        _strategy_table(pack.this_week, height=200)
 
     safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(pack.scope_label))[:60]
     if fmt == "Excel":
         payload = situation_excel_bytes(pack)
-        name = f"SND_situation_{kind}_{safe}_{period}.xlsx"
+        name = f"SND_situation_{kind}_{safe}_{sit_period}.xlsx"
         mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     else:
         payload = situation_pdf_bytes(pack)
-        name = f"SND_situation_{kind}_{safe}_{period}.pdf"
+        name = f"SND_situation_{kind}_{safe}_{sit_period}.pdf"
         mime = "application/pdf"
     st.download_button(
         f"Download {report_type.lower()} situation pack ({fmt})",
@@ -1150,13 +1247,13 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
         mime=mime,
         type="primary",
     )
-    st.caption("Situation PDF starts with the situation and the five steps, not the glossary.")
+    st.caption("Situation PDF starts with billed, projected month-end, and the monthly target — not the glossary.")
 
     z1, z2 = st.columns(2)
     with z1:
         if st.button("Build ZIP of every city pack (PDF)", key="sit_zip_cities"):
             with st.spinner("Writing one PDF per city."):
-                packs = build_field_packs(units, action=action, ledger=ledger, period=period, kind="city")
+                packs = build_field_packs(sit_units, action=action, ledger=ledger, period=sit_period, kind="city")
                 st.session_state["sit_city_zip"] = zip_field_packs(packs, fmt="pdf")
                 st.session_state["sit_city_zip_n"] = len(packs)
         if st.session_state.get("sit_city_zip"):
@@ -1164,14 +1261,14 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
             st.download_button(
                 f"Download {n} city packs",
                 st.session_state["sit_city_zip"],
-                file_name=f"SND_city_packs_{period}.zip",
+                file_name=f"SND_city_packs_{sit_period}.zip",
                 mime="application/zip",
                 key="sit_zip_cities_dl",
             )
     with z2:
         if st.button("Build ZIP of every distributor pack (PDF)", key="sit_zip_dists"):
             with st.spinner("Writing one PDF per distributor."):
-                packs = build_field_packs(units, action=action, ledger=ledger, period=period, kind="distributor")
+                packs = build_field_packs(sit_units, action=action, ledger=ledger, period=sit_period, kind="distributor")
                 st.session_state["sit_dist_zip"] = zip_field_packs(packs, fmt="pdf")
                 st.session_state["sit_dist_zip_n"] = len(packs)
         if st.session_state.get("sit_dist_zip"):
@@ -1179,7 +1276,7 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
             st.download_button(
                 f"Download {n} distributor packs",
                 st.session_state["sit_dist_zip"],
-                file_name=f"SND_distributor_packs_{period}.zip",
+                file_name=f"SND_distributor_packs_{sit_period}.zip",
                 mime="application/zip",
                 key="sit_zip_dists_dl",
             )

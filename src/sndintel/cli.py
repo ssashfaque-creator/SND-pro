@@ -431,17 +431,19 @@ def situation(
     scope: str = typer.Option("national", help="national, city, or distributor"),
     city: Optional[str] = typer.Option(None, help="City name when scope is city or distributor"),
     distributor: Optional[str] = typer.Option(None, help="Distributor name when scope is distributor"),
+    period: Optional[str] = typer.Option(None, help="YYYY-MM. Default is the latest month."),
 ):
-    """Print the sendable situation cascade (under/over performers + steps to potential)."""
+    """Print the sendable situation cascade (under/over performers + next actions)."""
     init_db()
     from sndintel.features import latest_period
-    from sndintel.situation_report import build_situation_pack
+    from sndintel.situation_report import build_situation_pack, load_units_for_period
 
     with connect() as conn:
-        units = read_sql(conn, "SELECT * FROM unit_scorecards")
         shop_month = read_sql(conn, "SELECT * FROM shop_month")
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
-        period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+        latest = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+        period = period or latest
+        units = load_units_for_period(conn, period)
     if units is None or units.empty:
         console.print("No scorecards yet. Run [bold]snd-intel ingest[/] or [bold]snd-intel rescore[/].")
         raise typer.Exit(1)
@@ -452,40 +454,54 @@ def situation(
     console.print(pack.weather)
     for para in pack.situation:
         console.print(para)
+    if pack.plan_lines:
+        console.print("[bold]Plan[/]")
+        for line in pack.plan_lines:
+            console.print(f"• {line}")
     if pack.steps is not None and not pack.steps.empty:
-        table = Table(title="Steps to potential")
+        table = Table(title="Next actions")
         table.add_column("Step")
         table.add_column("MT", justify="right")
-        table.add_column("Do this week")
+        table.add_column("Do this")
+        do_col = "Do this" if "Do this" in pack.steps.columns else "Do this week"
         for _, row in pack.steps.iterrows():
-            table.add_row(str(row.get("Step") or ""), str(row.get("Volume at stake (MT)") or ""), str(row.get("Do this week") or "")[:90])
+            table.add_row(str(row.get("Step") or ""), str(row.get("Volume at stake (MT)") or ""), str(row.get(do_col) or "")[:90])
         console.print(table)
     if pack.lagging_cities is not None and not pack.lagging_cities.empty:
         table = Table(title="Cities lagging")
         table.add_column("City")
-        table.add_column("Gap", justify="right")
-        table.add_column("Driver")
+        table.add_column("Billed", justify="right")
+        table.add_column("Target", justify="right")
+        table.add_column("Do this")
         for _, row in pack.lagging_cities.head(8).iterrows():
-            table.add_row(str(row.get("City") or ""), str(row.get("Gap (MT)") or ""), str(row.get("Driver") or ""))
+            table.add_row(
+                str(row.get("City") or ""),
+                str(row.get("Billed (MT)") or ""),
+                str(row.get("Monthly target (MT)") or ""),
+                str(row.get("Do this") or "")[:70],
+            )
         console.print(table)
     if pack.lagging_people is not None and not pack.lagging_people.empty:
         table = Table(title="Underperforming sales staff")
         table.add_column("DSR")
         table.add_column("City")
         table.add_column("Label")
-        table.add_column("Gap", justify="right")
+        table.add_column("Do this")
         for _, row in pack.lagging_people.head(10).iterrows():
             table.add_row(
                 str(row.get("DSR") or ""),
                 str(row.get("City") or ""),
                 str(row.get("Label") or ""),
-                str(row.get("Gap (MT)") or ""),
+                str(row.get("Do this") or "")[:70],
             )
         console.print(table)
 
 
 @app.command("export-situation")
-def export_situation(path: Path = typer.Argument(Path("SND_situation.pdf"))):
+def export_situation(
+    path: Path = typer.Argument(Path("SND_situation.pdf")),
+    period: Optional[str] = typer.Option(None, help="YYYY-MM. Default is the latest month."),
+):
     """Write national situation PDF/Excel plus a ZIP of every city pack and every distributor pack."""
     init_db()
     from sndintel.action import build_action_pack, load_action_pack
@@ -493,13 +509,13 @@ def export_situation(path: Path = typer.Argument(Path("SND_situation.pdf"))):
     from sndintel.situation_report import (
         build_field_packs,
         build_situation_pack,
+        load_units_for_period,
         write_excel,
         write_pdf,
         zip_field_packs,
     )
 
     with connect() as conn:
-        units = read_sql(conn, "SELECT * FROM unit_scorecards")
         shop_month = read_sql(conn, "SELECT * FROM shop_month")
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
         stores = read_sql(conn, "SELECT * FROM stores")
@@ -511,13 +527,18 @@ def export_situation(path: Path = typer.Argument(Path("SND_situation.pdf"))):
             visits = read_sql(conn, "SELECT * FROM shop_visits")
         except Exception:
             visits = pd.DataFrame()
-        period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
-        try:
-            action = load_action_pack(conn, period)
-        except Exception:
-            action = None
-        if action is None or not getattr(action, "headline", None):
-            action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+        latest = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+        period = period or latest
+        units = load_units_for_period(conn, period)
+        mtd = period_state(ledger, period)
+        action = None
+        if mtd.get("open"):
+            try:
+                action = load_action_pack(conn, period)
+            except Exception:
+                action = None
+            if action is None or not getattr(action, "headline", None):
+                action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
     pack = build_situation_pack(units, action=action, ledger=ledger, period=period)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
