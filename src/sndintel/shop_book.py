@@ -46,7 +46,7 @@ CLOSED_ISSUE_RANK = {
     "Lapsed": 3,
     "Beat Expected": 8,
     "On Expected": 9,
-    "No Expected": 10,
+    "No run-rate": 10,
 }
 MTD_ISSUE_RANK = {
     "Due · unvisited": 0,
@@ -56,8 +56,9 @@ MTD_ISSUE_RANK = {
     "Lapsed": 4,
     "Unvisited": 6,
     "On cycle": 9,
-    "No Expected": 10,
+    "No run-rate": 10,
 }
+MIX_SKIP = {"No run-rate"}
 ISSUE_LAG = {
     "Due · unvisited",
     "Due · no bill",
@@ -302,8 +303,10 @@ def _issue(row: dict[str, Any], open_mtd: bool, unvisited: bool, visited_no_bill
     remaining = float(row.get("remaining_mt") or 0)
     ask = float(row.get("week_target_mt") or 0)
     lapsed = bool(row.get("is_lapsed"))
+    has_bill = billed > ASK_MT
+    has_exp = expected > HOLE_MT
     if open_mtd:
-        if lapsed:
+        if lapsed and not has_bill:
             return "Lapsed"
         if ask > ASK_MT and unvisited:
             return "Due · unvisited"
@@ -311,18 +314,20 @@ def _issue(row: dict[str, Any], open_mtd: bool, unvisited: bool, visited_no_bill
             return "Due · no bill"
         if ask > ASK_MT:
             return "Due · light drop"
-        if visited_no_bill:
+        if visited_no_bill or (not has_bill and not unvisited):
             return "Visited, no bill"
-        if expected <= HOLE_MT and billed <= HOLE_MT:
-            return "No Expected"
+        if not has_exp and not has_bill:
+            return "No run-rate"
         return "On cycle"
-    if expected <= HOLE_MT and billed <= HOLE_MT:
-        return "No Expected"
-    if lapsed and billed <= HOLE_MT:
+    # Closed month: billed means any invoice (same as action call_status).
+    # 0.05 MT is the material hole, not a "did they bill / do they have Expected" cutoff.
+    if not has_exp and not has_bill:
+        return "No run-rate"
+    if not has_bill and lapsed:
         return "Lapsed"
-    if unvisited and remaining > HOLE_MT:
+    if not has_bill and unvisited:
         return "Unvisited"
-    if (visited_no_bill or billed <= HOLE_MT) and remaining > HOLE_MT:
+    if not has_bill:
         return "Unbilled"
     if remaining > HOLE_MT:
         return "Missed Expected"
@@ -368,8 +373,8 @@ def _comment(row: dict[str, Any], issue: str, open_mtd: bool) -> str:
         )
     if issue == "Beat Expected":
         return f"{name} billed {billed:.2f} MT versus Expected {expected:.2f} MT. Keep the same drop next month."
-    if issue == "No Expected":
-        return f"{name} has no Expected this month. Last billed {last_bit}."
+    if issue == "No run-rate":
+        return f"{name} has no material Expected this month. Last billed {last_bit}."
     return f"{name} landed on Expected ({billed:.2f} MT). Last billed {last_bit}."
 
 
@@ -397,6 +402,7 @@ def _kpis(shops: pd.DataFrame, open_mtd: bool) -> dict[str, Any]:
     ask = float(pd.to_numeric(shops.get("week_target_mt"), errors="coerce").fillna(0).sum()) if not shops.empty else 0.0
     issues = shops[shops["is_issue"]] if not shops.empty and "is_issue" in shops.columns else shops.iloc[0:0]
     issue_mt = float(pd.to_numeric(issues.get("remaining_mt"), errors="coerce").fillna(0).sum()) if not issues.empty else 0.0
+    quiet_n = int((shops["issue"] == "No run-rate").sum()) if not shops.empty and "issue" in shops.columns else 0
     due_n = int((pd.to_numeric(shops.get("week_target_mt"), errors="coerce").fillna(0) > ASK_MT).sum()) if open_mtd and not shops.empty else 0
     return {
         "open_mtd": open_mtd,
@@ -409,6 +415,7 @@ def _kpis(shops: pd.DataFrame, open_mtd: bool) -> dict[str, Any]:
         "n_shops": int(len(shops)),
         "n_issues": int(len(issues)),
         "issue_mt": issue_mt,
+        "n_quiet": quiet_n,
         "n_due": due_n,
         "n_unvisited": int((shops["issue"] == "Unvisited").sum()) if not shops.empty else 0,
         "n_unbilled": int((shops["issue"].isin(["Unbilled", "Visited, no bill", "Due · no bill"])).sum()) if not shops.empty else 0,
@@ -422,15 +429,20 @@ def _issue_mix(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
     order = list(MTD_ISSUE_RANK) if open_mtd else list(CLOSED_ISSUE_RANK)
     rows = []
     for issue in order:
+        if issue in MIX_SKIP:
+            continue
         part = shops[shops["issue"] == issue]
         if part.empty:
             continue
+        hole = float(pd.to_numeric(part["remaining_mt"], errors="coerce").fillna(0).sum())
+        if issue not in ISSUE_LAG:
+            hole = 0.0
         rec = {
             "Issue": issue,
             "Shops": int(len(part)),
             "Billed (MT)": round(float(pd.to_numeric(part["billed_mt"], errors="coerce").fillna(0).sum()), 2),
             "Expected (MT)": round(float(pd.to_numeric(part["expected_mt"], errors="coerce").fillna(0).sum()), 2),
-            "Hole (MT)": round(float(pd.to_numeric(part["remaining_mt"], errors="coerce").fillna(0).sum()), 2),
+            "Hole (MT)": round(hole, 2),
         }
         if open_mtd:
             rec["Ask (KG)"] = int(round(float(pd.to_numeric(part["week_target_mt"], errors="coerce").fillna(0).sum()) * 1000))
@@ -441,8 +453,8 @@ def _issue_mix(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
 def _headline(kpis: dict[str, Any], scope_label: str, label: str, open_mtd: bool) -> tuple[str, str]:
     billed = float(kpis.get("billed_mt") or 0)
     expected = float(kpis.get("expected_mt") or 0)
-    gap = float(kpis.get("gap_mt") or 0)
     n_iss = int(kpis.get("n_issues") or 0)
+    issue_mt = float(kpis.get("issue_mt") or 0)
     if open_mtd:
         n_due = int(kpis.get("n_due") or 0)
         ask_kg = int(round(float(kpis.get("ask_mt") or 0) * 1000))
@@ -457,7 +469,7 @@ def _headline(kpis: dict[str, Any], scope_label: str, label: str, open_mtd: bool
         return headline, weather
     headline = (
         f"{scope_label} closed {label}: billed {billed:.1f} MT versus Expected {expected:.1f} MT. "
-        f"{n_iss} shops missed Expected ({gap:.1f} MT hole)."
+        f"{n_iss} shops missed Expected ({issue_mt:.1f} MT hole)."
     )
     weather = (
         "This is a finished month. Issues are shops that missed Expected — "
@@ -475,8 +487,9 @@ def _how_to_read(open_mtd: bool) -> list[str]:
             "Target is the matched shop quota when a plan row exists. It does not replace Expected.",
         ]
     return [
-        "This is a closed month. Billed and Expected are the full month. Gap is Expected − billed.",
-        "Issues are shops that missed Expected: light orders, visited with no bill, unvisited, lapsed. Largest hole first.",
+        "This is a closed month. Billed and Expected are the full month. Gap on a shop is Expected − billed when that is positive.",
+        "Unbilled means visited and billed 0 this month. A 10–50 KG invoice is billed (light order / missed Expected), not unbilled.",
+        "Issues are shops that missed Expected: light orders, visited with no bill, unvisited, lapsed. Largest hole first. Universe doors with no material Expected are omitted from the mix.",
         "Usual drop is the 90-day expected drop (what they typically take). Ask is 0 on a closed month, so it is not on this list.",
         "Comment is next month, not this week. Target is the matched shop quota when a plan row exists.",
     ]
@@ -586,7 +599,13 @@ def excel_bytes(book: ShopBook) -> bytes:
         ws.cell(row, 1).font = Font(size=10, italic=True, color=HEX_SLATE)
         row += 1
     ws.column_dimensions["A"].width = 28
-    _sheet_table(wb, "01 Issue mix", "Issue mix", "Counts from existing shop fields. Not a new diagnosis model.", book.mix)
+    _sheet_table(
+        wb,
+        "01 Issue mix",
+        "Issue mix",
+        "Unbilled = visited and billed 0. A small invoice is Missed Expected. Universe doors with no run-rate are omitted.",
+        book.mix,
+    )
     note_iss = "Shops that are an issue on this cut, largest hole / Ask first."
     _sheet_table(wb, "02 Issues", "Issues", note_iss, book.issues)
     note_all = (
@@ -684,7 +703,11 @@ def write_pdf(book: ShopBook, path: Path | str | BytesIO) -> None:
     mix = book.mix
     if mix is not None and not mix.empty:
         heading = Paragraph("Issue mix", styles["h2"])
-        note = Paragraph("Counts from existing shop fields — not a new diagnosis.", styles["note"])
+        note = Paragraph(
+            "Unbilled = visited and billed 0 this month. A small invoice is Missed Expected, not unbilled. "
+            "Universe doors with no material Expected are omitted.",
+            styles["note"],
+        )
         table = _pdf_table(mix, styles, usable)
         story.append(KeepTogether([heading, note, Spacer(1, 2), table]))
     issues = book.issues

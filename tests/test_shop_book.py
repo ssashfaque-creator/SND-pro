@@ -7,7 +7,7 @@ from io import BytesIO
 import pandas as pd
 from openpyxl import load_workbook
 
-from sndintel.action import build_action_pack
+from sndintel.action import ActionPack, build_action_pack
 from sndintel.shop_book import build_shop_book, excel_bytes, list_shop_book_entities, pdf_bytes
 
 from test_situation_report import _mtd_world, _stores, _world
@@ -117,6 +117,113 @@ def test_mtd_attaches_matched_shop_target_without_replacing_expected():
     assert float(raw.loc["K1", "shop_target_mt"]) == 50.0
     assert float(raw.loc["K1", "expected_mt"]) != 50.0
     assert float(raw.loc["K1", "expected_mt"]) == float(action.raw_shops.set_index("store_id").loc["K1", "expected_mt"])
+
+
+def _closed_pack(rows):
+    shops = pd.DataFrame(rows)
+    if "remaining_mt" not in shops.columns:
+        shops["remaining_mt"] = (
+            pd.to_numeric(shops["expected_mt"], errors="coerce").fillna(0)
+            - pd.to_numeric(shops["billed_mt"], errors="coerce").fillna(0)
+        ).clip(lower=0)
+    return ActionPack(period="2026-08", label="Aug 2026", open_mtd=False, raw_shops=shops)
+
+
+def test_unbilled_is_billed_zero_not_a_tiny_invoice():
+    """0.05 MT was used as 'no bill', so Unbilled showed billed volume on the Karachi mix."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "U1",
+                "store_name": "Visited Zero",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 2.0,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "T1",
+                "store_name": "Tiny Invoice",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.02,
+                "expected_mt": 2.92,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08")
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Visited Zero"] == "Unbilled"
+    assert by_name["Tiny Invoice"] == "Missed Expected"
+    mix = book.mix.set_index("Issue")
+    assert float(mix.loc["Unbilled", "Billed (MT)"]) == 0.0
+    assert float(mix.loc["Unbilled", "Expected (MT)"]) == 2.0
+    assert "visited but not billed" in str(
+        book.issues.loc[book.issues["Shop"] == "Visited Zero", "Comment"].iloc[0]
+    ).lower()
+    tiny_comment = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Comment"].iloc[0]).lower()
+    assert "visited but not billed" not in tiny_comment
+    assert "2.92" in tiny_comment
+
+
+def test_no_run_rate_is_not_a_row_with_expected():
+    """0.05 MT was used as 'no Expected', so the mix showed Expected on No Expected."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "Q1",
+                "store_name": "Quiet",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.02,
+                "expected_mt": 0.03,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "Z1",
+                "store_name": "Universe",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 0.0,
+                "call_status": "Unvisited",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "M1",
+                "store_name": "Real Miss",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 1.0,
+                "expected_mt": 4.0,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08")
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Universe"] == "No run-rate"
+    assert by_name["Quiet"] == "On Expected"
+    assert by_name["Real Miss"] == "Missed Expected"
+    assert "No Expected" not in set(book.mix["Issue"].astype(str))
+    assert "No run-rate" not in set(book.mix["Issue"].astype(str))
+    assert book.kpis.get("n_quiet") == 1
 
 
 def test_pdf_and_excel_are_real_files():

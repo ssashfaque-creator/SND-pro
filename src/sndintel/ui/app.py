@@ -1424,6 +1424,14 @@ def _page_shop_book(data, period, mtd, ledger):
             st.write("• " + line)
 
     st.markdown("##### Issue mix")
+    quiet = int(kpis.get("n_quiet") or 0)
+    if quiet:
+        st.caption(
+            f"{quiet:,} universe doors with no material Expected and no bill are omitted from this mix. "
+            "Unbilled is visited with billed 0 — a small invoice is Missed Expected, not unbilled."
+        )
+    else:
+        st.caption("Unbilled is visited with billed 0 this month. A small invoice is Missed Expected, not unbilled.")
     _shop_book_table(book.mix, height=220)
 
     view = st.radio(
@@ -1838,7 +1846,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.9.4 (not 0.9.5), curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.9.5 (not 0.9.6), curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
