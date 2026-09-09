@@ -531,6 +531,12 @@ def shops(
             shop_targets = pd.DataFrame()
         latest = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
         period = period or latest
+        from sndintel.situation_report import load_units_for_period
+
+        try:
+            units = load_units_for_period(conn, period)
+        except Exception:
+            units = pd.DataFrame()
         action = None
         try:
             action = load_action_pack(conn, period)
@@ -541,6 +547,7 @@ def shops(
     book = build_shop_book(
         action=action,
         shop_targets=shop_targets,
+        units=units,
         ledger=ledger,
         period=period,
         scope=scope,

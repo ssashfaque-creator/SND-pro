@@ -1385,10 +1385,12 @@ def _page_shop_book(data, period, mtd, ledger):
         st.info("Choose a city, distributor, or DSR — type in Search to narrow the list.")
         return
 
+    sit_units = _units_for_situation(data, data.get("units"), period, sit_period)
     scoped = parse_shop_scope(kind, entity)
     book = build_shop_book(
         action=action,
         shop_targets=data.get("shop_targets"),
+        units=sit_units,
         ledger=ledger,
         period=sit_period,
         scope=kind,
@@ -1410,14 +1412,21 @@ def _page_shop_book(data, period, mtd, ledger):
         if has_plan:
             cols[5].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.1f}")
     else:
-        cols = st.columns(6 if has_plan else 5)
+        n_cols = 6 if has_plan else 4
+        cols = st.columns(n_cols)
         cols[0].metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.1f}")
         cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.1f}")
         cols[2].metric("Gap vs Expected (MT)", f"{float(kpis.get('gap_mt') or 0):.1f}")
         cols[3].metric("Issue shops", int(kpis.get("n_issues") or 0))
-        cols[4].metric("Hole (MT)", f"{float(kpis.get('issue_mt') or 0):.1f}")
         if has_plan:
-            cols[5].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.1f}")
+            cols[4].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.1f}")
+            cols[5].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.1f}")
+    if kpis.get("cover_from_scorecard"):
+        st.caption(
+            "Cover Billed / Expected / Target / Gap match Situation cascade for this scope. "
+            f"Shop-level holes total {float(kpis.get('issue_mt') or 0):.1f} MT and do not net shops that beat Expected. "
+            "Shop Target is a matched POP only."
+        )
 
     with st.expander("How to read this pack", expanded=False):
         for line in book.how_to_read:
@@ -1846,7 +1855,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.9.5 (not 0.9.6), curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.9.6 (not 0.9.7), curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
