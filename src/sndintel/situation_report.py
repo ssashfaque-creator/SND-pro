@@ -529,49 +529,55 @@ def write_pdf(pack: SituationPack, path: Path | str | BytesIO) -> None:
     doc = SimpleDocTemplate(
         path if not isinstance(path, (str, Path)) else str(path),
         pagesize=pagesize,
-        leftMargin=10 * mm,
-        rightMargin=10 * mm,
-        topMargin=14 * mm,
+        leftMargin=12 * mm,
+        rightMargin=12 * mm,
+        topMargin=16 * mm,
         bottomMargin=12 * mm,
         title=f"SND Intelligence · {pack.scope_label} situation",
         author="SND Intelligence",
     )
     styles = _pdf_styles()
-    story: list[Any] = []
-    story.extend(_cover_flowables(pack, styles))
     usable = pagesize[0] - doc.leftMargin - doc.rightMargin
-    for _sheet, heading, note, df in iter_situation_sheets(pack):
-        story.append(PageBreak())
-        block = [
-            Paragraph(xml_escape(heading), styles["h2"]),
-            Paragraph(xml_escape(note or ""), styles["note"]),
-            Spacer(1, 4),
-            _pdf_table(df, styles, usable),
-        ]
-        story.append(KeepTogether(block[:2]))
-        story.extend(block[2:])
+    story: list[Any] = []
+    story.extend(_cover_flowables(pack, styles, usable))
     story.append(PageBreak())
-    story.extend(_glossary_end(styles))
+    first_sheet = True
+    for _sheet, heading, note, df in iter_situation_sheets(pack):
+        n = 0 if df is None or getattr(df, "empty", True) else int(len(df))
+        heading_p = Paragraph(xml_escape(heading), styles["h2"])
+        note_p = Paragraph(xml_escape(note or ""), styles["note"])
+        table = _pdf_table(df, styles, usable)
+        parts = [heading_p, note_p, Spacer(1, 2), table]
+        if n <= 8:
+            if not first_sheet:
+                story.append(Spacer(1, 5 * mm))
+            story.append(KeepTogether(parts))
+        else:
+            if not first_sheet:
+                story.append(PageBreak())
+            story.append(KeepTogether([heading_p, note_p, Spacer(1, 2)]))
+            story.append(table)
+        first_sheet = False
+    story.append(PageBreak())
+    story.extend(_glossary_end(pack, styles, usable))
     scope = pack.scope_label or pack.scope or "national"
     label = pack.label or ""
+    closed = not bool((pack.kpis or {}).get("open_mtd"))
 
     def _on_page(canvas, doc_):
         canvas.saveState()
+        bar_h = 11 * mm
         canvas.setFillColor(NAVY)
-        canvas.rect(0, pagesize[1] - 9 * mm, pagesize[0], 9 * mm, fill=1, stroke=0)
+        canvas.rect(0, pagesize[1] - bar_h, pagesize[0], bar_h, fill=1, stroke=0)
         canvas.setFillColor(WHITE)
-        canvas.setFont("Helvetica-Bold", 8)
-        canvas.drawString(10 * mm, pagesize[1] - 6.2 * mm, "SND Intelligence · Situation")
+        canvas.setFont("Helvetica-Bold", 9)
+        canvas.drawString(12 * mm, pagesize[1] - 7 * mm, "SND Intelligence")
         canvas.setFont("Helvetica", 8)
-        canvas.drawRightString(
-            pagesize[0] - 10 * mm,
-            pagesize[1] - 6.2 * mm,
-            f"{scope}  ·  {label}  ·  {doc_.page}",
-        )
+        canvas.drawRightString(pagesize[0] - 12 * mm, pagesize[1] - 7 * mm, f"{scope}  ·  {label}")
         canvas.setFillColor(SLATE)
-        canvas.setFont("Helvetica", 7)
-        canvas.drawString(10 * mm, 5 * mm, EXPECTED_FORMULA)
-        canvas.drawRightString(pagesize[0] - 10 * mm, 5 * mm, f"Page {doc_.page}")
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(12 * mm, 5.5 * mm, "Monthly closing" if closed else "In-month MTD")
+        canvas.drawRightString(pagesize[0] - 12 * mm, 5.5 * mm, f"Page {doc_.page}")
         canvas.restoreState()
 
     doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
@@ -764,9 +770,9 @@ def _next_action_from_parts(drop: float, unb: float, unv: float, open_mtd: bool)
     )
     top = [k for k, v in ranked if v >= 0.25][:2]
     actions = {
-        "drop": f"lift drop on shops that already billed {when} — do not add coverage",
-        "unbilled": f"convert visited-no-bill shops {when} — same DSR, same doors",
-        "unvisited": f"cover unvisited shops first {when} — print the must-visit list by Expected",
+        "drop": f"lift drop on billed shops {when} — do not add coverage",
+        "unbilled": f"convert visited-no-bill shops {when}",
+        "unvisited": f"cover unvisited shops {when}",
     }
     if not top:
         return f"Hold billed drop and work the named lagging DSRs {when}."
@@ -957,7 +963,7 @@ def _unit_comment(
     extra = ""
     if sit == "lagging" or hole >= 0.5:
         if child_names:
-            extra += f" Worst books: {', '.join(child_names[:2])}."
+            extra += f" Worst: {', '.join(child_names[:2])}."
         if dsr_names:
             extra += f" Start with {', '.join(dsr_names[:3])}."
 
@@ -1884,6 +1890,8 @@ LINE = colors.HexColor("#CBD5E1")
 WASH = colors.HexColor("#F8FAFC")
 LAG = colors.HexColor("#FEF2F2")
 AHEAD = colors.HexColor("#F0FDF4")
+RED = colors.HexColor("#B91C1C")
+GREEN = colors.HexColor("#15803D")
 WHITE = colors.white
 
 TEXT_COLS = {
@@ -1905,53 +1913,105 @@ TEXT_COLS = {
     "Comment",
 }
 
+PDF_HEADERS = {
+    "Target (MT)": "Target",
+    "Expected (MT)": "Exp.",
+    "Billed (MT)": "Billed",
+    "Gap (MT)": "Gap",
+    "vs Target (MT)": "vs<br/>Target",
+    "Light orders (MT)": "Light",
+    "Unbilled (MT)": "Unbilled",
+    "Unvisited (MT)": "Unvis.",
+    "Monthly target (MT)": "Target",
+    "Projected month-end (MT)": "Projected",
+    "Volume at stake (MT)": "Stake",
+    "Visit %": "Visit",
+}
+
 
 def _pdf_styles() -> dict[str, ParagraphStyle]:
     base = getSampleStyleSheet()
     return {
         "kicker": ParagraphStyle(
-            "kicker", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8, textColor=SLATE, spaceAfter=4
+            "kicker", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8, textColor=SLATE, spaceAfter=3
         ),
         "h1": ParagraphStyle(
-            "h1", parent=base["Heading1"], fontName="Helvetica-Bold", fontSize=18, textColor=NAVY, spaceAfter=6, leading=22
+            "h1", parent=base["Heading1"], fontName="Helvetica-Bold", fontSize=18, textColor=NAVY, spaceAfter=4, leading=22
         ),
         "h2": ParagraphStyle(
-            "h2", parent=base["Heading2"], fontName="Helvetica-Bold", fontSize=13, textColor=NAVY, spaceBefore=0, spaceAfter=4
+            "h2", parent=base["Heading2"], fontName="Helvetica-Bold", fontSize=12, textColor=NAVY, spaceBefore=0, spaceAfter=3, leading=15
         ),
         "h3": ParagraphStyle(
-            "h3", parent=base["Heading3"], fontName="Helvetica-Bold", fontSize=11, textColor=NAVY, spaceBefore=6, spaceAfter=3
+            "h3", parent=base["Heading3"], fontName="Helvetica-Bold", fontSize=10.5, textColor=NAVY, spaceBefore=8, spaceAfter=3, leading=13
         ),
         "headline": ParagraphStyle(
-            "headline", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=12, textColor=NAVY, leading=16, spaceAfter=6
+            "headline", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=11.5, textColor=NAVY, leading=15, spaceAfter=8
         ),
         "body": ParagraphStyle(
-            "body", parent=base["Normal"], fontName="Helvetica", fontSize=9, textColor=NAVY, leading=13, spaceAfter=4
+            "body", parent=base["Normal"], fontName="Helvetica", fontSize=9, textColor=NAVY, leading=12.5, spaceAfter=3.5
+        ),
+        "lead": ParagraphStyle(
+            "lead", parent=base["Normal"], fontName="Helvetica", fontSize=9.5, textColor=NAVY, leading=13, spaceAfter=6
         ),
         "note": ParagraphStyle(
             "note", parent=base["Normal"], fontName="Helvetica-Oblique", fontSize=8, textColor=SLATE, leading=11, spaceAfter=2
         ),
         "th": ParagraphStyle(
-            "th", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=7, textColor=WHITE, leading=9, alignment=TA_LEFT
+            "th", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=6.5, textColor=WHITE, leading=8.5, alignment=TA_LEFT
+        ),
+        "th_right": ParagraphStyle(
+            "th_right", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=6.5, textColor=WHITE, leading=8.5, alignment=TA_RIGHT
         ),
         "td": ParagraphStyle(
-            "td", parent=base["Normal"], fontName="Helvetica", fontSize=7.5, textColor=NAVY, leading=10, alignment=TA_LEFT
+            "td", parent=base["Normal"], fontName="Helvetica", fontSize=8, textColor=NAVY, leading=10.5, alignment=TA_LEFT
         ),
         "td_right": ParagraphStyle(
-            "td_right", parent=base["Normal"], fontName="Helvetica", fontSize=7.5, textColor=NAVY, leading=10, alignment=TA_RIGHT
+            "td_right", parent=base["Normal"], fontName="Helvetica", fontSize=8, textColor=NAVY, leading=10.5, alignment=TA_RIGHT
+        ),
+        "td_wrap": ParagraphStyle(
+            "td_wrap", parent=base["Normal"], fontName="Helvetica", fontSize=8, textColor=NAVY, leading=11, alignment=TA_LEFT
         ),
         "kpi_l": ParagraphStyle(
-            "kpi_l", parent=base["Normal"], fontName="Helvetica", fontSize=7, textColor=SLATE, leading=9, alignment=TA_LEFT
+            "kpi_l", parent=base["Normal"], fontName="Helvetica", fontSize=6.5, textColor=WHITE, leading=8.5, alignment=TA_LEFT
         ),
         "kpi_v": ParagraphStyle(
-            "kpi_v", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=12, textColor=NAVY, leading=14, alignment=TA_LEFT
+            "kpi_v", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=13, textColor=NAVY, leading=16, alignment=TA_LEFT
+        ),
+        "kpi_v_bad": ParagraphStyle(
+            "kpi_v_bad", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=13, textColor=RED, leading=16, alignment=TA_LEFT
+        ),
+        "kpi_v_good": ParagraphStyle(
+            "kpi_v_good", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=13, textColor=GREEN, leading=16, alignment=TA_LEFT
         ),
         "gloss": ParagraphStyle(
-            "gloss", parent=base["Normal"], fontName="Helvetica", fontSize=8, textColor=SLATE, leading=11, spaceAfter=3
+            "gloss", parent=base["Normal"], fontName="Helvetica", fontSize=8, textColor=SLATE, leading=11, spaceAfter=2
         ),
     }
 
 
-def _cover_flowables(pack: SituationPack, styles: dict[str, ParagraphStyle]) -> list[Any]:
+def _kpi_value_style(name: str, value: str, styles: dict[str, ParagraphStyle]) -> ParagraphStyle:
+    sit = value.strip().lower()
+    if name == "Situation":
+        if sit == "lagging":
+            return styles["kpi_v_bad"]
+        if sit == "ahead":
+            return styles["kpi_v_good"]
+        return styles["kpi_v"]
+    if name in {"Gap vs Expected", "vs Target"}:
+        try:
+            n = float(value.replace(" MT", "").replace(",", "").replace("−", "-"))
+        except ValueError:
+            return styles["kpi_v"]
+        if name == "Gap vs Expected" and n >= 0.5:
+            return styles["kpi_v_bad"]
+        if name == "vs Target" and n < -0.5:
+            return styles["kpi_v_bad"]
+        if name == "vs Target" and n > 0.5:
+            return styles["kpi_v_good"]
+    return styles["kpi_v"]
+
+
+def _cover_flowables(pack: SituationPack, styles: dict[str, ParagraphStyle], usable: float) -> list[Any]:
     kicker = {
         "national": "NATIONAL SITUATION",
         "city": "CITY PACK — SEND TO THE CITY",
@@ -1987,29 +2047,37 @@ def _cover_flowables(pack: SituationPack, styles: dict[str, ParagraphStyle]) -> 
             ("vs Target", vs_t),
             ("Situation", str(kpis.get("situation_label") or "")),
         ]
-    kpi_data = [
-        [Paragraph(xml_escape(n), styles["kpi_l"]) for n, _ in kpi_cells],
-        [Paragraph(xml_escape(v), styles["kpi_v"]) for _, v in kpi_cells],
-    ]
-    kpi_table = Table(kpi_data, colWidths=[270 * mm / max(len(kpi_cells), 1)] * len(kpi_cells))
+    labels = []
+    values = []
+    for name, val in kpi_cells:
+        label = name.replace("Projected month-end", "Projected<br/>month-end").replace("Gap vs Expected", "Gap vs<br/>Expected")
+        parts = label.split("<br/>")
+        labels.append(Paragraph("<br/>".join(xml_escape(p) for p in parts), styles["kpi_l"]))
+        values.append(Paragraph(xml_escape(val), _kpi_value_style(name, val, styles)))
+    n = max(len(kpi_cells), 1)
+    kpi_table = Table([labels, values], colWidths=[usable / n] * n)
     kpi_table.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, -1), WASH),
+                ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+                ("BACKGROUND", (0, 1), (-1, 1), WASH),
                 ("BOX", (0, 0), (-1, -1), 0.4, LINE),
                 ("INNERGRID", (0, 0), (-1, -1), 0.25, LINE),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, 0), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+                ("TOPPADDING", (0, 1), (-1, 1), 6),
+                ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ]
         )
     )
     story.append(kpi_table)
-    story.append(Spacer(1, 4))
-    story.append(Paragraph(xml_escape(_gap_sentence(kpis, pack.scope_label or "Country")), styles["note"]))
+    story.append(Spacer(1, 6))
+    gap = _gap_sentence(kpis, pack.scope_label or "Country")
+    story.append(Paragraph(xml_escape(gap), styles["lead"]))
     if open_mtd and float(kpis.get("expected_today_mt") or 0) > 0.05:
-        story.append(Spacer(1, 4))
         story.append(
             Paragraph(
                 xml_escape(
@@ -2019,33 +2087,46 @@ def _cover_flowables(pack: SituationPack, styles: dict[str, ParagraphStyle]) -> 
                 styles["note"],
             )
         )
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Current situation", styles["h2"]))
-    for para in pack.situation:
-        story.append(Paragraph(xml_escape(para), styles["body"]))
-    if pack.plan_lines:
+    weather = pack.weather or ""
+    situation = []
+    for para in pack.situation or []:
+        if not para or para == weather or para == gap or para.startswith("Gap versus "):
+            continue
+        situation.append(para)
+    if situation:
+        story.append(Paragraph("Current situation", styles["h2"]))
+        for para in situation:
+            story.append(Paragraph(xml_escape(para), styles["body"]))
+    plan = []
+    for line in pack.plan_lines or []:
+        if not line or line == gap or line.startswith("Gap versus "):
+            continue
+        plan.append(line)
+    if plan:
         story.append(Paragraph("Plan", styles["h3"]))
-        for line in pack.plan_lines:
-            story.append(Paragraph(xml_escape("• " + line), styles["body"]))
+        for line in plan:
+            story.append(Paragraph(xml_escape("- " + line), styles["body"]))
     if pack.copy_from:
         story.append(Paragraph("Copy from overperformers", styles["h3"]))
         for line in pack.copy_from:
             story.append(Paragraph(xml_escape(line), styles["body"]))
-    story.append(Paragraph("How to read this pack", styles["h3"]))
-    for step in how_to_read(pack):
-        story.append(Paragraph(xml_escape("• " + step), styles["note"]))
     return story
 
 
-def _glossary_end(styles: dict[str, ParagraphStyle]) -> list[Any]:
+def _glossary_end(pack: SituationPack, styles: dict[str, ParagraphStyle], usable: float) -> list[Any]:
     story = [
-        Paragraph("Short glossary", styles["h2"]),
-        Paragraph("Full scorecard definitions stay on the detailed national pack.", styles["note"]),
+        Paragraph("How to read this pack", styles["h2"]),
     ]
+    for step in how_to_read(pack):
+        story.append(Paragraph(xml_escape("- " + step), styles["body"]))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("Short glossary", styles["h2"]))
+    story.append(Paragraph(f"Expected on this pack: {EXPECTED_FORMULA}. Full scorecard definitions stay on the detailed national pack.", styles["note"]))
     rows = [[Paragraph("Term", styles["th"]), Paragraph("Meaning", styles["th"])]]
     for term, meaning in GLOSSARY:
         rows.append([Paragraph(xml_escape(term), styles["td"]), Paragraph(xml_escape(meaning), styles["gloss"])])
-    table = Table(rows, colWidths=[55 * mm, 212 * mm])
+    term_w = min(58 * mm, usable * 0.22)
+    table = Table(rows, colWidths=[term_w, usable - term_w])
     table.setStyle(
         TableStyle(
             [
@@ -2053,10 +2134,10 @@ def _glossary_end(styles: dict[str, ParagraphStyle]) -> list[Any]:
                 ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("GRID", (0, 0), (-1, -1), 0.25, LINE),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, WASH]),
             ]
         )
@@ -2065,21 +2146,40 @@ def _glossary_end(styles: dict[str, ParagraphStyle]) -> list[Any]:
     return story
 
 
+def _header_cell(name: str, styles: dict[str, ParagraphStyle]) -> Paragraph:
+    raw = PDF_HEADERS.get(name, name.replace(" this period", "").replace(" this month", ""))
+    parts = raw.split("<br/>")
+    text = "<br/>".join(xml_escape(p) for p in parts)
+    numeric = name not in TEXT_COLS
+    return Paragraph(text, styles["th_right"] if numeric else styles["th"])
+
+
+def _body_cell(name: str, value: Any, styles: dict[str, ParagraphStyle]) -> Paragraph:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        text = ""
+    else:
+        text = str(value)
+    if name == "Plan" and ", " in text:
+        parts = text.split(", ", 1)
+        html = "<br/>".join(xml_escape(p) for p in parts)
+        return Paragraph(html, styles["td"])
+    html = xml_escape(text).replace("\n", "<br/>")
+    if name in {"Do this", "Do this week", "Comment", "Step"}:
+        return Paragraph(html, styles["td_wrap"])
+    if name in TEXT_COLS:
+        return Paragraph(html, styles["td"])
+    return Paragraph(html, styles["td_right"])
+
+
 def _pdf_table(df: pd.DataFrame, styles: dict[str, ParagraphStyle], usable: float) -> Table:
     if df is None or df.empty:
         return Paragraph("No rows at this layer for this period.", styles["note"])
     headers = [str(c) for c in df.columns]
     widths = _col_widths(headers, usable)
-    data = [[Paragraph(xml_escape(h.replace(" this period", "").replace(" this month", "")), styles["th"]) for h in headers]]
+    data = [[_header_cell(h, styles) for h in headers]]
     tones: list[str] = [""]
     for _, row in df.iterrows():
-        cells = []
-        for h in headers:
-            val = row.get(h)
-            text = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val)
-            style = styles["td"] if h in TEXT_COLS else styles["td_right"]
-            cells.append(Paragraph(xml_escape(text).replace("\n", "<br/>"), style))
-        data.append(cells)
+        data.append([_body_cell(h, row.get(h), styles) for h in headers])
         sit = str(row.get("Situation") or "")
         if sit == "Lagging":
             tones.append("lag")
@@ -2087,16 +2187,16 @@ def _pdf_table(df: pd.DataFrame, styles: dict[str, ParagraphStyle], usable: floa
             tones.append("ahead")
         else:
             tones.append("")
-    table = Table(data, colWidths=widths, repeatRows=1)
+    table = Table(data, colWidths=widths, repeatRows=1, splitByRow=1)
     cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), NAVY),
         ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("GRID", (0, 0), (-1, -1), 0.25, LINE),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("GRID", (0, 0), (-1, -1), 0.3, LINE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]
     for i, tone in enumerate(tones):
         if i == 0:
@@ -2111,21 +2211,46 @@ def _pdf_table(df: pd.DataFrame, styles: dict[str, ParagraphStyle], usable: floa
     return table
 
 
+def _col_weight(header: str) -> float:
+    if header in {"Do this", "Do this week", "Comment"}:
+        return 4.2
+    if header == "Step":
+        return 1.7
+    if header == "Distributor":
+        return 1.9
+    if header in {"DSR", "Shop", "Area"}:
+        return 1.35
+    if header == "City":
+        return 1.2
+    if header in {"Situation", "Label", "Driver", "Who"}:
+        return 1.05
+    if header == "Plan":
+        return 1.15
+    if header == "Call":
+        return 1.4
+    if header == "Visit %":
+        return 0.55
+    if header in {
+        "Gap (MT)",
+        "Billed (MT)",
+        "Expected (MT)",
+        "Target (MT)",
+        "Unbilled (MT)",
+        "Unvisited (MT)",
+        "Light orders (MT)",
+        "Volume at stake (MT)",
+    }:
+        return 0.62
+    if header == "vs Target (MT)" or "Projected" in header or "Monthly target" in header:
+        return 0.7
+    if header.endswith("(MT)") or header.endswith("%"):
+        return 0.62
+    return 1.0
+
+
 def _col_widths(headers: list[str], usable: float) -> list[float]:
-    n = len(headers)
-    if n == 0:
+    if not headers:
         return [usable]
-    weights = []
-    for h in headers:
-        if h in {"Do this", "Do this week", "Step", "Comment"}:
-            weights.append(3.2)
-        elif h in {"Shop", "Distributor", "DSR", "Area"}:
-            weights.append(1.6)
-        elif h in {"Situation", "Label", "Driver", "Call", "Who", "Plan"}:
-            weights.append(1.3)
-        elif "Projected" in h or "Monthly target" in h:
-            weights.append(1.15)
-        else:
-            weights.append(1.0)
+    weights = [_col_weight(h) for h in headers]
     total = sum(weights) or 1.0
     return [usable * w / total for w in weights]
