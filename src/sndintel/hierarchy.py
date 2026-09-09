@@ -164,8 +164,9 @@ def build_hierarchy_pack(
     mtd_obs: pd.DataFrame | None = None,
     visits: pd.DataFrame | None = None,
     shop_day: pd.DataFrame | None = None,
+    period: str | None = None,
 ) -> HierarchyPack:
-    period = latest_period(shop_month)
+    period = period or latest_period(shop_month)
     if not period or shop_month is None or shop_month.empty:
         return HierarchyPack(period=period or "", yoy_period="", mtd={}, national={})
     mtd = period_state(ledger, period)

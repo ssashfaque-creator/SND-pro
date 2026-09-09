@@ -42,6 +42,22 @@ SSRS CSVs are jagged (parameter rows have fewer columns than the tablix) and hid
 
 The master list is the **universe**. Strike rate = billed shops / universe shops. Shops on the master that never appear in sales are whitespace.
 
+### Shop-wise targets (sales-team plan)
+
+Optional. Region / area / distributor / DSR / shop name / target MT (SSRS field ids like `txt_cPOP_NAME`, `uval_TARGET_UOM`). There is usually **no POP code** and **no calendar month** — treat the file as the live quota for the period being scored.
+
+This is **not** a forecast. The model keeps three numbers the way Oracle SVP / SAP trade analytics do:
+
+| Number | Meaning |
+|---|---|
+| **Actual** | Billed secondary |
+| **Expected** (baseline) | Last-3 AMS blended with last-6 median, paced if MTD is open. Unchanged by the target file. |
+| **Target** (quota) | What the sales team wrote, rolled to city / distributor / DSR. Open MTD uses the same national day curve as Expected. |
+
+Stretch = max(0, paced Target − Expected) is ambition, not a coverage miss. Gap on the board is still billed vs Expected. Shop matching is conservative (exact city+distributor+name; whales ≥ 1 MT are never fuzzy-matched). Unmatched names still count in the city/DSR book if Area folds onto a unique live city. Warehouse → Shop plan shows match rate and unmatched rows.
+
+No extra LLM or ML is used on this file. Name-matching models mis-assign kiryana whales; XGBoost Expected already carries seasonality and national day shape.
+
 ## What the machine actually learns
 
 Monthly shop data is sparse. The pipeline does **not** pretend a neural net can “understand Excel”. It builds a stack that companies like Nielsen / IRI / FireAI-style S&D platforms use, adapted to one monthly MTD file:
@@ -78,17 +94,19 @@ pip install -e ".[dev]"
 snd-intel demo
 
 # Your own files
-snd-intel ingest path/to/Shop_SKU_Wise_Execution_Report.xlsx --shops path/to/shop_master.xlsx
+snd-intel ingest path/to/Shop_SKU_Wise_Execution_Report.xlsx --shops path/to/shop_master.xlsx --targets path/to/shopwise_targets.csv
 snd-intel brief
 snd-intel actions
 snd-intel dashboard
 snd-intel export-excel SND_intelligence_brief.xlsx
+snd-intel situation
+snd-intel export-situation SND_situation.pdf
 
 # Drop-folder: copy new extracts into data/incoming/
 snd-intel watch --once
 ```
 
-JSON API (for a future agent): `snd-intel serve-api` then `GET /brief`, `/insights`, `/focus`, `/shops/{id}`, `/search?q=trade+loading`.
+JSON API (for a future agent): `snd-intel serve-api` then `GET /brief`, `/insights`, `/focus`, `/situation`, `/shops/{id}`, `/search?q=trade+loading`.
 
 ## Install on a Mac (curl, keep `.venv`)
 
@@ -103,7 +121,7 @@ Git is not required. Update is `curl` the branch ZIP, `rsync` over `~/sndintel`,
 ```bash
 rm -rf /tmp/sndintel-dl
 mkdir -p /tmp/sndintel-dl "$HOME/sndintel"
-curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/demand-driven-ask-7a79.zip" -o /tmp/sndintel-dl/app.zip
+curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/situation-cascade-eccd.zip" -o /tmp/sndintel-dl/app.zip
 unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
 SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
 rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
@@ -121,16 +139,16 @@ In the app: **Upload files** → shop list once, then the sales extract. Later m
 ```bash
 rm -rf /tmp/sndintel-dl
 mkdir -p /tmp/sndintel-dl
-curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/demand-driven-ask-7a79.zip" -o /tmp/sndintel-dl/app.zip
+curl -L --fail "https://github.com/ssashfaque-creator/SND-pro/archive/refs/heads/cursor/situation-cascade-eccd.zip" -o /tmp/sndintel-dl/app.zip
 unzip -o /tmp/sndintel-dl/app.zip -d /tmp/sndintel-dl
 SRC="$(find /tmp/sndintel-dl -maxdepth 2 -type d -name 'SND-pro-*' | head -1)"
 rsync -a --delete --exclude '.venv' "$SRC/" ~/sndintel/
 cd ~/sndintel && source .venv/bin/activate && pip install -e . && snd-intel app
 ```
 
-Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.7.0**. The app opens on **This week → Monday dispatch**. Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8; official Expected on Gap cards is still last-3 / last-6 paced by the national day curve.
+Do not pick a ZIP from Downloads — an old `SND-pro*.zip` will silently install the previous branch. After this landing, **Warehouse** should show version **0.9.7**. Open **Report → Situation cascade** for the briefing pack, or **Report → Shop-wise issues** for every door in a scope (National / City / Distributor / DSR). Same MTD vs Monthly closing cut. Closed month lists shops that missed Expected, largest hole first (billed, Expected, gap, last billed, usual drop, next-month comment with “usual drop is X MT every Y days”). Cover Billed / Expected / Gap / Target on the shop pack match Situation cascade for that scope — Target is the plan book (unmatched names still count), not the sum of matched shop POPs; Gap versus Expected is max(0, Expected − billed) on those cover figures, not the sum of every shop’s remaining. Open MTD does **not** treat still-to-Expected as a miss — issues are due this week (Ask), visited with no bill, and lost doors; next-order number is Ask (KG). Toggle All shops for the full universe. Expected, Ask, and Target are not recalculated. Situation cascade is unchanged: billed vs Expected vs quota, city gap split, underperforming staff only DSRs who missed their own Expected. Weak-area pages are gone. This week → Monday dispatch is still the operating call list. Ask is the shop’s 90-day expected drop when the depletion ratio is ≥ 0.8; official Expected on Gap cards is still last-3 / last-6 paced by the national day curve.
 
-Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates). Leave **Replace all billed sales** unticked for a weekly refresh: days in the new file override the same shop-days (a later 20 Aug file replaces an incomplete 20 Aug); other days stay. Tick replace-all only when switching from Shop SKU Wise or wiping billed history. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
+Open the app → **Upload files**. Universe can stay in the warehouse. Drop **one or more Outlet Date Wise** files (split by shops or dates). Optionally drop **shop-wise targets** (quota / plan) — they do not replace Expected. Leave **Replace all billed sales** unticked for a weekly refresh: days in the new file override the same shop-days (a later 20 Aug file replaces an incomplete 20 Aug); other days stay. Tick replace-all only when switching from Shop SKU Wise or wiping billed history. Score warehouse. AMS is the last three *closed* months (May+June+July when scoring August), paced vs billed if MTD is open.
 
 Warehouse → **Clear billed sales only** also wipes billed rows and keeps shop lists.
 
@@ -149,16 +167,23 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 
 | Question | Where it shows up |
 |---|---|
-| How is each city doing vs what it should be billing? | Strategy city waterfall |
-| Which distributor / DSR / shop in that city? | Open the city card; Named targets CSV |
-| Which areas/shops must we focus on this week? | Strategy must-visit + Focus slice by gap |
-| What are we doing well, so we can copy it? | Positive insights, DSR wins, local outperformance |
+| What is the national situation, and who is under / over? | Report → Situation cascade → National HQ (MTD or Monthly closing) |
+| Are we on the monthly target, or only on Expected? | Situation KPIs: projected month-end vs full monthly target |
+| What should we send each city / distributor? | Same page: City pack / Distributor pack, or ZIP of every pack |
+| Which salespeople are lagging, and why? | Situation pack People sheets; capacity label is the coaching script |
+| What is the plan, and what do we do next? | Situation pack → Plan and next actions |
+| How is each city doing vs what it should be billing? | Situation city gap table (Target / Expected / Billed / Gap + light orders / unbilled / unvisited) |
+| Which distributor / DSR / shop in that city? | City pack; named targets; detailed scorecards |
+| Which shops missed Expected, and what should we do next month? | Report → Shop-wise issues → Monthly closing (city / distributor / DSR) |
+| Which shops are due this week, visited with no bill, or lost? | Report → Shop-wise issues → MTD |
+| Which areas/shops must we focus on this week? | Situation this-week doors + Monday dispatch + shop-wise MTD |
+| What are we doing well, so we can copy it? | Situation “ahead” sheets and Copy from overperformers |
 | Did salespeople dump stock into a shop? | Trade-loading anomalies (spike vs that shop’s own 6-month median) |
-| Is a section dying while the city is fine? | Divergence insights |
-| Are we covering the universe or just the same 30 shops? | Strike rate by DSR, whitespace |
+| Is a section dying while the city is fine? | Situation weak areas; divergence insights |
+| Are we covering the universe or just the same 30 shops? | Strike rate by DSR, whitespace, coverage driver |
 | Is 5L oil growth real or stealing 16kg tin? | Cannibalization / substitution |
 | Are we over-dependent on a handful of accounts? | Pareto / concentration |
-| Who on the team is actually productive? | DSR scorecard (strike × drop size × MoM) |
+| Who on the team is actually productive? | People ahead + DSR capacity Fine |
 
 ## Project layout
 
@@ -166,8 +191,12 @@ The Google Drive sample is July + August in one extract. The next file you drop 
 src/sndintel/
   ingest/ssrs.py       SSRS chrome stripper + column inference
   ingest/shops.py      Universe parser
+  ingest/targets.py    Shop-wise sales-team quota (not a forecast)
   ingest/pipeline.py   Daily shop-day overlay (or SKU-wise month replace) → features → models → insights
+  plan.py              Attach Actual / Expected / Target without mixing them
   materiality.py       Pareto core / middle / long-tail (not every quiet shop is 'lost')
+  situation_report.py  National / city / distributor sendable packs
+  shop_book.py         Shop-wise issues (MTD due list / closed-month misses)
   strategy.py          Five-play briefing
   ui/app.py            Local app: upload + strategy pack
   mtd.py               Closed vs open MTD from SSRS execution date

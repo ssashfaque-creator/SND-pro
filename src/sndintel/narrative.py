@@ -42,7 +42,7 @@ Return JSON only:
 Two sections, and only these two:
 
 1. situation — 2 to 4 short paragraphs. Summary of the current situation.
-   Paragraph 1: the country. Billed versus AMS, last year, and Expected. Country Gap is that miss versus Expected (not a leftover versus peers). If MTD is open, say the day/fraction. Visit % versus Strike % at country level.
+   Paragraph 1: the country. Billed versus AMS, last year, and Expected. Country Gap is that miss versus Expected (not a leftover versus peers). If MTD is open, say the day/fraction. Visit % versus Strike % at country level. If a sales-team plan is in the BRIEF, state billed versus that plan (attainment) separately from Gap versus Expected. Stretch above Expected is quota, not a coverage miss.
    Paragraph 2: cities versus their own Expected. Rank lagging cities by Gap and, when you can, each city's share of country Gap. Lagging-city Gap can sum to more than country Gap when other cities are Ahead. Name Ahead cities so leadership does not raid them.
    Paragraph 3: coverage versus conversion versus drop size. Read country Visit % against Strike %, and the country From drop / From unvisited / From unbilled split (they add to Gap). High visit and low strike means unbilled shops, not unvisited. Confirm with the From columns.
    Optional paragraph 4: concentration. If one city is both a large share of billed volume and most of the country miss versus Expected, say so. Do not tour every city that is slightly down.
@@ -57,6 +57,7 @@ How the pack is built (use these definitions; do not redefine them in the prose)
 - Expected = last three calendar months before this period (same window as AMS; a missing month is 0), blended with the last-six-month median, paced if MTD is open using the country’s usual billed share by that calendar day (one national Outlet Date Wise curve). Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied. Children's Expecteds are then scaled so they add to the parent Expected. It is not last year alone, and an empty August last year does not zero Expected.
 - Lagging = behind this unit's own Expected by a material amount (Gap > 0). Ahead = billed above Expected. On expected = billed in line with the recent run-rate.
 - Gap = the hole versus this unit's own Expected as a positive number. Country Gap is the country miss versus Expected.
+- Target / plan = shop-wise quota the sales team wrote. It is not Expected and must not replace it. Stretch = plan − Expected. Missing stretch is not a coverage miss. Attainment is billed ÷ paced Target.
 - From drop / unvisited / unbilled add to Gap. Positive = part of the hole. Negative = billed more than Expected.
 - Drop size (MT) = billed MT ÷ billed shops. Remarks compare drop size vs expected drop vs the national average. Expected drop = Expected volume ÷ Expected billed shops (same last-3 / last-6 run-rate as Expected sales; not paced; not this month’s shop count). It is not From drop size.
 - Visit % = visited ÷ universe (a billed shop counts as visited). Strike % = billed ÷ universe.
@@ -248,6 +249,11 @@ def build_grounded_brief(pack: StrategyPack) -> dict[str, Any]:
             "expected_mt": kpis.get("expected_mt"),
             "gap_vs_expected_mt": kpis.get("gap_mt"),
             "ly_mt": kpis.get("ly_mt"),
+            "sales_team_plan_mt": kpis.get("sales_team_plan_mt"),
+            "plan_attain_pct": kpis.get("plan_attain_pct"),
+            "stretch_vs_expected_mt": kpis.get("stretch_vs_expected_mt"),
+            "plan_book_mt": kpis.get("plan_book_mt"),
+            "plan_matched_mt": kpis.get("plan_matched_mt"),
             "country_recoverable_mt": rec_country,
             "n_lagging_cities": kpis.get("n_lagging_cities") if kpis.get("n_lagging_cities") is not None else int(len(lag)),
         },

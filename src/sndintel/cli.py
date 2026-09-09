@@ -49,7 +49,7 @@ def apply_zip_cmd(
         console.print(
             "No ZIP given and none named SND-pro*.zip in Downloads.\n"
             "In GitHub (logged in): Code → Download ZIP, then:\n"
-            "  snd-intel apply-zip ~/Downloads/SND-pro-cursor-demand-driven-ask-7a79.zip"
+            "  snd-intel apply-zip ~/Downloads/SND-pro-cursor-situation-cascade-eccd.zip"
         )
         raise typer.Exit(1)
     result = apply_code_zip(archive, dest)
@@ -70,6 +70,7 @@ def ingest(
     shops: Optional[Path] = typer.Option(None, "--shops", exists=True, help="Legacy shop master (zone / historical map)"),
     universe: Optional[Path] = typer.Option(None, "--universe", exists=True, help="Live universe shop list"),
     visits: Optional[Path] = typer.Option(None, "--visits", exists=True, help="Shop visit calls (MTD)"),
+    targets: Optional[Path] = typer.Option(None, "--targets", exists=True, help="Shop-wise sales-team targets (quota / plan)"),
     replace_sales: bool = typer.Option(
         False,
         "--replace-sales",
@@ -77,13 +78,14 @@ def ingest(
     ),
 ):
     """Clean a sales export, merge the live universe and visits, and write insights."""
-    if not sales and universe is None and visits is None and shops is None:
-        raise typer.BadParameter("Pass one or more sales files and/or --universe / --visits / --shops.")
+    if not sales and universe is None and visits is None and shops is None and targets is None:
+        raise typer.BadParameter("Pass one or more sales files and/or --universe / --visits / --shops / --targets.")
     result = run_pipeline(
         sales_paths=sales,
         shop_path=shops,
         universe_path=universe,
         visits_path=visits,
+        targets_path=targets,
         replace_sales=replace_sales,
     )
     console.print_json(data=result)
@@ -422,6 +424,243 @@ def export_excel(path: Path = typer.Argument(Path("SND_strategy.xlsx"))):
     console.print(f"Wrote {pdf_path}")
     console.print(f"Wrote {detailed_xlsx}")
     console.print(f"Wrote {detailed_pdf}")
+
+
+@app.command()
+def situation(
+    scope: str = typer.Option("national", help="national, city, or distributor"),
+    city: Optional[str] = typer.Option(None, help="City name when scope is city or distributor"),
+    distributor: Optional[str] = typer.Option(None, help="Distributor name when scope is distributor"),
+    period: Optional[str] = typer.Option(None, help="YYYY-MM. Default is the latest month."),
+):
+    """Print the sendable situation cascade (under/over performers + next actions)."""
+    init_db()
+    from sndintel.features import latest_period
+    from sndintel.situation_report import build_situation_pack, load_units_for_period
+
+    with connect() as conn:
+        shop_month = read_sql(conn, "SELECT * FROM shop_month")
+        ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
+        latest = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+        period = period or latest
+        units = load_units_for_period(conn, period)
+    if units is None or units.empty:
+        console.print("No scorecards yet. Run [bold]snd-intel ingest[/] or [bold]snd-intel rescore[/].")
+        raise typer.Exit(1)
+    pack = build_situation_pack(
+        units, ledger=ledger, period=period, scope=scope, city=city, distributor=distributor
+    )
+    console.print(f"[bold]{pack.headline}[/]")
+    console.print(pack.weather)
+    for para in pack.situation:
+        console.print(para)
+    if pack.plan_lines:
+        console.print("[bold]Plan[/]")
+        for line in pack.plan_lines:
+            console.print(f"• {line}")
+    if pack.steps is not None and not pack.steps.empty:
+        table = Table(title="Next actions")
+        table.add_column("Step")
+        table.add_column("MT", justify="right")
+        table.add_column("Do this")
+        do_col = "Do this" if "Do this" in pack.steps.columns else "Do this week"
+        for _, row in pack.steps.iterrows():
+            table.add_row(str(row.get("Step") or ""), str(row.get("Volume at stake (MT)") or ""), str(row.get(do_col) or "")[:90])
+        console.print(table)
+    if pack.lagging_cities is not None and not pack.lagging_cities.empty:
+        table = Table(title="Cities lagging")
+        table.add_column("City")
+        table.add_column("Billed", justify="right")
+        table.add_column("Target", justify="right")
+        table.add_column("Do this")
+        for _, row in pack.lagging_cities.head(8).iterrows():
+            table.add_row(
+                str(row.get("City") or ""),
+                str(row.get("Billed (MT)") or ""),
+                str(row.get("Monthly target (MT)") or ""),
+                str(row.get("Do this") or "")[:70],
+            )
+        console.print(table)
+    if pack.lagging_people is not None and not pack.lagging_people.empty:
+        table = Table(title="Underperforming sales staff")
+        table.add_column("DSR")
+        table.add_column("City")
+        table.add_column("Label")
+        table.add_column("Do this")
+        for _, row in pack.lagging_people.head(10).iterrows():
+            table.add_row(
+                str(row.get("DSR") or ""),
+                str(row.get("City") or ""),
+                str(row.get("Label") or ""),
+                str(row.get("Do this") or "")[:70],
+            )
+        console.print(table)
+
+
+@app.command()
+def shops(
+    scope: str = typer.Option("national", help="national, city, distributor, or dsr"),
+    city: Optional[str] = typer.Option(None, help="City when scope is city, distributor, or dsr"),
+    distributor: Optional[str] = typer.Option(None, help="Distributor when scope is distributor or dsr"),
+    dsr: Optional[str] = typer.Option(None, help="DSR name when scope is dsr"),
+    period: Optional[str] = typer.Option(None, help="YYYY-MM. Default is the latest month."),
+    all_shops: bool = typer.Option(False, "--all", help="Print every shop, not only issues"),
+    path: Optional[Path] = typer.Option(None, "--out", help="Write PDF or Excel (suffix decides)"),
+):
+    """Print the shop-wise issues pack (MTD due list, or closed-month misses)."""
+    init_db()
+    from sndintel.action import build_action_pack, load_action_pack
+    from sndintel.features import latest_period
+    from sndintel.shop_book import build_shop_book, excel_bytes as shop_excel, pdf_bytes as shop_pdf
+
+    with connect() as conn:
+        shop_month = read_sql(conn, "SELECT * FROM shop_month")
+        ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
+        stores = read_sql(conn, "SELECT * FROM stores")
+        try:
+            shop_day = read_sql(conn, "SELECT * FROM shop_day")
+        except Exception:
+            shop_day = pd.DataFrame()
+        try:
+            visits = read_sql(conn, "SELECT * FROM shop_visits")
+        except Exception:
+            visits = pd.DataFrame()
+        try:
+            shop_targets = read_sql(conn, "SELECT * FROM shop_targets")
+        except Exception:
+            shop_targets = pd.DataFrame()
+        latest = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+        period = period or latest
+        from sndintel.situation_report import load_units_for_period
+
+        try:
+            units = load_units_for_period(conn, period)
+        except Exception:
+            units = pd.DataFrame()
+        action = None
+        try:
+            action = load_action_pack(conn, period)
+        except Exception:
+            action = None
+        if action is None or not getattr(action, "headline", None) or str(getattr(action, "period", "") or "") != str(period):
+            action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+    book = build_shop_book(
+        action=action,
+        shop_targets=shop_targets,
+        units=units,
+        ledger=ledger,
+        period=period,
+        scope=scope,
+        city=city,
+        distributor=distributor,
+        dsr=dsr,
+    )
+    console.print(f"[bold]{book.headline}[/]")
+    console.print(book.weather)
+    if book.mix is not None and not book.mix.empty:
+        mix = Table(title="Issue mix")
+        for col in book.mix.columns:
+            mix.add_column(str(col), justify="right" if str(col) != "Issue" else "left")
+        for _, row in book.mix.iterrows():
+            mix.add_row(*[str(row.get(c) if row.get(c) is not None else "") for c in book.mix.columns])
+        console.print(mix)
+    show = book.shops if all_shops else book.issues
+    if show is None or show.empty:
+        console.print("No shops in this scope.")
+        raise typer.Exit(0)
+    comment_col = "Do this" if "Do this" in show.columns else "Comment"
+    table = Table(title="Issues" if not all_shops else "All shops")
+    table.add_column("Shop")
+    if "City" in show.columns:
+        table.add_column("City")
+    table.add_column("Issue")
+    table.add_column("Billed", justify="right")
+    table.add_column("Expected", justify="right")
+    table.add_column(comment_col)
+    for _, row in show.head(40).iterrows():
+        cells = [str(row.get("Shop") or "")]
+        if "City" in show.columns:
+            cells.append(str(row.get("City") or ""))
+        cells.extend(
+            [
+                str(row.get("Issue") or ""),
+                str(row.get("Billed (MT)") or ""),
+                str(row.get("Expected (MT)") or ""),
+                str(row.get(comment_col) or "")[:90],
+            ]
+        )
+        table.add_row(*cells)
+    console.print(table)
+    extra = max(0, len(show) - 40)
+    if extra:
+        console.print(f"Showing 40 of {len(show)}. Use --out file.xlsx for the full list.")
+    if path is not None:
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.suffix.lower() in {".xlsx", ".xls"}:
+            dest.write_bytes(shop_excel(book))
+        else:
+            dest.write_bytes(shop_pdf(book))
+        console.print(f"Wrote {dest}")
+
+
+@app.command("export-situation")
+def export_situation(
+    path: Path = typer.Argument(Path("SND_situation.pdf")),
+    period: Optional[str] = typer.Option(None, help="YYYY-MM. Default is the latest month."),
+):
+    """Write national situation PDF/Excel plus a ZIP of every city pack and every distributor pack."""
+    init_db()
+    from sndintel.action import build_action_pack, load_action_pack
+    from sndintel.features import latest_period
+    from sndintel.situation_report import (
+        build_field_packs,
+        build_situation_pack,
+        load_units_for_period,
+        write_excel,
+        write_pdf,
+        zip_field_packs,
+    )
+
+    with connect() as conn:
+        shop_month = read_sql(conn, "SELECT * FROM shop_month")
+        ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
+        stores = read_sql(conn, "SELECT * FROM stores")
+        try:
+            shop_day = read_sql(conn, "SELECT * FROM shop_day")
+        except Exception:
+            shop_day = pd.DataFrame()
+        try:
+            visits = read_sql(conn, "SELECT * FROM shop_visits")
+        except Exception:
+            visits = pd.DataFrame()
+        latest = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+        period = period or latest
+        units = load_units_for_period(conn, period)
+        mtd = period_state(ledger, period)
+        action = None
+        if mtd.get("open"):
+            try:
+                action = load_action_pack(conn, period)
+            except Exception:
+                action = None
+            if action is None or not getattr(action, "headline", None):
+                action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+    pack = build_situation_pack(units, action=action, ledger=ledger, period=period)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path = path if path.suffix.lower() == ".pdf" else path.with_suffix(".pdf")
+    xls_path = pdf_path.with_suffix(".xlsx")
+    write_pdf(pack, pdf_path)
+    write_excel(pack, xls_path)
+    city_zip = pdf_path.with_name(f"SND_city_packs_{period or 'period'}.zip")
+    dist_zip = pdf_path.with_name(f"SND_distributor_packs_{period or 'period'}.zip")
+    city_zip.write_bytes(zip_field_packs(build_field_packs(units, action, ledger, period, "city")))
+    dist_zip.write_bytes(zip_field_packs(build_field_packs(units, action, ledger, period, "distributor")))
+    console.print(f"Wrote {pdf_path}")
+    console.print(f"Wrote {xls_path}")
+    console.print(f"Wrote {city_zip}")
+    console.print(f"Wrote {dist_zip}")
 
 
 @app.command("export-ops")

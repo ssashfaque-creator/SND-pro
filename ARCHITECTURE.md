@@ -6,8 +6,8 @@ Blueprint for a repeatable, file-drop secondary-sales intelligence pipeline.
 
 ```
 SSRS xlsx/csv  ─┐
-                ├─► parsers ─► SQLite facts ─► shop-month panel ─► features
-Shop master ───┘
+Universe       ├─► parsers ─► SQLite facts ─► shop-month panel ─► features
+Shop targets ──┘
 ```
 
 - Parsers are heuristic. They do not assume column G; they look for SSRS field ids, then human headers, then a positional distributor + POP-code + year/month + numeric MTD pattern.
@@ -53,10 +53,12 @@ Each module writes rows into `insights` with `type`, `severity`, `entity_*`, `na
 - **Warehouse position** — closed YTD plus open MTD run-rate vs last year. Always ranked first so the briefing is the overall book, not “what was in the latest file”.
 - **Volume bridge** — like-for-like vs new vs lost, split by Pareto **core / middle / tail**. Micro shops are one coverage KPI (weighted distribution), not a lost-account dump. Irregular billers are not treated as lapses.
 - **Strategy plays** — at most five: close the month, protect the base, recover material volume, fix the beat, long-tail coverage / mix / people. Must-visit lists are material shops only.
+- **Situation cascade** — sendable packs, no API key. National HQ names under- and over-performing cities, distributors, and DSRs, then five steps that close Gap versus Expected. Each city and each distributor gets the same skeleton, scoped, so it can be emailed. Detailed scorecards stay as the working file.
+- **Sales-team plan** — shop-wise quota is a third number (Target), never a replacement for Expected. National Target is the submitted book. City / DSR Target rolls the book on live geography (unmatched kiryana names still count if Area matches). Shop identity is conservative; whales are never fuzzy-matched. Stretch above Expected is ambition. The optional national GPT brief may *cite* plan figures already on the scorecard; it is not used to match names or to forecast quota.
 
 ## 4. Execution
 
-- CLI `snd-intel app` / `ingest` / `watch` / `demo` / `brief` / `where`.
+- CLI `snd-intel app` / `ingest` / `watch` / `demo` / `brief` / `situation` / `where`.
 - On a Mac the warehouse is `~/Library/Application Support/SND Intelligence/warehouse.db` so unzipping a new app build does not wipe history.
 - Local UI: upload shop list once, then incremental sales extracts. Drop folder `incoming/` still works.
 - Delta scoring is implicit: months in the new file replace that month’s facts, features use the full history as baseline, and insights are rebuilt for the **overall warehouse**.
