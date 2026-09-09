@@ -29,6 +29,13 @@ from sndintel.briefing import (
     pdf_bytes,
     pdf_bytes_detailed,
 )
+from sndintel.shop_book import (
+    build_shop_book,
+    excel_bytes as shop_excel_bytes,
+    list_shop_book_entities,
+    parse_shop_scope,
+    pdf_bytes as shop_pdf_bytes,
+)
 from sndintel.situation_report import (
     build_field_packs,
     build_situation_pack,
@@ -991,7 +998,7 @@ def _load_action(data, period, ledger):
     if brief is not None and not brief.empty:
         with connect() as conn:
             pack = load_action_pack(conn, period)
-        if pack is not None and pack.headline:
+        if pack is not None and pack.headline and str(pack.period or "") == str(period or ""):
             return pack
     shop_month = data.get("shop_month", pd.DataFrame())
     if shop_month is None or shop_month.empty:
@@ -1010,7 +1017,8 @@ def _page_report(data, _latest, period, mtd, ledger):
     st.title("Report")
     st.caption(
         f"**{mtd['label'] or period}** · Situation cascade is the pack you send. "
-        "MTD is the in-month cut. Monthly closing is a finished month you pick."
+        "Shop-wise issues is every door in a scope. MTD is the in-month cut. "
+        "Monthly closing is a finished month you pick."
     )
     units = data.get("units", pd.DataFrame())
     if units is None or units.empty:
@@ -1019,13 +1027,15 @@ def _page_report(data, _latest, period, mtd, ledger):
         return
     mode = st.radio(
         "Pack",
-        ["Situation cascade", "Detailed scorecards"],
+        ["Situation cascade", "Shop-wise issues", "Detailed scorecards"],
         horizontal=True,
         index=0,
         key="report_mode",
     )
     if mode == "Situation cascade":
         _page_situation_cascade(data, units, period, mtd, ledger)
+    elif mode == "Shop-wise issues":
+        _page_shop_book(data, period, mtd, ledger)
     else:
         _page_detailed_scorecard(data, period, mtd, ledger)
     _rescore_button()
@@ -1287,6 +1297,179 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
                 mime="application/zip",
                 key="sit_zip_dists_dl",
             )
+
+
+def _shop_book_table(df: pd.DataFrame, height: int = 420):
+    if df is None or df.empty:
+        st.caption("No shops in this scope.")
+        return
+    cfg = {}
+    for col in df.columns:
+        name = str(col)
+        if name in {"Do this", "Comment", "Issue"}:
+            cfg[col] = st.column_config.TextColumn(name, width="large")
+        elif name in {"Ask (KG)", "Days since", "Shops"}:
+            cfg[col] = st.column_config.NumberColumn(name, format="%.0f")
+        elif "(MT)" in name:
+            cfg[col] = st.column_config.NumberColumn(name, format="%.2f")
+    n = max(3, len(df))
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(max(height, 180), 80 + 40 * min(n, 12)),
+        column_config=cfg,
+    )
+
+
+def _page_shop_book(data, period, mtd, ledger):
+    open_period = _open_period(ledger, period)
+    closed = _closed_periods(ledger, data.get("shop_month"))
+    cut_options = ["MTD (this month)", "Monthly closing"]
+    default_cut = 0 if open_period else 1
+    cut = st.radio("Report cut", cut_options, horizontal=True, index=default_cut, key="shop_cut")
+
+    sit_period = period
+    if cut == "MTD (this month)":
+        if not open_period:
+            st.info("No open month in the warehouse. Use Monthly closing to pick a finished month.")
+            return
+        sit_period = open_period
+    else:
+        if not closed:
+            st.info("No closed month in the warehouse yet.")
+            return
+        labels = {p: format_period_label(p, open_=False) or p for p in closed}
+        default_i = len(closed) - 1
+        sit_period = st.selectbox(
+            "Month",
+            closed,
+            index=default_i,
+            format_func=lambda p: labels.get(p, p),
+            key="shop_closed_month",
+        )
+
+    sit_mtd = period_state(ledger, sit_period)
+    open_mtd = bool(sit_mtd.get("open"))
+    action = _load_action(data, sit_period, ledger)
+    if action is None or getattr(action, "raw_shops", None) is None or action.raw_shops.empty:
+        st.warning("No shop rows for this month. Rebuild from the warehouse.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        report_type = st.selectbox(
+            "1. Scope",
+            ["National", "City", "Distributor", "DSR"],
+            key="shop_report_type",
+        )
+    kind = {"National": "national", "City": "city", "Distributor": "distributor", "DSR": "dsr"}[report_type]
+    entity = None
+    with c2:
+        if kind == "national":
+            st.selectbox("2. Who", ["Whole country"], disabled=True, key="shop_scope_national")
+        else:
+            options = list_shop_book_entities(action.raw_shops, kind)
+            q = st.text_input("Search", placeholder=f"Type to filter {kind}s", key="shop_search")
+            filtered = [o for o in options if not q or q.lower() in o.lower()]
+            if not options:
+                st.selectbox(f"2. {report_type}", ["No options in the warehouse"], disabled=True, key="shop_entity_empty")
+            elif not filtered:
+                st.selectbox(f"2. {report_type}", [f"No match for “{q}”"], disabled=True, key="shop_entity_nomatch")
+            else:
+                entity = st.selectbox(f"2. {report_type}", filtered, index=0, key="shop_entity")
+    with c3:
+        fmt = st.selectbox("3. Format", ["PDF", "Excel"], key="shop_format")
+
+    if kind != "national" and not entity:
+        st.info("Choose a city, distributor, or DSR — type in Search to narrow the list.")
+        return
+
+    scoped = parse_shop_scope(kind, entity)
+    book = build_shop_book(
+        action=action,
+        shop_targets=data.get("shop_targets"),
+        ledger=ledger,
+        period=sit_period,
+        scope=kind,
+        city=scoped.get("city"),
+        distributor=scoped.get("distributor"),
+        dsr=scoped.get("dsr"),
+    )
+    kpis = book.kpis or {}
+    st.markdown(f"**{book.headline}**")
+    st.caption(book.weather)
+    has_plan = bool(kpis.get("has_plan"))
+    if open_mtd:
+        cols = st.columns(6 if has_plan else 5)
+        cols[0].metric("Billed so far (MT)", f"{float(kpis.get('billed_mt') or 0):.1f}")
+        cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.1f}")
+        cols[2].metric("Due this week", int(kpis.get("n_due") or 0))
+        cols[3].metric("Ask (KG)", f"{int(round(float(kpis.get('ask_mt') or 0) * 1000)):,}")
+        cols[4].metric("Issue shops", int(kpis.get("n_issues") or 0))
+        if has_plan:
+            cols[5].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.1f}")
+    else:
+        cols = st.columns(6 if has_plan else 5)
+        cols[0].metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.1f}")
+        cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.1f}")
+        cols[2].metric("Gap vs Expected (MT)", f"{float(kpis.get('gap_mt') or 0):.1f}")
+        cols[3].metric("Issue shops", int(kpis.get("n_issues") or 0))
+        cols[4].metric("Hole (MT)", f"{float(kpis.get('issue_mt') or 0):.1f}")
+        if has_plan:
+            cols[5].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.1f}")
+
+    with st.expander("How to read this pack", expanded=False):
+        for line in book.how_to_read:
+            st.write("• " + line)
+
+    st.markdown("##### Issue mix")
+    _shop_book_table(book.mix, height=220)
+
+    view = st.radio(
+        "Shop list",
+        ["Issues", "All shops"],
+        horizontal=True,
+        index=0,
+        key="shop_list_view",
+        help="Issues is the working list. All shops is the full universe in this scope.",
+    )
+    table = book.issues if view == "Issues" else book.shops
+    n_iss = 0 if book.issues is None or book.issues.empty else len(book.issues)
+    n_all = 0 if book.shops is None or book.shops.empty else len(book.shops)
+    st.caption(
+        f"{n_iss} issue shops · {n_all} shops in scope"
+        + (" · largest Ask first" if open_mtd else " · largest hole versus Expected first")
+    )
+    st.markdown("##### This week" if open_mtd else "##### Results and next month")
+    _shop_book_table(table, height=480)
+
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(book.scope_label))[:60]
+    if fmt == "Excel":
+        payload = shop_excel_bytes(book)
+        name = f"SND_shops_{kind}_{safe}_{sit_period}.xlsx"
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        payload = shop_pdf_bytes(book)
+        name = f"SND_shops_{kind}_{safe}_{sit_period}.pdf"
+        mime = "application/pdf"
+    st.download_button(
+        f"Download {report_type.lower()} shop pack ({fmt})",
+        payload,
+        file_name=name,
+        mime=mime,
+        type="primary",
+    )
+    if open_mtd:
+        st.caption(
+            "MTD PDF is due / visited-no-bill / lost doors. Still-to-Expected is on Excel for every shop. "
+            "Ask is the next-order number. Expected is unchanged."
+        )
+    else:
+        st.caption(
+            "Closed-month PDF is shops that missed Expected, largest hole first. "
+            "Usual drop is the next-order hint (Ask is 0 on a finished month)."
+        )
 
 
 def _page_detailed_scorecard(data, period, mtd, ledger):
@@ -1655,7 +1838,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.9.3 (not 0.9.4), curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.9.4 (not 0.9.5), curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"

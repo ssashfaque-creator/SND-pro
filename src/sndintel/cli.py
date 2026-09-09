@@ -497,6 +497,106 @@ def situation(
         console.print(table)
 
 
+@app.command()
+def shops(
+    scope: str = typer.Option("national", help="national, city, distributor, or dsr"),
+    city: Optional[str] = typer.Option(None, help="City when scope is city, distributor, or dsr"),
+    distributor: Optional[str] = typer.Option(None, help="Distributor when scope is distributor or dsr"),
+    dsr: Optional[str] = typer.Option(None, help="DSR name when scope is dsr"),
+    period: Optional[str] = typer.Option(None, help="YYYY-MM. Default is the latest month."),
+    all_shops: bool = typer.Option(False, "--all", help="Print every shop, not only issues"),
+    path: Optional[Path] = typer.Option(None, "--out", help="Write PDF or Excel (suffix decides)"),
+):
+    """Print the shop-wise issues pack (MTD due list, or closed-month misses)."""
+    init_db()
+    from sndintel.action import build_action_pack, load_action_pack
+    from sndintel.features import latest_period
+    from sndintel.shop_book import build_shop_book, excel_bytes as shop_excel, pdf_bytes as shop_pdf
+
+    with connect() as conn:
+        shop_month = read_sql(conn, "SELECT * FROM shop_month")
+        ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
+        stores = read_sql(conn, "SELECT * FROM stores")
+        try:
+            shop_day = read_sql(conn, "SELECT * FROM shop_day")
+        except Exception:
+            shop_day = pd.DataFrame()
+        try:
+            visits = read_sql(conn, "SELECT * FROM shop_visits")
+        except Exception:
+            visits = pd.DataFrame()
+        try:
+            shop_targets = read_sql(conn, "SELECT * FROM shop_targets")
+        except Exception:
+            shop_targets = pd.DataFrame()
+        latest = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
+        period = period or latest
+        action = None
+        try:
+            action = load_action_pack(conn, period)
+        except Exception:
+            action = None
+        if action is None or not getattr(action, "headline", None) or str(getattr(action, "period", "") or "") != str(period):
+            action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+    book = build_shop_book(
+        action=action,
+        shop_targets=shop_targets,
+        ledger=ledger,
+        period=period,
+        scope=scope,
+        city=city,
+        distributor=distributor,
+        dsr=dsr,
+    )
+    console.print(f"[bold]{book.headline}[/]")
+    console.print(book.weather)
+    if book.mix is not None and not book.mix.empty:
+        mix = Table(title="Issue mix")
+        for col in book.mix.columns:
+            mix.add_column(str(col), justify="right" if str(col) != "Issue" else "left")
+        for _, row in book.mix.iterrows():
+            mix.add_row(*[str(row.get(c) if row.get(c) is not None else "") for c in book.mix.columns])
+        console.print(mix)
+    show = book.shops if all_shops else book.issues
+    if show is None or show.empty:
+        console.print("No shops in this scope.")
+        raise typer.Exit(0)
+    comment_col = "Do this" if "Do this" in show.columns else "Comment"
+    table = Table(title="Issues" if not all_shops else "All shops")
+    table.add_column("Shop")
+    if "City" in show.columns:
+        table.add_column("City")
+    table.add_column("Issue")
+    table.add_column("Billed", justify="right")
+    table.add_column("Expected", justify="right")
+    table.add_column(comment_col)
+    for _, row in show.head(40).iterrows():
+        cells = [str(row.get("Shop") or "")]
+        if "City" in show.columns:
+            cells.append(str(row.get("City") or ""))
+        cells.extend(
+            [
+                str(row.get("Issue") or ""),
+                str(row.get("Billed (MT)") or ""),
+                str(row.get("Expected (MT)") or ""),
+                str(row.get(comment_col) or "")[:90],
+            ]
+        )
+        table.add_row(*cells)
+    console.print(table)
+    extra = max(0, len(show) - 40)
+    if extra:
+        console.print(f"Showing 40 of {len(show)}. Use --out file.xlsx for the full list.")
+    if path is not None:
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.suffix.lower() in {".xlsx", ".xls"}:
+            dest.write_bytes(shop_excel(book))
+        else:
+            dest.write_bytes(shop_pdf(book))
+        console.print(f"Wrote {dest}")
+
+
 @app.command("export-situation")
 def export_situation(
     path: Path = typer.Argument(Path("SND_situation.pdf")),

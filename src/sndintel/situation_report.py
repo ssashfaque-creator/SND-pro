@@ -1911,6 +1911,8 @@ TEXT_COLS = {
     "Owner",
     "Who",
     "Comment",
+    "Issue",
+    "Last billed",
 }
 
 PDF_HEADERS = {
@@ -1926,6 +1928,13 @@ PDF_HEADERS = {
     "Projected month-end (MT)": "Projected",
     "Volume at stake (MT)": "Stake",
     "Visit %": "Visit",
+    "Ask (KG)": "Ask",
+    "Last billed": "Last<br/>billed",
+    "Days since": "Days",
+    "Last drop (MT)": "Last<br/>drop",
+    "Usual drop (MT)": "Usual<br/>drop",
+    "Hole (MT)": "Hole",
+    "Issue": "Issue",
 }
 
 
@@ -2181,9 +2190,19 @@ def _pdf_table(df: pd.DataFrame, styles: dict[str, ParagraphStyle], usable: floa
     for _, row in df.iterrows():
         data.append([_body_cell(h, row.get(h), styles) for h in headers])
         sit = str(row.get("Situation") or "")
-        if sit == "Lagging":
+        issue = str(row.get("Issue") or "")
+        if sit == "Lagging" or issue in {
+            "Due · unvisited",
+            "Due · no bill",
+            "Due · light drop",
+            "Visited, no bill",
+            "Missed Expected",
+            "Unbilled",
+            "Unvisited",
+            "Lapsed",
+        }:
             tones.append("lag")
-        elif sit == "Ahead":
+        elif sit == "Ahead" or issue in {"Beat Expected", "On Expected", "On cycle"}:
             tones.append("ahead")
         else:
             tones.append("")
@@ -2222,8 +2241,12 @@ def _col_weight(header: str) -> float:
         return 1.35
     if header == "City":
         return 1.2
-    if header in {"Situation", "Label", "Driver", "Who"}:
+    if header in {"Situation", "Label", "Driver", "Who", "Issue"}:
         return 1.05
+    if header in {"Last billed", "Days since"}:
+        return 0.7
+    if header == "Ask (KG)":
+        return 0.62
     if header == "Plan":
         return 1.15
     if header == "Call":
