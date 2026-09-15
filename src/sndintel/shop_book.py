@@ -40,44 +40,49 @@ BILL_MT = 0.005
 PDF_ISSUE_N = 200
 MIX_OTHER = f"Shops (<{HOLE_MT:.2f} MT)"
 MIX_TOTAL = "Total"
+ISSUE_LAPSED = "Lapsed (lost door)"
+ISSUE_MISSED = "Missed Expected"
+ISSUE_UNBILLED = "Unbilled"
+ISSUE_UNVISITED = "Unvisited"
+# Mix billed must be 0 for these. Any rounding dust moves into MIX_OTHER.
 NO_BILL_ISSUES = {
-    "Unbilled",
-    "Unvisited",
-    "Lapsed",
+    ISSUE_UNBILLED,
+    ISSUE_UNVISITED,
+    ISSUE_LAPSED,
     "Visited, no bill",
     "Due · no bill",
     "Due · unvisited",
 }
 
 CLOSED_ISSUE_RANK = {
-    "Unvisited": 0,
-    "Unbilled": 1,
-    "Missed Expected": 2,
-    "Lapsed": 3,
+    ISSUE_MISSED: 0,
+    ISSUE_LAPSED: 1,
     "Beat Expected": 8,
     "On Expected": 9,
-    "No run-rate": 10,
+    MIX_OTHER: 10,
+    "No run-rate": 11,
 }
 MTD_ISSUE_RANK = {
     "Due · unvisited": 0,
     "Due · no bill": 1,
     "Due · light drop": 2,
     "Visited, no bill": 3,
-    "Lapsed": 4,
-    "Unvisited": 6,
+    ISSUE_LAPSED: 4,
+    ISSUE_UNVISITED: 6,
     "On cycle": 9,
-    "No run-rate": 10,
+    MIX_OTHER: 10,
+    "No run-rate": 11,
 }
-MIX_SKIP = {"No run-rate"}
+MIX_SKIP = {"No run-rate", MIX_OTHER}
 ISSUE_LAG = {
     "Due · unvisited",
     "Due · no bill",
     "Due · light drop",
     "Visited, no bill",
-    "Missed Expected",
-    "Unbilled",
-    "Unvisited",
-    "Lapsed",
+    ISSUE_MISSED,
+    ISSUE_UNBILLED,
+    ISSUE_UNVISITED,
+    ISSUE_LAPSED,
 }
 
 
@@ -430,10 +435,14 @@ def _issue(row: dict[str, Any], open_mtd: bool, unvisited: bool, visited_no_bill
     ask = float(row.get("week_target_mt") or 0)
     lapsed = bool(row.get("is_lapsed"))
     has_bill = round(billed, 2) > 0
-    has_exp = expected > HOLE_MT
+    tiny_exp = expected <= HOLE_MT
     if open_mtd:
+        if tiny_exp and not (ask > ASK_MT):
+            if billed <= ASK_MT and expected <= ASK_MT:
+                return "No run-rate"
+            return MIX_OTHER
         if lapsed and not has_bill:
-            return "Lapsed"
+            return ISSUE_LAPSED
         if ask > ASK_MT and unvisited:
             return "Due · unvisited"
         if ask > ASK_MT and visited_no_bill:
@@ -442,21 +451,19 @@ def _issue(row: dict[str, Any], open_mtd: bool, unvisited: bool, visited_no_bill
             return "Due · light drop"
         if visited_no_bill or (not has_bill and not unvisited):
             return "Visited, no bill"
-        if not has_exp and not has_bill:
+        if tiny_exp and not has_bill:
             return "No run-rate"
         return "On cycle"
-    # Closed month: billed means any invoice (same as action call_status).
-    # 0.05 MT is the material hole, not a "did they bill / do they have Expected" cutoff.
-    if not has_exp and not has_bill:
-        return "No run-rate"
+    # Closed month: Shops (<0.05 MT) is Expected-only. A door with Expected
+    # above that cut is a live miss or a lost door — never the tiny bucket.
+    if tiny_exp:
+        if billed <= ASK_MT and expected <= ASK_MT:
+            return "No run-rate"
+        return MIX_OTHER
     if not has_bill and lapsed:
-        return "Lapsed"
-    if not has_bill and unvisited:
-        return "Unvisited"
-    if not has_bill:
-        return "Unbilled"
+        return ISSUE_LAPSED
     if remaining > HOLE_MT:
-        return "Missed Expected"
+        return ISSUE_MISSED
     if billed > expected + HOLE_MT:
         return "Beat Expected"
     return "On Expected"
@@ -484,22 +491,30 @@ def _comment(row: dict[str, Any], issue: str, open_mtd: bool, period: str = "") 
     last_bit = last or "no billed sale"
     drop_bit = f"{last_drop:.2f} MT" if last_drop >= BILL_MT else "—"
     cycle_bit = _usual_cycle_text(row)
-    if issue == "Unvisited":
+    call = str(row.get("call_status") or "")
+    unvisited = call == "Unvisited"
+    has_bill = round(billed, 2) > 0
+    if issue in {ISSUE_UNVISITED, ISSUE_UNBILLED} or (issue == ISSUE_MISSED and not has_bill):
+        if unvisited:
+            return (
+                f"{name} was not visited. Expected {expected:.2f} MT, billed 0.00. "
+                f"Last billed {last_bit}.{cycle_bit} "
+                f"This is Missed Expected (a live shop short this month), not a lost door. "
+                f"Next month: put on the beat before the first drop is due."
+            )
         return (
-            f"{name} was not visited. Last billed {last_bit}.{cycle_bit} "
-            f"Next month: put on the beat before the first drop is due."
-        )
-    if issue == "Unbilled":
-        return (
-            f"{name} was visited but not billed. Last billed {last_bit} ({drop_bit}).{cycle_bit} "
+            f"{name} was visited but billed 0.00 versus Expected {expected:.2f} MT. "
+            f"Last billed {last_bit} ({drop_bit}).{cycle_bit} "
+            f"This is Missed Expected (a live shop short this month), not a lost door. "
             f"Next month: do not leave without the usual drop."
         )
-    if issue == "Lapsed":
+    if issue == ISSUE_LAPSED:
         return (
-            f"{name} is a lost door. Last billed {last_bit}.{cycle_bit} "
+            f"{name} is a lost door: last billed {last_bit}, quiet longer than 3× the usual cycle. "
+            f"Billed 0.00 because they stopped buying — not Unbilled and not Missed Expected.{cycle_bit} "
             f"Next month: recover or drop from the beat."
         )
-    if issue == "Missed Expected":
+    if issue == ISSUE_MISSED:
         return (
             f"{name} billed {billed:.2f} MT versus Expected {expected:.2f} MT. "
             f"Last drop {drop_bit} on {last_bit}.{cycle_bit} "
@@ -512,6 +527,11 @@ def _comment(row: dict[str, Any], issue: str, open_mtd: bool, period: str = "") 
         )
     if issue == "No run-rate":
         return f"{name} has no material Expected this month. Last billed {last_bit}.{cycle_bit}"
+    if issue == MIX_OTHER:
+        return (
+            f"{name} has Expected {expected:.2f} MT (under {HOLE_MT:.2f} MT), so it sits in {MIX_OTHER}. "
+            f"Not an issue this month. Last billed {last_bit}.{cycle_bit}"
+        )
     return f"{name} landed on Expected ({billed:.2f} MT). Last billed {last_bit}.{cycle_bit}"
 
 
@@ -575,8 +595,18 @@ def _kpis(shops: pd.DataFrame, open_mtd: bool) -> dict[str, Any]:
         "shop_remaining_mt": remaining,
         "n_quiet": quiet_n,
         "n_due": due_n,
-        "n_unvisited": int((shops["issue"] == "Unvisited").sum()) if not shops.empty else 0,
-        "n_unbilled": int((shops["issue"].isin(["Unbilled", "Visited, no bill", "Due · no bill"])).sum()) if not shops.empty else 0,
+        "n_unvisited": int((shops["issue"] == ISSUE_UNVISITED).sum()) if not shops.empty else 0,
+        "n_unbilled": int(
+            (
+                shops["issue"].isin([ISSUE_UNBILLED, "Visited, no bill", "Due · no bill"])
+                | (
+                    shops["issue"].eq(ISSUE_MISSED)
+                    & (pd.to_numeric(shops.get("billed_mt"), errors="coerce").fillna(0).round(2) <= 0)
+                )
+            ).sum()
+        )
+        if not shops.empty
+        else 0,
         "cover_from_scorecard": False,
     }
 
@@ -736,12 +766,20 @@ def _issue_mix(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
     if shops is None or shops.empty:
         return pd.DataFrame()
     order = list(MTD_ISSUE_RANK) if open_mtd else list(CLOSED_ISSUE_RANK)
-    used: list[Any] = []
     rows = []
+    expected_all = pd.to_numeric(shops.get("expected_mt"), errors="coerce").fillna(0.0)
+    billed_all = pd.to_numeric(shops.get("billed_mt"), errors="coerce").fillna(0.0)
+    tiny_mask = expected_all <= HOLE_MT
+    quiet = shops["issue"].astype(str).eq("No run-rate") if "issue" in shops.columns else pd.Series(False, index=shops.index)
 
     def rec_for(label: str, part: pd.DataFrame, billed: float | None = None, expected: float | None = None) -> dict[str, Any]:
+        raw = pd.to_numeric(part["billed_mt"], errors="coerce").fillna(0.0) if billed is None else None
         if billed is None:
-            billed = float(pd.to_numeric(part["billed_mt"], errors="coerce").fillna(0).sum())
+            shown = raw.map(lambda x: round(float(x), 2))
+            if label in {MIX_OTHER, MIX_TOTAL}:
+                billed = float(raw.sum())
+            else:
+                billed = float(raw.where(shown > 0, 0.0).sum())
         if expected is None:
             expected = float(pd.to_numeric(part["expected_mt"], errors="coerce").fillna(0).sum())
         if label in NO_BILL_ISSUES:
@@ -762,28 +800,22 @@ def _issue_mix(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
     for issue in order:
         if issue in MIX_SKIP:
             continue
-        part = shops[shops["issue"] == issue]
-        if issue not in ISSUE_LAG and not part.empty:
-            billed_s = pd.to_numeric(part["billed_mt"], errors="coerce").fillna(0)
-            expected_s = pd.to_numeric(part["expected_mt"], errors="coerce").fillna(0)
-            part = part.loc[(billed_s > HOLE_MT) | (expected_s > HOLE_MT)]
+        part = shops.loc[(shops["issue"] == issue) & ~tiny_mask]
         if part.empty:
             continue
         rows.append(rec_for(issue, part))
-        used.extend(list(part.index))
-    rest = shops.loc[~shops.index.isin(used)]
-    if not rest.empty:
-        rest = rest[rest["issue"].astype(str) != "No run-rate"]
-        billed_s = pd.to_numeric(rest.get("billed_mt"), errors="coerce").fillna(0)
-        expected_s = pd.to_numeric(rest.get("expected_mt"), errors="coerce").fillna(0)
-        rest = rest.loc[(billed_s > ASK_MT) | (expected_s > ASK_MT)]
-    if rest is not None and not rest.empty:
-        rows.append(rec_for(MIX_OTHER, rest))
-        used.extend(list(rest.index))
+    tiny = shops.loc[tiny_mask & ~quiet]
+    if not tiny.empty:
+        tiny = tiny.loc[(billed_all.reindex(tiny.index).fillna(0) > ASK_MT) | (expected_all.reindex(tiny.index).fillna(0) > ASK_MT)]
+    if tiny is not None and not tiny.empty:
+        rows.append(rec_for(MIX_OTHER, tiny))
+    named_idx = shops.index.difference(tiny.index if tiny is not None and not tiny.empty else shops.iloc[0:0].index)
+    named_idx = named_idx.difference(shops.loc[quiet].index)
     dust = 0.0
-    if not shops.empty and "issue" in shops.columns:
-        no_bill = shops["issue"].astype(str).isin(NO_BILL_ISSUES)
-        dust = float(pd.to_numeric(shops.loc[no_bill, "billed_mt"], errors="coerce").fillna(0).sum())
+    if len(named_idx):
+        raw = billed_all.reindex(named_idx).fillna(0.0)
+        shown = raw.map(lambda x: round(float(x), 2))
+        dust = float(raw.where(shown <= 0, 0.0).sum())
     if _mt2(dust) > 0:
         other_i = next((i for i, rec in enumerate(rows) if rec["Issue"] == MIX_OTHER), None)
         if other_i is None:
@@ -828,7 +860,7 @@ def _headline(kpis: dict[str, Any], scope_label: str, label: str, open_mtd: bool
     )
     weather = (
         f"Gap vs Expected is Expected − billed = {_mt2(hole):.2f} MT. "
-        f"{n_iss} shops missed ({_mt2(issue_mt):.2f} MT of holes); shops that beat Expected net against that in the mix total. "
+        f"{n_iss} shops missed Expected or are lost doors ({_mt2(issue_mt):.2f} MT of holes); shops that beat Expected net against that in the mix total. "
         f"{n_active} doors had a bill or a run-rate this month"
         + (f"; {n_quiet:,} universe doors with neither are omitted from the mix." if n_quiet else ".")
     )
@@ -841,16 +873,19 @@ def _how_to_read(open_mtd: bool) -> list[str]:
         return [
             "Cover Billed, Expected, and Target match Situation cascade for this scope. Mix Total billed and Expected are the same cover figures.",
             "A shop that has not yet billed its full Expected is not a miss mid-month. Issues are due this week (Ask), visited with no bill, and lost doors.",
+            f"{ISSUE_LAPSED} = last bill older than 3× the usual cycle. Billed 0 because they stopped — not a this-week miss.",
             "Ask (KG) is the 90-day expected drop when the depletion ratio is ≥ 0.8. That is the next-order number for this week.",
             "Usual drop is X MT. 'Every N days' is printed only when a gap was measured between purchases — a single bill does not assume 14 days.",
         ]
     return [
         "Cover Billed, Expected, Gap, and Target match Situation cascade for this scope. Gap = Expected − billed (floored at 0). Mix Total billed, Expected, and Gap are the same cover figures.",
-        f"Issue shops are the working list (missed Expected, unbilled, unvisited, lapsed). {tiny} holds tiny doors so the mix still adds up. Excel has every door.",
+        f"{tiny} is Expected-only: every door with Expected under {HOLE_MT:.2f} MT, even if it billed. If Expected is {HOLE_MT:.2f} MT or more, the shop is Missed Expected or {ISSUE_LAPSED} — never {tiny}.",
+        f"Issue shops are the working list: {ISSUE_MISSED} (live shop short of Expected, including billed 0.00) and {ISSUE_LAPSED}. Excel has every door.",
+        f"{ISSUE_LAPSED} = last bill older than 3× the usual cycle. Billed is 0 because they fell off the beat, not because this month’s visit failed. Not Missed Expected.",
+        f"{ISSUE_MISSED} = still a live shop (not a lost door) and Expected ≥ {HOLE_MT:.2f} MT, but billed less than Expected by more than {HOLE_MT:.2f} MT. Billed 0.00 is a miss, not a separate Unbilled row.",
         "Shop Expected is last-3 / last-6, scaled so the doors in this scope add to the official Expected — the same figure as Situation cascade.",
         "Target on the cover is the plan book. Shop Target is only shown when a matched POP quota is material. Unmatched names still count on the cover if Area folds onto this city.",
-        f"Unbilled means visited and billed 0.00 on the page. Mix Unbilled billed is always 0. Invoices that round to 0.00 sit in {tiny}, not as Unbilled volume. Situation Unbilled (MT) is the city hole split, not this shop-count billed volume.",
-        "A 10–50 KG invoice is billed — Missed Expected if it missed the run-rate.",
+        f"Invoices that round to 0.00 on the page do not sit as mix billed on Missed Expected — those kilos park in {tiny}. Situation Unbilled (MT) is the city hole split, not this shop-count billed volume.",
         "Usual drop is X MT. 'Every N days' is printed only when a gap was measured between purchases — a single bill does not assume 14 days. Comment is next month, not this week.",
     ]
 
@@ -987,7 +1022,7 @@ def excel_bytes(book: ShopBook) -> bytes:
         wb,
         "01 Issue mix",
         "Issue mix",
-        f"Mix Total billed, Expected, and Gap (Expected − billed) match the cover. {MIX_OTHER} holds tiny doors. Mix Unbilled billed is always 0. Universe doors with no bill and no run-rate are omitted from named rows (they are 0 on the Total).",
+        f"Mix Total billed, Expected, and Gap (Expected − billed) match the cover. {MIX_OTHER} is Expected under {HOLE_MT:.2f} MT. Lost-door billed is always 0. Universe doors with no bill and no run-rate are omitted from named rows (they are 0 on the Total).",
         book.mix,
     )
     note_iss = "Shops that are an issue on this cut, largest hole / Ask first."
@@ -1089,8 +1124,8 @@ def write_pdf(book: ShopBook, path: Path | str | BytesIO) -> None:
         heading = Paragraph("Issue mix", styles["h2"])
         note = Paragraph(
             "Mix Total billed, Expected, and Gap (Expected − billed) match the cover. "
-            f"{MIX_OTHER} holds tiny doors so the total still adds up. "
-            "Mix Unbilled billed is always 0.",
+            f"{MIX_OTHER} is every door with Expected under {HOLE_MT:.2f} MT. "
+            f"{ISSUE_LAPSED} billed is always 0 — they stopped, they are not a this-month miss.",
             styles["note"],
         )
         table = _pdf_table(mix, styles, usable)
@@ -1102,7 +1137,7 @@ def write_pdf(book: ShopBook, path: Path | str | BytesIO) -> None:
     extra = f" Showing {PDF_ISSUE_N} of {n_iss}. Excel has every shop." if n_iss > PDF_ISSUE_N else " Excel has every shop in this scope."
     note = Paragraph(
         (
-            "Working list: shops that missed Expected, were unbilled or unvisited, or lapsed. "
+            "Working list: live shops that missed Expected (including billed 0.00) and lost doors. "
             "The mix Total is the full pack. "
         )
         + extra.strip(),

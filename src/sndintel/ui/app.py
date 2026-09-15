@@ -30,6 +30,7 @@ from sndintel.briefing import (
     pdf_bytes_detailed,
 )
 from sndintel.shop_book import (
+    MIX_OTHER,
     build_shop_book,
     excel_bytes as shop_excel_bytes,
     list_shop_book_entities,
@@ -1439,12 +1440,12 @@ def _page_shop_book(data, period, mtd, ledger):
         st.caption(
             f"{quiet:,} universe doors with no bill and no run-rate are omitted from named mix rows (they are 0 on Total). "
             "Mix Total billed, Expected, and Gap match the cover and Situation cascade for this scope. "
-            "Unbilled billed is always 0."
+            f"{MIX_OTHER} is Expected under 0.05 MT. Lapsed (lost door) billed is 0."
         )
     else:
         st.caption(
             "Mix Total billed, Expected, and Gap (Expected − billed) match the cover and Situation cascade for this scope. "
-            "Unbilled billed is always 0."
+            f"{MIX_OTHER} is Expected under 0.05 MT. Lapsed (lost door) billed is 0."
         )
     _shop_book_table(book.mix, height=220)
 
@@ -1860,7 +1861,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.9.8 (not 0.9.9), curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.9.9 (not 0.9.10), curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"

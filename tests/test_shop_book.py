@@ -9,7 +9,15 @@ from openpyxl import load_workbook
 
 from sndintel.action import ActionPack, build_action_pack
 from sndintel.plan import attach_plan
-from sndintel.shop_book import MIX_OTHER, build_shop_book, excel_bytes, list_shop_book_entities, pdf_bytes
+from sndintel.shop_book import (
+    ISSUE_LAPSED,
+    ISSUE_MISSED,
+    MIX_OTHER,
+    build_shop_book,
+    excel_bytes,
+    list_shop_book_entities,
+    pdf_bytes,
+)
 from sndintel.situation_report import build_situation_pack
 
 from test_situation_report import _mtd_world, _stores, _world
@@ -103,7 +111,7 @@ def test_mtd_does_not_flag_still_to_expected_as_the_issue_list():
             "Due · no bill",
             "Due · light drop",
             "Visited, no bill",
-            "Lapsed",
+            ISSUE_LAPSED,
             "Unvisited",
         }
     ask_left = action.raw_shops.set_index("store_id")["week_target_mt"].astype(float)
@@ -173,16 +181,17 @@ def test_unbilled_is_billed_zero_not_a_tiny_invoice():
     )
     book = build_shop_book(action=pack, period="2026-08")
     by_name = book.raw.set_index("store_name")["issue"].astype(str)
-    assert by_name["Visited Zero"] == "Unbilled"
-    assert by_name["Tiny Invoice"] == "Missed Expected"
+    assert by_name["Visited Zero"] == ISSUE_MISSED
+    assert by_name["Tiny Invoice"] == ISSUE_MISSED
     mix = book.mix.set_index("Issue")
-    assert float(mix.loc["Unbilled", "Billed (MT)"]) == 0.0
-    assert float(mix.loc["Unbilled", "Expected (MT)"]) == 2.0
-    assert "visited but not billed" in str(
-        book.issues.loc[book.issues["Shop"] == "Visited Zero", "Comment"].iloc[0]
-    ).lower()
+    assert "Unbilled" not in mix.index
+    assert float(mix.loc[ISSUE_MISSED, "Billed (MT)"]) == 0.02
+    assert float(mix.loc[ISSUE_MISSED, "Expected (MT)"]) == 4.92
+    zero_comment = str(book.issues.loc[book.issues["Shop"] == "Visited Zero", "Comment"].iloc[0]).lower()
+    assert "visited but billed 0.00" in zero_comment
+    assert "not a lost door" in zero_comment
     tiny_comment = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Comment"].iloc[0]).lower()
-    assert "visited but not billed" not in tiny_comment
+    assert "visited but billed 0.00" not in tiny_comment
     assert "2.92" in tiny_comment
     assert "usual drop is 1.71 mt every 14 days" in tiny_comment
     last = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Last billed"].iloc[0])
@@ -234,8 +243,8 @@ def test_no_run_rate_is_not_a_row_with_expected():
     book = build_shop_book(action=pack, period="2026-08")
     by_name = book.raw.set_index("store_name")["issue"].astype(str)
     assert by_name["Universe"] == "No run-rate"
-    assert by_name["Quiet"] == "On Expected"
-    assert by_name["Real Miss"] == "Missed Expected"
+    assert by_name["Quiet"] == MIX_OTHER
+    assert by_name["Real Miss"] == ISSUE_MISSED
     assert "No Expected" not in set(book.mix["Issue"].astype(str))
     assert "No run-rate" not in set(book.mix["Issue"].astype(str))
     named = set(book.mix["Issue"].astype(str)) - {"Total", MIX_OTHER}
@@ -482,7 +491,7 @@ def test_presented_gap_equals_expected_minus_billed():
     )
     book = build_shop_book(action=pack, period="2026-08", scope="city", city="Karachi")
     by_name = book.raw.set_index("store_name")["issue"].astype(str)
-    assert by_name["Zero Display"] == "Unbilled"
+    assert by_name["Zero Display"] == ISSUE_MISSED
     for _, row in book.shops.iterrows():
         billed = float(row["Billed (MT)"])
         expected = float(row["Expected (MT)"])
@@ -639,8 +648,12 @@ def test_unbilled_rounding_dust_is_not_unbilled_volume():
     )
     book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
     mix = book.mix.set_index("Issue")
-    assert "Unbilled" in mix.index
-    assert float(mix.loc["Unbilled", "Billed (MT)"]) == 0.0
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Dust A"] == ISSUE_MISSED
+    assert by_name["Dust B"] == ISSUE_MISSED
+    assert by_name["Tiny Landed"] == MIX_OTHER
+    assert "Unbilled" not in mix.index
+    assert float(mix.loc[ISSUE_MISSED, "Billed (MT)"]) == 1.0
     assert "Other doors" not in set(book.mix["Issue"].astype(str))
     assert MIX_OTHER in mix.index
     dust = 0.004 + 0.003
@@ -684,6 +697,103 @@ def test_unmeasured_cycle_does_not_claim_fourteen_days():
     )
     book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
     comment = str(book.issues.loc[book.issues["Shop"] == "Once", "Comment"].iloc[0]).lower()
+    assert book.raw.set_index("store_name").loc["Once", "issue"] == ISSUE_MISSED
     assert "usual drop is 1.50 mt" in comment
     assert "every" not in comment
     assert "14" not in comment
+    assert "not a lost door" in comment
+
+
+def test_tiny_bucket_is_expected_not_billed():
+    """Shops (<0.05 MT) is Expected-only. Material Expected never sits there."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "WHALE",
+                "store_name": "Tiny Expected Whale",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 2.00,
+                "expected_mt": 0.03,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "LIVE0",
+                "store_name": "Live Zero",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 1.50,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+                "last_bill_date": "2026-07-27",
+            },
+            {
+                "store_id": "DEAD",
+                "store_name": "Lost Door",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 1.20,
+                "call_status": "Unvisited",
+                "is_lapsed": True,
+                "week_target_mt": 0.0,
+                "last_bill_date": "2026-05-21",
+            },
+            {
+                "store_id": "SMALL0",
+                "store_name": "Small Expected",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 0.04,
+                "call_status": "Visited · not billed",
+                "is_lapsed": True,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "LIGHT",
+                "store_name": "Light Bill",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.02,
+                "expected_mt": 0.80,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Tiny Expected Whale"] == MIX_OTHER
+    assert by_name["Small Expected"] == MIX_OTHER
+    assert by_name["Live Zero"] == ISSUE_MISSED
+    assert by_name["Lost Door"] == ISSUE_LAPSED
+    assert by_name["Light Bill"] == ISSUE_MISSED
+    mix = book.mix.set_index("Issue")
+    assert "Unbilled" not in mix.index
+    assert "Unvisited" not in mix.index
+    assert MIX_OTHER in mix.index
+    tiny = mix.loc[MIX_OTHER]
+    assert int(tiny["Shops"]) == 2
+    assert float(tiny["Expected (MT)"]) <= 0.05 + 0.04 + 1e-9
+    for _, row in book.raw.iterrows():
+        if float(row["expected_mt"]) > 0.05:
+            assert str(row["issue"]) != MIX_OTHER
+    lost = str(book.issues.loc[book.issues["Shop"] == "Lost Door", "Comment"].iloc[0]).lower()
+    assert "lost door" in lost
+    assert "not unbilled" in lost
+    assert "not missed expected" in lost
+    live = str(book.issues.loc[book.issues["Shop"] == "Live Zero", "Comment"].iloc[0]).lower()
+    assert "missed expected" in live
+    assert "not a lost door" in live
+    assert "billed 0.00" in live
