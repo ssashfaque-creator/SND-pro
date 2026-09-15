@@ -38,8 +38,16 @@ HOLE_MT = 0.05
 ASK_MT = 0.0005
 BILL_MT = 0.005
 PDF_ISSUE_N = 200
-MIX_OTHER = "Other doors"
+MIX_OTHER = f"Shops (<{HOLE_MT:.2f} MT)"
 MIX_TOTAL = "Total"
+NO_BILL_ISSUES = {
+    "Unbilled",
+    "Unvisited",
+    "Lapsed",
+    "Visited, no bill",
+    "Due · no bill",
+    "Due · unvisited",
+}
 
 CLOSED_ISSUE_RANK = {
     "Unvisited": 0,
@@ -731,15 +739,21 @@ def _issue_mix(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
     used: list[Any] = []
     rows = []
 
-    def rec_for(label: str, part: pd.DataFrame) -> dict[str, Any]:
-        billed = float(pd.to_numeric(part["billed_mt"], errors="coerce").fillna(0).sum())
-        expected = float(pd.to_numeric(part["expected_mt"], errors="coerce").fillna(0).sum())
+    def rec_for(label: str, part: pd.DataFrame, billed: float | None = None, expected: float | None = None) -> dict[str, Any]:
+        if billed is None:
+            billed = float(pd.to_numeric(part["billed_mt"], errors="coerce").fillna(0).sum())
+        if expected is None:
+            expected = float(pd.to_numeric(part["expected_mt"], errors="coerce").fillna(0).sum())
+        if label in NO_BILL_ISSUES:
+            billed = 0.0
         rec = {
             "Issue": label,
             "Shops": int(len(part)),
             "Billed (MT)": _mt2(billed),
             "Expected (MT)": _mt2(expected),
             "Gap (MT)": _mt2(expected - billed),
+            "_raw_billed": billed,
+            "_raw_expected": expected,
         }
         if open_mtd:
             rec["Ask (KG)"] = int(round(float(pd.to_numeric(part["week_target_mt"], errors="coerce").fillna(0).sum()) * 1000))
@@ -766,9 +780,25 @@ def _issue_mix(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
     if rest is not None and not rest.empty:
         rows.append(rec_for(MIX_OTHER, rest))
         used.extend(list(rest.index))
+    dust = 0.0
+    if not shops.empty and "issue" in shops.columns:
+        no_bill = shops["issue"].astype(str).isin(NO_BILL_ISSUES)
+        dust = float(pd.to_numeric(shops.loc[no_bill, "billed_mt"], errors="coerce").fillna(0).sum())
+    if _mt2(dust) > 0:
+        other_i = next((i for i, rec in enumerate(rows) if rec["Issue"] == MIX_OTHER), None)
+        if other_i is None:
+            empty = shops.iloc[0:0]
+            rows.append(rec_for(MIX_OTHER, empty, billed=0.0, expected=0.0))
+            other_i = len(rows) - 1
+        billed_other = float(rows[other_i]["_raw_billed"]) + dust
+        expected_other = float(rows[other_i]["_raw_expected"])
+        rows[other_i]["_raw_billed"] = billed_other
+        rows[other_i]["Billed (MT)"] = _mt2(billed_other)
+        rows[other_i]["Gap (MT)"] = _mt2(expected_other - billed_other)
     if rows:
         rows.append(rec_for(MIX_TOTAL, shops))
-    return pd.DataFrame(rows)
+    mix = pd.DataFrame(rows)
+    return mix.drop(columns=[c for c in mix.columns if str(c).startswith("_")], errors="ignore")
 
 
 def _headline(kpis: dict[str, Any], scope_label: str, label: str, open_mtd: bool) -> tuple[str, str]:
@@ -806,20 +836,22 @@ def _headline(kpis: dict[str, Any], scope_label: str, label: str, open_mtd: bool
 
 
 def _how_to_read(open_mtd: bool) -> list[str]:
+    tiny = MIX_OTHER
     if open_mtd:
         return [
-            "Cover Billed and Expected are the shops in this pack. They add to the mix total. Target is the plan book (unmatched names still roll if Area is this city).",
+            "Cover Billed, Expected, and Target match Situation cascade for this scope. Mix Total billed and Expected are the same cover figures.",
             "A shop that has not yet billed its full Expected is not a miss mid-month. Issues are due this week (Ask), visited with no bill, and lost doors.",
             "Ask (KG) is the 90-day expected drop when the depletion ratio is ≥ 0.8. That is the next-order number for this week.",
-            "Usual drop is X MT every Y days — that shop’s 90-day cycle.",
+            "Usual drop is X MT. 'Every N days' is printed only when a gap was measured between purchases — a single bill does not assume 14 days.",
         ]
     return [
-        "Cover Billed, Expected, and Gap vs Expected are this pack’s shops. Gap = Expected − billed (floored at 0). The mix Total is the same billed, Expected, and Gap.",
-        "Issue shops are the working list (missed Expected, unbilled, unvisited, lapsed). Other doors holds small landed shops so the mix still adds up. Excel has every door.",
-        "Shop Expected is last-3 / last-6, scaled so the doors in this scope add to the official city (or distributor / DSR) Expected — the same figure as Situation cascade.",
+        "Cover Billed, Expected, Gap, and Target match Situation cascade for this scope. Gap = Expected − billed (floored at 0). Mix Total billed, Expected, and Gap are the same cover figures.",
+        f"Issue shops are the working list (missed Expected, unbilled, unvisited, lapsed). {tiny} holds tiny doors so the mix still adds up. Excel has every door.",
+        "Shop Expected is last-3 / last-6, scaled so the doors in this scope add to the official Expected — the same figure as Situation cascade.",
         "Target on the cover is the plan book. Shop Target is only shown when a matched POP quota is material. Unmatched names still count on the cover if Area folds onto this city.",
-        "Unbilled means visited and billed 0 this month (nothing that shows at 0.01 MT). A 10–50 KG invoice is billed — Missed Expected if it missed the run-rate.",
-        "Usual drop is X MT every Y days — the 90-day cycle, not the monthly Expected. Comment is next month, not this week.",
+        f"Unbilled means visited and billed 0.00 on the page. Mix Unbilled billed is always 0. Invoices that round to 0.00 sit in {tiny}, not as Unbilled volume. Situation Unbilled (MT) is the city hole split, not this shop-count billed volume.",
+        "A 10–50 KG invoice is billed — Missed Expected if it missed the run-rate.",
+        "Usual drop is X MT. 'Every N days' is printed only when a gap was measured between purchases — a single bill does not assume 14 days. Comment is next month, not this week.",
     ]
 
 
@@ -955,7 +987,7 @@ def excel_bytes(book: ShopBook) -> bytes:
         wb,
         "01 Issue mix",
         "Issue mix",
-        "Mix Total billed, Expected, and Gap (Expected − billed) match the cover. Other doors holds small landed shops. Universe doors with no bill and no run-rate are omitted from named rows (they are 0 on the Total).",
+        f"Mix Total billed, Expected, and Gap (Expected − billed) match the cover. {MIX_OTHER} holds tiny doors. Mix Unbilled billed is always 0. Universe doors with no bill and no run-rate are omitted from named rows (they are 0 on the Total).",
         book.mix,
     )
     note_iss = "Shops that are an issue on this cut, largest hole / Ask first."
@@ -1057,7 +1089,8 @@ def write_pdf(book: ShopBook, path: Path | str | BytesIO) -> None:
         heading = Paragraph("Issue mix", styles["h2"])
         note = Paragraph(
             "Mix Total billed, Expected, and Gap (Expected − billed) match the cover. "
-            "Other doors holds small landed shops so the total still adds up.",
+            f"{MIX_OTHER} holds tiny doors so the total still adds up. "
+            "Mix Unbilled billed is always 0.",
             styles["note"],
         )
         table = _pdf_table(mix, styles, usable)

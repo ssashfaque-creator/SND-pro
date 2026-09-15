@@ -9,7 +9,7 @@ from openpyxl import load_workbook
 
 from sndintel.action import ActionPack, build_action_pack
 from sndintel.plan import attach_plan
-from sndintel.shop_book import build_shop_book, excel_bytes, list_shop_book_entities, pdf_bytes
+from sndintel.shop_book import MIX_OTHER, build_shop_book, excel_bytes, list_shop_book_entities, pdf_bytes
 from sndintel.situation_report import build_situation_pack
 
 from test_situation_report import _mtd_world, _stores, _world
@@ -238,7 +238,7 @@ def test_no_run_rate_is_not_a_row_with_expected():
     assert by_name["Real Miss"] == "Missed Expected"
     assert "No Expected" not in set(book.mix["Issue"].astype(str))
     assert "No run-rate" not in set(book.mix["Issue"].astype(str))
-    named = set(book.mix["Issue"].astype(str)) - {"Total", "Other doors"}
+    named = set(book.mix["Issue"].astype(str)) - {"Total", MIX_OTHER}
     assert "On Expected" not in named
     assert book.kpis.get("n_quiet") == 1
     total = book.mix.set_index("Issue").loc["Total"]
@@ -581,3 +581,109 @@ def test_duplicate_shop_names_are_disambiguated():
     assert abs(float(total["Billed (MT)"]) - round(float(book.kpis["billed_mt"]), 2)) < 0.02
     assert abs(float(total["Expected (MT)"]) - round(float(book.kpis["expected_mt"]), 2)) < 0.02
     assert abs(float(total["Gap (MT)"]) - round(float(book.kpis["expected_mt"]) - float(book.kpis["billed_mt"]), 2)) < 0.02
+
+
+def test_unbilled_rounding_dust_is_not_unbilled_volume():
+    """0.001–0.004 MT displays as billed 0.00 and must not sit in mix Unbilled billed."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "U1",
+                "store_name": "Dust A",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.004,
+                "expected_mt": 2.00,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "U2",
+                "store_name": "Dust B",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.003,
+                "expected_mt": 1.00,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "T1",
+                "store_name": "Tiny Landed",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.02,
+                "expected_mt": 0.03,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "M1",
+                "store_name": "Real Miss",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 1.00,
+                "expected_mt": 4.00,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
+    mix = book.mix.set_index("Issue")
+    assert "Unbilled" in mix.index
+    assert float(mix.loc["Unbilled", "Billed (MT)"]) == 0.0
+    assert "Other doors" not in set(book.mix["Issue"].astype(str))
+    assert MIX_OTHER in mix.index
+    dust = 0.004 + 0.003
+    tiny = 0.02
+    assert abs(float(mix.loc[MIX_OTHER, "Billed (MT)"]) - round(tiny + dust, 2)) < 1e-9
+    total = mix.loc["Total"]
+    cover_billed = round(float(book.kpis["billed_mt"]), 2)
+    assert abs(float(total["Billed (MT)"]) - cover_billed) < 1e-9
+    parts = book.mix[book.mix["Issue"] != "Total"]
+    assert abs(float(parts["Billed (MT)"].sum()) - float(total["Billed (MT)"])) < 0.02
+    assert abs(float(parts["Expected (MT)"].sum()) - float(total["Expected (MT)"])) < 0.02
+    assert abs(float(parts["Gap (MT)"].sum()) - float(total["Gap (MT)"])) < 0.02
+    assert abs(float(total["Gap (MT)"]) - (float(total["Expected (MT)"]) - float(total["Billed (MT)"]))) < 1e-9
+    how = " ".join(book.how_to_read).lower()
+    assert "situation cascade" in how
+    assert "every n days" in how
+    assert MIX_OTHER.lower() in how
+
+
+def test_unmeasured_cycle_does_not_claim_fourteen_days():
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "ONCE",
+                "store_name": "Once",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 2.0,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+                "expected_drop_mt": 1.50,
+                "cycle_days": float("nan"),
+                "n_intervals": 0,
+                "last_bill_date": "2026-08-08",
+                "last_drop_mt": 1.50,
+            }
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
+    comment = str(book.issues.loc[book.issues["Shop"] == "Once", "Comment"].iloc[0]).lower()
+    assert "usual drop is 1.50 mt" in comment
+    assert "every" not in comment
+    assert "14" not in comment
