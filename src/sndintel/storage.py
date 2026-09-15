@@ -277,6 +277,24 @@ CREATE TABLE IF NOT EXISTS unit_scorecards (
     PRIMARY KEY (period, grain, grain_id, parent_id)
 );
 
+CREATE TABLE IF NOT EXISTS shop_targets (
+    store_id TEXT,
+    store_name TEXT NOT NULL,
+    distributor TEXT,
+    dsr_name TEXT,
+    zone TEXT,
+    city TEXT,
+    section TEXT,
+    target_mt REAL NOT NULL,
+    match_method TEXT,
+    match_score REAL,
+    source_file TEXT,
+    ingested_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_shop_targets_store ON shop_targets(store_id);
+CREATE INDEX IF NOT EXISTS idx_shop_targets_city ON shop_targets(city);
+
 CREATE TABLE IF NOT EXISTS seasonality_index (
     period TEXT NOT NULL,
     grain TEXT NOT NULL,
@@ -596,9 +614,22 @@ def init_db(path: Optional[Path] = None) -> Path:
             ("has_visit_file", "INTEGER"),
             ("distributor", "TEXT"),
             ("dsr_name", "TEXT"),
+            ("target_mt", "REAL"),
+            ("target_paced_mt", "REAL"),
+            ("vs_target_mt", "REAL"),
+            ("gap_to_target_mt", "REAL"),
+            ("attain_pct", "REAL"),
+            ("stretch_mt", "REAL"),
+            ("plan_quality", "TEXT"),
+            ("plan_status", "TEXT"),
+            ("n_target_shops", "INTEGER"),
+            ("target_matched_mt", "REAL"),
+            ("target_book_mt", "REAL"),
+            ("n_target_unmatched", "INTEGER"),
         ):
             _ensure_column(conn, "unit_scorecards", col, ddl)
         _ensure_column(conn, "stores", "source", "TEXT")
+        _ensure_column(conn, "shop_targets", "section", "TEXT")
         for col, ddl in (
             ("competitive_mt", "REAL"),
             ("isolated_mt", "REAL"),

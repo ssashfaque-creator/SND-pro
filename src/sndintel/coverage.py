@@ -199,13 +199,23 @@ def allocate_recoverable_drivers(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()
-    drop = pd.to_numeric(out.get("from_drop_size_mt"), errors="coerce").fillna(0.0)
-    unv = pd.to_numeric(out.get("from_unvisited_mt"), errors="coerce").fillna(0.0)
-    unb = pd.to_numeric(out.get("from_unbilled_mt"), errors="coerce").fillna(0.0)
-    rec = pd.to_numeric(out.get("recoverable_mt"), errors="coerce").fillna(0.0)
-    iso = pd.to_numeric(out.get("isolated_mt"), errors="coerce")
-    vol = pd.to_numeric(out.get("volume_mt"), errors="coerce")
-    fair = pd.to_numeric(out.get("share_expected_mt"), errors="coerce")
+
+    def _s(name: str, fill: float | None = None) -> pd.Series:
+        if name not in out.columns:
+            s = pd.Series(np.nan, index=out.index)
+        else:
+            s = pd.to_numeric(out[name], errors="coerce")
+        if fill is not None:
+            return s.fillna(fill)
+        return s
+
+    drop = _s("from_drop_size_mt", 0.0)
+    unv = _s("from_unvisited_mt", 0.0)
+    unb = _s("from_unbilled_mt", 0.0)
+    rec = _s("recoverable_mt", 0.0)
+    iso = _s("isolated_mt")
+    vol = _s("volume_mt")
+    fair = _s("share_expected_mt")
     out["from_drop_size_raw_mt"] = drop
     out["from_unvisited_raw_mt"] = unv
     out["from_unbilled_raw_mt"] = unb

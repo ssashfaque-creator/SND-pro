@@ -172,7 +172,10 @@ def test_pack_layers_cities_then_those_dists_then_all_dists():
     assert "Fair share of country (MT)" not in cities.columns
     assert "Zone" not in cities.columns
     exp_i = list(cities.columns).index("Expected this month (MT)")
-    assert list(cities.columns)[exp_i + 1] == "Gap (MT)"
+    gap_i = list(cities.columns).index("Gap (MT)")
+    assert gap_i > exp_i
+    assert "Sales-team plan (MT)" in cities.columns
+    assert list(cities.columns)[exp_i + 1] == "Sales-team plan (MT)"
     assert list(cities.columns)[-2] == "Drop size (MT)"
     assert "From drop size (MT)" in cities.columns
     assert "From unvisited shops (MT)" in cities.columns

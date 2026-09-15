@@ -16,8 +16,10 @@ from sndintel.action import build_action_pack, persist_action_pack
 from sndintel.ingest.daily import overlay_store_attrs
 from sndintel.ingest.shops import parse_shop_master
 from sndintel.ingest.ssrs import ParseReport, collapse_sales_facts, parse_sales_file
+from sndintel.ingest.targets import match_shop_targets, parse_shop_targets
 from sndintel.ingest.universe import fill_zone_from_legacy, parse_universe
 from sndintel.ingest.visits import parse_visit_calls
+from sndintel.plan import attach_plan
 from sndintel.hierarchy import HierarchyPack, build_hierarchy_pack, plays_from_pack
 from sndintel.insights import compile_insights
 from sndintel.models import cluster_shops, detect_anomalies, forecast_shop_month
@@ -202,6 +204,7 @@ def run_pipeline(
     shop_path: Optional[str | Path] = None,
     universe_path: Optional[str | Path] = None,
     visits_path: Optional[str | Path] = None,
+    targets_path: Optional[str | Path] = None,
     db_path: Optional[str | Path] = None,
     sales_paths: Optional[list[str | Path]] = None,
     replace_sales: bool = False,
@@ -223,6 +226,7 @@ def run_pipeline(
     shop_path = Path(shop_path) if shop_path else None
     universe_path = Path(universe_path) if universe_path else None
     visits_path = Path(visits_path) if visits_path else None
+    targets_path = Path(targets_path) if targets_path else None
     file_paths = _normalize_sales_paths(sales_path, sales_paths)
     sales_path = file_paths[0] if file_paths else None
 
@@ -241,6 +245,10 @@ def run_pipeline(
     visit_report = None
     if visits_path:
         visits, visit_report = parse_visit_calls(visits_path)
+    targets = pd.DataFrame()
+    target_report = None
+    if targets_path:
+        targets, target_report = parse_shop_targets(targets_path)
 
     touched_periods: list[str] = []
     open_period: Optional[str] = None
@@ -397,6 +405,26 @@ def run_pipeline(
                 ["store_id", "period"],
             )
 
+        if not targets.empty:
+            live_book = read_sql(conn, "SELECT * FROM stores")
+            matched, target_report = match_shop_targets(targets, live_book)
+            if target_report is not None:
+                target_report.source_file = str(targets_path)
+            replace_table(conn, "shop_targets", matched)
+
+        facts_probe = read_sql(conn, "SELECT 1 AS x FROM sales_facts LIMIT 1")
+        if (facts_probe is None or facts_probe.empty) and sales.empty:
+            conn.execute(
+                """UPDATE pipeline_runs SET finished_at=?, status=?, notes=? WHERE run_id=?""",
+                (utcnow(), "error", "No sales files and warehouse is empty.", run_id),
+            )
+            return {
+                "ok": False,
+                "error": "No sales files and warehouse is empty.",
+                "run_id": run_id,
+                "db_path": str(db_path),
+            }
+
         scored = _rebuild_intelligence(conn, run_id)
         period = scored["latest_period"]
         facts_df = scored["_facts"]
@@ -426,6 +454,9 @@ def run_pipeline(
             "universe_clean_rows": universe_report.n_clean_rows if universe_report else None,
             "visit_strategy": visit_report.strategy if visit_report else None,
             "visit_clean_rows": visit_report.n_clean_rows if visit_report else None,
+            "target_strategy": target_report.strategy if target_report else None,
+            "target_clean_rows": target_report.n_clean_rows if target_report else None,
+            "target_matched": target_report.n_matched if target_report else None,
             "replaced_periods": touched_periods,
             "open_mtd_period": open_period,
             "replace_sales": replace_sales,
@@ -434,7 +465,7 @@ def run_pipeline(
             "overridden_dates": overridden_dates,
         }
         warnings = []
-        for rep in (sales_report, shop_report, universe_report, visit_report):
+        for rep in (sales_report, shop_report, universe_report, visit_report, target_report):
             if rep is not None:
                 warnings.extend(rep.warnings or [])
         conn.execute(
@@ -474,6 +505,10 @@ def run_pipeline(
         "n_targets": int(len(pack.targets)) if pack is not None and pack.targets is not None else 0,
         "n_universe": int(universe_report.n_clean_rows) if universe_report else None,
         "n_visits": int(visit_report.n_clean_rows) if visit_report else None,
+        "n_plan_shops": int(target_report.n_clean_rows) if target_report else None,
+        "n_plan_matched": int(target_report.n_matched) if target_report else None,
+        "plan_book_mt": float(target_report.book_mt) if target_report else None,
+        "plan_matched_mt": float(target_report.matched_mt) if target_report else None,
         "exec_ok": bool(scored.get("exec_ok")),
         "exec_error": scored.get("exec_error") or "",
         "exec_model": scored.get("exec_model") or "",
@@ -885,6 +920,18 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
         visits=visits_df,
         shop_day=shop_day_df,
     )
+    try:
+        shop_targets = read_sql(conn, "SELECT * FROM shop_targets")
+    except Exception:
+        shop_targets = pd.DataFrame()
+    if shop_targets is not None and not shop_targets.empty:
+        rematched, _ = match_shop_targets(shop_targets, stores_df)
+        replace_table(conn, "shop_targets", rematched)
+        shop_targets = rematched
+    pace = 1.0
+    if pack.units is not None and not pack.units.empty and "intra_month_frac" in pack.units.columns:
+        pace = float(pd.to_numeric(pack.units["intra_month_frac"], errors="coerce").dropna().max() or 1.0)
+    pack.units = attach_plan(pack.units, shop_targets, pace=pace)
     replace_table(conn, "unit_scorecards", pack.units)
     replace_table(conn, "focus_targets", pack.targets)
     season_df = pack.seasonality if pack.seasonality is not None else pd.DataFrame()

@@ -10,10 +10,18 @@ from sndintel.ingest.pipeline import run_pipeline
 
 SALES_GLOBS = ("*.xlsx", "*.xlsm", "*.xls", "*.csv")
 SHOP_HINTS = ("shop", "store", "outlet", "master", "universe")
+TARGET_HINTS = ("target", "quota", "tgt")
+
+
+def _is_target_file(path: Path) -> bool:
+    name = path.name.lower()
+    return any(h in name for h in TARGET_HINTS)
 
 
 def _is_shop_file(path: Path) -> bool:
     name = path.name.lower()
+    if _is_target_file(path):
+        return False
     return any(h in name for h in SHOP_HINTS)
 
 
@@ -48,7 +56,10 @@ def scan_once() -> list[dict]:
             marker = path.with_suffix(path.suffix + ".done")
             if marker.exists() and marker.stat().st_mtime >= path.stat().st_mtime:
                 continue
-            result = process_sales_file(path, shop)
+            if _is_target_file(path):
+                result = run_pipeline(shop_path=shop, targets_path=path)
+            else:
+                result = process_sales_file(path, shop)
             marker.write_text(str(result), encoding="utf-8")
             results.append(result)
     return results

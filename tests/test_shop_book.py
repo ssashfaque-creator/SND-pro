@@ -1,0 +1,799 @@
+"""Shop-wise issues pack: reuse action Expected / Ask; MTD vs closed cuts."""
+
+from __future__ import annotations
+
+from io import BytesIO
+
+import pandas as pd
+from openpyxl import load_workbook
+
+from sndintel.action import ActionPack, build_action_pack
+from sndintel.plan import attach_plan
+from sndintel.shop_book import (
+    ISSUE_LAPSED,
+    ISSUE_MISSED,
+    MIX_OTHER,
+    build_shop_book,
+    excel_bytes,
+    list_shop_book_entities,
+    pdf_bytes,
+)
+from sndintel.situation_report import build_situation_pack
+
+from test_situation_report import _mtd_world, _stores, _world
+
+
+def test_closed_month_lists_missed_expected_largest_hole_first():
+    sm, _hier = _world()
+    ledger = pd.DataFrame([{"period": "2026-08", "status": "closed"}])
+    action = build_action_pack(sm, _stores(sm.to_dict("records")), ledger=ledger, period="2026-08")
+    book = build_shop_book(action=action, ledger=ledger, period="2026-08", scope="national")
+    assert book.open_mtd is False
+    assert "this week" not in (book.headline + book.weather).lower()
+    issues = book.issues
+    assert not issues.empty
+    assert "Kifaya" in set(issues["Shop"].astype(str))
+    assert "Quiet K" in set(issues["Shop"].astype(str))
+    # Lahore Ace beat or held Expected — not an issue.
+    assert "Big L" not in set(issues["Shop"].astype(str))
+    gap = pd.to_numeric(issues["Gap (MT)"], errors="coerce").fillna(0)
+    assert gap.is_monotonic_decreasing or len(issues) <= 1
+    blob = " ".join(issues["Comment"].astype(str).tolist()).lower()
+    assert "this week" not in blob
+    assert "next month" in blob
+    drops = pd.to_numeric(book.raw.get("expected_drop_mt"), errors="coerce").fillna(0)
+    if float(drops.max()) > 0.0005:
+        assert "usual drop is" in blob
+        cycles = pd.to_numeric(book.raw.get("cycle_days"), errors="coerce")
+        if cycles.notna().any() and float(cycles.fillna(0).max()) > 0:
+            assert "every" in blob
+            assert "days" in blob
+    assert "Ask (KG)" not in issues.columns
+    assert "Usual drop (MT)" in issues.columns
+    assert "Gap (MT)" in issues.columns
+
+
+def test_closed_expected_matches_action_pack():
+    sm, _hier = _world()
+    ledger = pd.DataFrame([{"period": "2026-08", "status": "closed"}])
+    action = build_action_pack(sm, _stores(sm.to_dict("records")), ledger=ledger, period="2026-08")
+    book = build_shop_book(action=action, ledger=ledger, period="2026-08")
+    left = action.raw_shops.set_index("store_id")["expected_mt"].astype(float)
+    right = book.raw.set_index("store_id")["expected_mt"].astype(float)
+    assert set(left.index) == set(right.index)
+    pd.testing.assert_series_equal(left.sort_index(), right.sort_index(), check_names=False)
+
+
+def test_city_and_dsr_scope():
+    sm, _hier = _world()
+    ledger = pd.DataFrame([{"period": "2026-08", "status": "closed"}])
+    action = build_action_pack(sm, _stores(sm.to_dict("records")), ledger=ledger, period="2026-08")
+    karachi = build_shop_book(
+        action=action, ledger=ledger, period="2026-08", scope="city", city="Karachi"
+    )
+    assert set(karachi.raw["city"].astype(str)) <= {"Karachi"}
+    assert "Big L" not in set(karachi.shops["Shop"].astype(str))
+    assert "Distributor" in karachi.shops.columns
+    assert "City" not in karachi.shops.columns
+    amir = build_shop_book(
+        action=action,
+        ledger=ledger,
+        period="2026-08",
+        scope="dsr",
+        city="Karachi",
+        distributor="Eva Foods",
+        dsr="Amir",
+    )
+    assert set(amir.shops["Shop"].astype(str)) <= {"Kifaya"}
+    cities = list_shop_book_entities(action.raw_shops, "city")
+    assert "Karachi" in cities and "Lahore" in cities
+    dsrs = list_shop_book_entities(action.raw_shops, "dsr")
+    assert any("Amir" in x for x in dsrs)
+
+
+def test_mtd_does_not_flag_still_to_expected_as_the_issue_list():
+    sm, _units, ledger, _pace = _mtd_world()
+    stores = _stores(sm.to_dict("records"))
+    action = build_action_pack(sm, stores, ledger=ledger, period="2026-09")
+    book = build_shop_book(action=action, ledger=ledger, period="2026-09")
+    assert book.open_mtd is True
+    assert "Ask (KG)" in book.shops.columns
+    assert "Do this" in book.shops.columns
+    assert "Gap (MT)" not in book.shops.columns
+    remaining = pd.to_numeric(book.raw["remaining_mt"], errors="coerce").fillna(0)
+    # Mid-month almost every shop still has a full-month hole. That must not be the issue list.
+    behind = int((remaining > 0.05).sum())
+    n_issues = 0 if book.issues.empty else len(book.issues)
+    assert behind >= n_issues
+    if not book.issues.empty:
+        assert set(book.issues["Issue"].astype(str)) <= {
+            "Due · unvisited",
+            "Due · no bill",
+            "Due · light drop",
+            "Visited, no bill",
+            ISSUE_LAPSED,
+            "Unvisited",
+        }
+    ask_left = action.raw_shops.set_index("store_id")["week_target_mt"].astype(float)
+    ask_right = book.raw.set_index("store_id")["week_target_mt"].astype(float)
+    pd.testing.assert_series_equal(ask_left.sort_index(), ask_right.sort_index(), check_names=False)
+
+
+def test_mtd_attaches_matched_shop_target_without_replacing_expected():
+    sm, _units, ledger, _pace = _mtd_world()
+    stores = _stores(sm.to_dict("records"))
+    action = build_action_pack(sm, stores, ledger=ledger, period="2026-09")
+    targets = pd.DataFrame(
+        [
+            {"store_id": "K1", "store_name": "Kifaya", "target_mt": 50.0, "match_method": "id"},
+            {"store_id": "L1", "store_name": "Big L", "target_mt": 55.0, "match_method": "id"},
+        ]
+    )
+    book = build_shop_book(action=action, shop_targets=targets, ledger=ledger, period="2026-09")
+    raw = book.raw.set_index("store_id")
+    assert float(raw.loc["K1", "shop_target_mt"]) == 50.0
+    assert float(raw.loc["K1", "expected_mt"]) != 50.0
+    assert float(raw.loc["K1", "expected_mt"]) == float(action.raw_shops.set_index("store_id").loc["K1", "expected_mt"])
+
+
+def _closed_pack(rows):
+    shops = pd.DataFrame(rows)
+    if "remaining_mt" not in shops.columns:
+        shops["remaining_mt"] = (
+            pd.to_numeric(shops["expected_mt"], errors="coerce").fillna(0)
+            - pd.to_numeric(shops["billed_mt"], errors="coerce").fillna(0)
+        ).clip(lower=0)
+    return ActionPack(period="2026-08", label="Aug 2026", open_mtd=False, raw_shops=shops)
+
+
+def test_unbilled_is_billed_zero_not_a_tiny_invoice():
+    """0.05 MT was used as 'no bill', so Unbilled showed billed volume on the Karachi mix."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "U1",
+                "store_name": "Visited Zero",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 2.0,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "T1",
+                "store_name": "Tiny Invoice",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.02,
+                "expected_mt": 2.92,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+                "expected_drop_mt": 1.71,
+                "cycle_days": 14,
+                "last_bill_date": "2025-10-25",
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08")
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Visited Zero"] == ISSUE_MISSED
+    assert by_name["Tiny Invoice"] == ISSUE_MISSED
+    mix = book.mix.set_index("Issue")
+    assert "Unbilled" not in mix.index
+    assert float(mix.loc[ISSUE_MISSED, "Billed (MT)"]) == 0.02
+    assert float(mix.loc[ISSUE_MISSED, "Expected (MT)"]) == 4.92
+    zero_comment = str(book.issues.loc[book.issues["Shop"] == "Visited Zero", "Comment"].iloc[0]).lower()
+    assert "visited but billed 0.00" in zero_comment
+    assert "not a lost door" in zero_comment
+    tiny_comment = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Comment"].iloc[0]).lower()
+    assert "visited but billed 0.00" not in tiny_comment
+    assert "2.92" in tiny_comment
+    assert "usual drop is 1.71 mt every 14 days" in tiny_comment
+    last = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Last billed"].iloc[0])
+    assert "2025" in last
+
+
+def test_no_run_rate_is_not_a_row_with_expected():
+    """0.05 MT was used as 'no Expected', so the mix showed Expected on No Expected."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "Q1",
+                "store_name": "Quiet",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.02,
+                "expected_mt": 0.03,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "Z1",
+                "store_name": "Universe",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 0.0,
+                "call_status": "Unvisited",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "M1",
+                "store_name": "Real Miss",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 1.0,
+                "expected_mt": 4.0,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08")
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Universe"] == "No run-rate"
+    assert by_name["Quiet"] == MIX_OTHER
+    assert by_name["Real Miss"] == ISSUE_MISSED
+    assert "No Expected" not in set(book.mix["Issue"].astype(str))
+    assert "No run-rate" not in set(book.mix["Issue"].astype(str))
+    named = set(book.mix["Issue"].astype(str)) - {"Total", MIX_OTHER}
+    assert "On Expected" not in named
+    assert book.kpis.get("n_quiet") == 1
+    total = book.mix.set_index("Issue").loc["Total"]
+    assert abs(float(total["Billed (MT)"]) - round(float(book.kpis["billed_mt"]), 2)) < 1e-9
+    assert abs(float(total["Expected (MT)"]) - round(float(book.kpis["expected_mt"]), 2)) < 1e-9
+    assert abs(float(total["Gap (MT)"]) - round(float(book.kpis["expected_mt"]) - float(book.kpis["billed_mt"]), 2)) < 1e-9
+
+
+def test_pdf_and_excel_are_real_files():
+    sm, _hier = _world()
+    ledger = pd.DataFrame([{"period": "2026-08", "status": "closed"}])
+    action = build_action_pack(sm, _stores(sm.to_dict("records")), ledger=ledger, period="2026-08")
+    book = build_shop_book(action=action, ledger=ledger, period="2026-08")
+    pdf = pdf_bytes(book)
+    assert pdf[:4] == b"%PDF"
+    xls = excel_bytes(book)
+    assert xls[:2] == b"PK"
+    wb = load_workbook(BytesIO(xls))
+    assert "00 Cover" in wb.sheetnames
+    assert "02 Issues" in wb.sheetnames
+    assert "03 All shops" in wb.sheetnames
+
+
+def _karachi_cover_units(*, volume: float, expected: float) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "grain": "national",
+                "grain_id": "ALL",
+                "city": "",
+                "distributor": "",
+                "dsr_name": "",
+                "volume_mt": volume,
+                "expected_mt": expected,
+                "intra_month_frac": 1.0,
+            },
+            {
+                "grain": "city",
+                "grain_id": "Karachi",
+                "city": "Karachi",
+                "distributor": "",
+                "dsr_name": "",
+                "volume_mt": volume,
+                "expected_mt": expected,
+                "intra_month_frac": 1.0,
+            },
+        ]
+    )
+
+
+def test_cover_gap_is_net_not_sum_of_shop_remainings():
+    """Beat shops must not inflate Gap vs Expected. Cover Gap is Expected − billed, floored at 0."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "M1",
+                "store_name": "Miss",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 1.0,
+                "expected_mt": 5.0,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "B1",
+                "store_name": "Beat",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 10.0,
+                "expected_mt": 3.0,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Karachi")
+    # Shop billed 11 vs shop Expected 8 → net cover Gap 0, even though the miss still has a 4 MT hole.
+    assert abs(float(book.kpis["billed_mt"]) - 11.0) < 1e-9
+    assert abs(float(book.kpis["expected_mt"]) - 8.0) < 1e-9
+    assert abs(float(book.kpis["gap_mt"])) < 1e-9
+    assert abs(float(book.kpis["issue_mt"]) - 4.0) < 1e-9
+    assert "gap 0.00 mt" in book.headline.lower()
+
+
+def test_cover_target_is_plan_book_not_matched_pop_sum():
+    """City Target is the full plan book (unmatched names still count), same as Situation cascade."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "K1",
+                "store_name": "Kifaya",
+                "city": "Karachi",
+                "distributor": "Eva Foods",
+                "dsr_name": "Amir",
+                "billed_mt": 1.0,
+                "expected_mt": 5.0,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "K2",
+                "store_name": "Beat K",
+                "city": "Karachi",
+                "distributor": "Eva Foods",
+                "dsr_name": "Amir",
+                "billed_mt": 10.0,
+                "expected_mt": 3.0,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    targets = pd.DataFrame(
+        [
+            {
+                "store_id": "K1",
+                "store_name": "Kifaya",
+                "city": "Karachi",
+                "distributor": "Eva Foods",
+                "dsr_name": "Amir",
+                "target_mt": 2.0,
+                "match_method": "id",
+            },
+            {
+                "store_id": "",
+                "store_name": "Unknown Kiryana",
+                "city": "Karachi",
+                "distributor": "Ghost Dist",
+                "dsr_name": "Ghost",
+                "target_mt": 8.0,
+                "match_method": "unmatched",
+            },
+        ]
+    )
+    units = _karachi_cover_units(volume=20.0, expected=30.0)
+    book = build_shop_book(
+        action=pack,
+        shop_targets=targets,
+        units=units,
+        period="2026-08",
+        scope="city",
+        city="Karachi",
+    )
+    assert abs(float(book.kpis["matched_target_mt"]) - 2.0) < 1e-9
+    assert abs(float(book.kpis["target_mt"]) - 10.0) < 1e-9
+    # Cover billed is the shops in the pack (11), not a separate scorecard overlay.
+    assert abs(float(book.kpis["billed_mt"]) - 11.0) < 1e-9
+    assert abs(float(book.kpis["expected_mt"]) - 30.0) < 1e-9
+    assert abs(float(book.kpis["gap_mt"]) - 19.0) < 1e-9
+    assert abs(float(book.kpis["vs_target_mt"]) - 1.0) < 1e-9
+    assert abs(float(book.raw.set_index("store_id").loc["K1", "shop_target_mt"]) - 2.0) < 1e-9
+
+
+def test_city_cover_matches_situation_scorecard():
+    sm, hier = _world()
+    ledger = pd.DataFrame([{"period": "2026-08", "status": "closed"}])
+    targets = pd.DataFrame(
+        [
+            {
+                "store_id": "K1",
+                "store_name": "Kifaya",
+                "city": "Karachi",
+                "distributor": "Eva Foods",
+                "dsr_name": "Amir",
+                "target_mt": 10.0,
+                "match_method": "id",
+            },
+            {
+                "store_id": "",
+                "store_name": "Unknown Kiryana",
+                "city": "Karachi",
+                "distributor": "Ghost Dist",
+                "dsr_name": "Ghost",
+                "target_mt": 90.0,
+                "match_method": "unmatched",
+            },
+        ]
+    )
+    units = attach_plan(hier.units, targets, pace=1.0)
+    sit = build_situation_pack(units, ledger=ledger, period="2026-08", scope="city", city="Karachi")
+    action = build_action_pack(sm, _stores(sm.to_dict("records")), ledger=ledger, period="2026-08")
+    book = build_shop_book(
+        action=action,
+        shop_targets=targets,
+        units=units,
+        ledger=ledger,
+        period="2026-08",
+        scope="city",
+        city="Karachi",
+    )
+    sit_expected = float(sit.kpis.get("expected_full_mt") or sit.kpis.get("expected_mt") or 0)
+    assert abs(float(book.kpis["target_mt"]) - 100.0) < 1e-6
+    assert abs(float(book.kpis["target_mt"]) - float(sit.kpis["target_mt"])) < 1e-6
+    assert abs(float(book.kpis["matched_target_mt"]) - 10.0) < 1e-6
+    assert abs(float(book.kpis["billed_mt"]) - float(sit.kpis["billed_mt"])) < 0.6
+    assert abs(float(book.kpis["expected_mt"]) - sit_expected) < 0.6
+    assert abs(float(book.kpis["gap_mt"]) - float(sit.kpis["gap_mt"])) < 0.6
+    assert abs(float(book.kpis["gap_mt"]) - max(0.0, float(book.kpis["expected_mt"]) - float(book.kpis["billed_mt"]))) < 1e-6
+    assert float(book.kpis["target_mt"]) > float(book.kpis["matched_target_mt"]) + 1.0
+    total = book.mix.set_index("Issue").loc["Total"]
+    assert abs(float(total["Billed (MT)"]) - round(float(book.kpis["billed_mt"]), 2)) < 0.02
+    assert abs(float(total["Expected (MT)"]) - round(float(book.kpis["expected_mt"]), 2)) < 0.02
+    assert abs(float(total["Gap (MT)"]) - round(float(book.kpis["expected_mt"]) - float(book.kpis["billed_mt"]), 2)) < 0.02
+
+
+def test_presented_gap_equals_expected_minus_billed():
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "M1",
+                "store_name": "Miss",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 1.04,
+                "expected_mt": 2.23,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "Z1",
+                "store_name": "Zero Display",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.004,
+                "expected_mt": 1.55,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Karachi")
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Zero Display"] == ISSUE_MISSED
+    for _, row in book.shops.iterrows():
+        billed = float(row["Billed (MT)"])
+        expected = float(row["Expected (MT)"])
+        gap = float(row["Gap (MT)"])
+        assert abs(gap - (expected - billed)) < 1e-9
+    tot = book.mix.set_index("Issue").loc["Total"]
+    assert abs(float(tot["Gap (MT)"]) - (float(tot["Expected (MT)"]) - float(tot["Billed (MT)"]))) < 1e-9
+    assert abs(float(book.kpis["gap_mt"]) - max(0.0, float(book.kpis["expected_mt"]) - float(book.kpis["billed_mt"]))) < 1e-9
+
+
+def test_missing_billed_shop_is_absorbed_so_cover_billed_adds():
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "K1",
+                "store_name": "On File",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 2.0,
+                "expected_mt": 3.0,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            }
+        ]
+    )
+    shop_month = pd.DataFrame(
+        [
+            {
+                "store_id": "K1",
+                "store_name": "On File",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "period": "2026-08",
+                "volume_mt": 2.0,
+            },
+            {
+                "store_id": "K9",
+                "store_name": "Missing Whale",
+                "city": "Karachi",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "period": "2026-08",
+                "volume_mt": 5.0,
+            },
+        ]
+    )
+    book = build_shop_book(
+        action=pack,
+        shop_month=shop_month,
+        period="2026-08",
+        scope="city",
+        city="Karachi",
+    )
+    assert "K9" in set(book.raw["store_id"].astype(str))
+    assert abs(float(book.kpis["billed_mt"]) - 7.0) < 1e-9
+    tot = book.mix.set_index("Issue").loc["Total"]
+    assert abs(float(tot["Billed (MT)"]) - 7.0) < 1e-9
+
+
+def test_duplicate_shop_names_are_disambiguated():
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "A11111",
+                "store_name": "EURO MART",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 1.0,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "B22222",
+                "store_name": "EURO MART",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 0.8,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
+    names = set(book.shops["Shop"].astype(str))
+    assert names == {"EURO MART · A11111", "EURO MART · B22222"}
+    total = book.mix.set_index("Issue").loc["Total"]
+    assert abs(float(total["Billed (MT)"]) - round(float(book.kpis["billed_mt"]), 2)) < 0.02
+    assert abs(float(total["Expected (MT)"]) - round(float(book.kpis["expected_mt"]), 2)) < 0.02
+    assert abs(float(total["Gap (MT)"]) - round(float(book.kpis["expected_mt"]) - float(book.kpis["billed_mt"]), 2)) < 0.02
+
+
+def test_unbilled_rounding_dust_is_not_unbilled_volume():
+    """0.001–0.004 MT displays as billed 0.00 and must not sit in mix Unbilled billed."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "U1",
+                "store_name": "Dust A",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.004,
+                "expected_mt": 2.00,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "U2",
+                "store_name": "Dust B",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.003,
+                "expected_mt": 1.00,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "T1",
+                "store_name": "Tiny Landed",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.02,
+                "expected_mt": 0.03,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "M1",
+                "store_name": "Real Miss",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 1.00,
+                "expected_mt": 4.00,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
+    mix = book.mix.set_index("Issue")
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Dust A"] == ISSUE_MISSED
+    assert by_name["Dust B"] == ISSUE_MISSED
+    assert by_name["Tiny Landed"] == MIX_OTHER
+    assert "Unbilled" not in mix.index
+    assert float(mix.loc[ISSUE_MISSED, "Billed (MT)"]) == 1.0
+    assert "Other doors" not in set(book.mix["Issue"].astype(str))
+    assert MIX_OTHER in mix.index
+    dust = 0.004 + 0.003
+    tiny = 0.02
+    assert abs(float(mix.loc[MIX_OTHER, "Billed (MT)"]) - round(tiny + dust, 2)) < 1e-9
+    total = mix.loc["Total"]
+    cover_billed = round(float(book.kpis["billed_mt"]), 2)
+    assert abs(float(total["Billed (MT)"]) - cover_billed) < 1e-9
+    parts = book.mix[book.mix["Issue"] != "Total"]
+    assert abs(float(parts["Billed (MT)"].sum()) - float(total["Billed (MT)"])) < 0.02
+    assert abs(float(parts["Expected (MT)"].sum()) - float(total["Expected (MT)"])) < 0.02
+    assert abs(float(parts["Gap (MT)"].sum()) - float(total["Gap (MT)"])) < 0.02
+    assert abs(float(total["Gap (MT)"]) - (float(total["Expected (MT)"]) - float(total["Billed (MT)"]))) < 1e-9
+    how = " ".join(book.how_to_read).lower()
+    assert "situation cascade" in how
+    assert "every n days" in how
+    assert MIX_OTHER.lower() in how
+
+
+def test_unmeasured_cycle_does_not_claim_fourteen_days():
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "ONCE",
+                "store_name": "Once",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 2.0,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+                "expected_drop_mt": 1.50,
+                "cycle_days": float("nan"),
+                "n_intervals": 0,
+                "last_bill_date": "2026-08-08",
+                "last_drop_mt": 1.50,
+            }
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
+    comment = str(book.issues.loc[book.issues["Shop"] == "Once", "Comment"].iloc[0]).lower()
+    assert book.raw.set_index("store_name").loc["Once", "issue"] == ISSUE_MISSED
+    assert "usual drop is 1.50 mt" in comment
+    assert "every" not in comment
+    assert "14" not in comment
+    assert "not a lost door" in comment
+
+
+def test_tiny_bucket_is_expected_not_billed():
+    """Shops (<0.05 MT) is Expected-only. Material Expected never sits there."""
+    pack = _closed_pack(
+        [
+            {
+                "store_id": "WHALE",
+                "store_name": "Tiny Expected Whale",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 2.00,
+                "expected_mt": 0.03,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "LIVE0",
+                "store_name": "Live Zero",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 1.50,
+                "call_status": "Visited · not billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+                "last_bill_date": "2026-07-27",
+            },
+            {
+                "store_id": "DEAD",
+                "store_name": "Lost Door",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 1.20,
+                "call_status": "Unvisited",
+                "is_lapsed": True,
+                "week_target_mt": 0.0,
+                "last_bill_date": "2026-05-21",
+            },
+            {
+                "store_id": "SMALL0",
+                "store_name": "Small Expected",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.0,
+                "expected_mt": 0.04,
+                "call_status": "Visited · not billed",
+                "is_lapsed": True,
+                "week_target_mt": 0.0,
+            },
+            {
+                "store_id": "LIGHT",
+                "store_name": "Light Bill",
+                "city": "Lahore",
+                "distributor": "Dist",
+                "dsr_name": "Ali",
+                "billed_mt": 0.02,
+                "expected_mt": 0.80,
+                "call_status": "Billed",
+                "is_lapsed": False,
+                "week_target_mt": 0.0,
+            },
+        ]
+    )
+    book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
+    by_name = book.raw.set_index("store_name")["issue"].astype(str)
+    assert by_name["Tiny Expected Whale"] == MIX_OTHER
+    assert by_name["Small Expected"] == MIX_OTHER
+    assert by_name["Live Zero"] == ISSUE_MISSED
+    assert by_name["Lost Door"] == ISSUE_LAPSED
+    assert by_name["Light Bill"] == ISSUE_MISSED
+    mix = book.mix.set_index("Issue")
+    assert "Unbilled" not in mix.index
+    assert "Unvisited" not in mix.index
+    assert MIX_OTHER in mix.index
+    tiny = mix.loc[MIX_OTHER]
+    assert int(tiny["Shops"]) == 2
+    assert float(tiny["Expected (MT)"]) <= 0.05 + 0.04 + 1e-9
+    for _, row in book.raw.iterrows():
+        if float(row["expected_mt"]) > 0.05:
+            assert str(row["issue"]) != MIX_OTHER
+    lost = str(book.issues.loc[book.issues["Shop"] == "Lost Door", "Comment"].iloc[0]).lower()
+    assert "lost door" in lost
+    assert "not unbilled" in lost
+    assert "not missed expected" in lost
+    live = str(book.issues.loc[book.issues["Shop"] == "Live Zero", "Comment"].iloc[0]).lower()
+    assert "missed expected" in live
+    assert "not a lost door" in live
+    assert "billed 0.00" in live

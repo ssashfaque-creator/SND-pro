@@ -26,6 +26,12 @@ def test_api_brief(demo, tmp_path, monkeypatch):
     water = client.get("/waterfall")
     assert water.status_code == 200
     assert isinstance(water.json(), list)
+    sit = client.get("/situation")
+    assert sit.status_code == 200
+    body = sit.json()
+    assert "headline" in body
+    assert "steps" in body
+    assert "lagging_people" in body
 
 
 def test_cli_query_help():
@@ -33,3 +39,4 @@ def test_cli_query_help():
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
     assert "ingest" in result.stdout
+    assert "situation" in result.stdout

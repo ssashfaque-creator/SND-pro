@@ -49,6 +49,27 @@ def run_rate_factor(execution: Optional[datetime], period: str) -> tuple[float, 
     return (days / day), day, days
 
 
+def format_period_label(
+    period: str | None,
+    *,
+    open_: bool = False,
+    as_of_day: int | None = None,
+    days_in_month: int | None = None,
+) -> str:
+    """Human month label. Never '8/30' — that reads as 30 August."""
+    if not period:
+        return ""
+    try:
+        dt = datetime.strptime(f"{period}-01", "%Y-%m-%d")
+    except ValueError:
+        return str(period)
+    month = dt.strftime("%b %Y")
+    mon = dt.strftime("%b")
+    if open_ and as_of_day and days_in_month:
+        return f"{month} MTD · billed through {int(as_of_day)} {mon} ({int(days_in_month)}-day month)"
+    return f"{month} · closed month"
+
+
 def period_state(ledger: pd.DataFrame | None, period: str | None) -> dict[str, Any]:
     """Normalised closed vs open-MTD state for one calendar month."""
     empty: dict[str, Any] = {
@@ -79,7 +100,9 @@ def period_state(ledger: pd.DataFrame | None, period: str | None) -> dict[str, A
         factor = days_i / as_of_i
     label = str(period)
     if open_ and as_of_i and days_i:
-        label = f"{period} MTD through day {as_of_i}/{days_i}"
+        label = format_period_label(period, open_=True, as_of_day=as_of_i, days_in_month=days_i)
+    elif period:
+        label = format_period_label(period, open_=False, as_of_day=as_of_i, days_in_month=days_i)
     exec_raw = row.get("execution_date")
     return {
         "period": period,
@@ -100,8 +123,7 @@ def banner_text(ledger: pd.DataFrame | None, period: str | None) -> str:
         return ""
     if state["open"] and state["as_of_day"] and state["days_in_month"]:
         return (
-            f"{period} is open MTD through day {state['as_of_day']} of "
-            f"{state['days_in_month']} — later extracts replace this month in full; "
+            f"{state.get('label') or period} — later extracts replace this month in full; "
             "closed months stay as they are."
         )
     return f"{period} is a closed month. Insights cover the full warehouse, not only the latest file."

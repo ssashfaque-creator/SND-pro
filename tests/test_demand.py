@@ -88,6 +88,8 @@ def test_cold_start_one_purchase_uses_default_api():
     )
     shops = attach_demand_cycles(shops, daily, as_of)
     assert float(shops.loc[0, "api_days"]) == DEFAULT_API_DAYS
+    assert pd.isna(shops.loc[0, "cycle_days"])
+    assert int(shops.loc[0, "n_intervals"] or 0) == 0
     assert abs(float(shops.loc[0, "expected_drop_mt"]) - 0.8) < 1e-9
     assert bool(shops.loc[0, "is_cold_start"])
     # DSLP = 14, API = 14, ratio = 1.0 → due, but billed this month so another visit
@@ -97,6 +99,33 @@ def test_cold_start_one_purchase_uses_default_api():
     assert float(shops.loc[0, "depletion_ratio"]) == DUE_RATIO + (14 / 14 - DUE_RATIO)
     assert shops.loc[0, "action"] == ACTION_LIFT
     assert abs(float(shops.loc[0, "week_target_mt"]) - 0.8) < 1e-9
+
+
+def test_measured_fortnightly_gap_is_the_cycle():
+    as_of = pd.Timestamp("2026-08-22")
+    daily = pd.DataFrame(
+        [
+            {"store_id": "F14", "sale_date": date(2026, 8, 8), "volume_mt": 0.9},
+            {"store_id": "F14", "sale_date": date(2026, 7, 25), "volume_mt": 0.9},
+        ]
+    )
+    shops = pd.DataFrame(
+        [
+            {
+                "store_id": "F14",
+                "ams_3m": 1.8,
+                "expected_mt": 1.8,
+                "billed_mt": 0.9,
+                "last_billed_period": "2026-08",
+                "last_billed_mt": 0.9,
+                "last_month_mt": 0.9,
+            }
+        ]
+    )
+    shops = attach_demand_cycles(shops, daily, as_of)
+    assert int(shops.loc[0, "n_intervals"] or 0) >= 1
+    assert abs(float(shops.loc[0, "cycle_days"]) - 14) < 1e-9
+    assert abs(float(shops.loc[0, "api_days"]) - 14) < 1e-9
 
 
 def test_ratio_below_due_ask_is_zero_and_not_yet_due_fills_pipeline():

@@ -55,6 +55,9 @@ GLOSSARY = [
     ("vs AMS", "This period minus AMS × elapsed calendar days (day 20 of 31 is billed − AMS × 20/31). Negative = behind the recent run-rate. The AMS column itself stays the full-month number. Expected can use a different intra-month fraction when Outlet Date Wise teaches the country’s usual billed-by-day shape."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month). Zero means no August last year — it does not mean Expected should be zero."),
     ("Expected this month", "Recent run-rate: mean of the three calendar months immediately before this period (same window as AMS), blended with the last-six-month median, paced if MTD is open. The pace is the country’s usual billed share by that calendar day (Outlet Date Wise, one national curve — not a per-store or per-city shape). Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
+    ("Sales-team plan", "Shop-wise quota from the sales team. Not Expected. Expected stays the statistical run-rate. Target is the submitted book rolled to this grain (unmatched shop names still count if Area / distributor / DSR fold onto a unique live name). Open MTD uses the same national day curve as Expected."),
+    ("Plan attained %", "Billed ÷ paced Target. A unit can beat Expected and still miss the plan, or beat a soft plan and still lag Expected."),
+    ("Stretch vs Expected", "max(0, paced Target − Expected). Ambition above run-rate. Missing stretch is not a coverage miss and does not get a lost-shop list."),
     ("Gap", "The hole versus this unit’s own Expected, as a positive number — volume that comes back if the unit billed its recent run-rate. Country Gap is the country miss versus Expected. Zero means billed at or above Expected, not that AMS is irrelevant."),
     ("From drop size (MT)", "Share of the gap explained by smaller (or larger) drops on billed doors. Positive = part of the hole. Negative = billed more than Expected. The three From columns add to Gap when the unit is behind."),
     ("From unvisited shops (MT)", "Share of the gap from universe doors that were not called this period (visit count 0 and not billed). Positive = hole; negative = ahead of Expected."),
@@ -177,6 +180,9 @@ SCORECARD_METRICS = [
     ("vs_ams_mt", "vs AMS (MT)"),
     ("ly_mt", "Same month last year (MT)"),
     ("expected_mt", "Expected this month (MT)"),
+    ("target_paced_mt", "Sales-team plan (MT)"),
+    ("plan_attain_pct", "Plan attained %"),
+    ("stretch_mt", "Stretch vs Expected (MT)"),
     ("recoverable_mt", "Gap (MT)"),
     ("from_drop_size_mt", "From drop size (MT)"),
     ("from_unvisited_mt", "From unvisited shops (MT)"),
@@ -1198,6 +1204,8 @@ def _grain(units: pd.DataFrame, grain: str) -> pd.DataFrame:
     out["strike_pct"] = strike * 100
     visit = pd.to_numeric(out.get("visit_rate"), errors="coerce")
     out["visit_pct"] = visit * 100
+    attain = pd.to_numeric(out.get("attain_pct"), errors="coerce")
+    out["plan_attain_pct"] = attain * 100
     vol = pd.to_numeric(out.get("volume_mt"), errors="coerce")
     if "billed" in out.columns:
         billed = pd.to_numeric(out["billed"], errors="coerce")
@@ -1446,6 +1454,11 @@ def _kpis(nat_row, units: pd.DataFrame, sit: dict[str, Any]) -> dict[str, Any]:
         "n_same_month": sit.get("n_same_month"),
         "intra_month_frac": sit.get("intra_month_frac") or (nat_row.get("intra_month_frac") if nat_row is not None else None),
         "open_mtd": sit.get("open_mtd"),
+        "sales_team_plan_mt": float(nat_row["target_paced_mt"] if pd.notna(nat_row.get("target_paced_mt")) else nat_row.get("target_mt") or 0) if nat_row is not None else None,
+        "plan_attain_pct": float(nat_row["attain_pct"] * 100) if nat_row is not None and pd.notna(nat_row.get("attain_pct")) else None,
+        "stretch_vs_expected_mt": float(nat_row.get("stretch_mt") or 0) if nat_row is not None else None,
+        "plan_book_mt": float(nat_row.get("target_book_mt") or 0) if nat_row is not None else None,
+        "plan_matched_mt": float(nat_row.get("target_matched_mt") or 0) if nat_row is not None else None,
     }
 
 
@@ -1649,8 +1662,12 @@ def _sheet_table(
     headers = list(df.columns)
     for i, name in enumerate(headers, start=1):
         width = min(max(len(str(name)) + 2, 12), 28)
-        if name in {"What to do", "Shop", "Remarks", "Do this"}:
-            width = 56 if name in {"Remarks", "Do this"} else 48
+        if name in {"What to do", "Shop", "Remarks", "Do this", "Comment"}:
+            width = 56 if name in {"Remarks", "Do this", "Comment"} else 48
+        elif name == "Distributor":
+            width = 26
+        elif name.endswith("(MT)") or name in {"Visit %", "vs Target (MT)"}:
+            width = 12
         ws.column_dimensions[get_column_letter(i)].width = width
     if "Remarks" in headers:
         for r in range(start + 1, start + 1 + len(df)):

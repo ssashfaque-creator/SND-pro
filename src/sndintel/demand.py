@@ -43,8 +43,9 @@ def attach_demand_cycles(shops: pd.DataFrame, shop_day: pd.DataFrame, as_of_ts: 
 
     * 0 purchases ever → expected drop 0, Ask 0 (stays in universe).
     * 0 purchases in the window but older history → lapsed (no invented run-rate).
-    * 1 purchase → expected drop = that invoice; API = 14 days until a second bill.
-    * 2 purchases → mean drop; API = the one interval (else 14).
+    * 1 purchase → expected drop = that invoice; Ask uses a 14-day API until a
+      second bill is observed (cycle_days stays empty — 14 is not a measured gap).
+    * 2 purchases → mean drop; cycle = the one interval (else Ask still uses 14).
     * 3+ in the window → median drop and median gap (2–120 days).
     """
     out = shops.copy()
@@ -76,7 +77,8 @@ def attach_demand_cycles(shops: pd.DataFrame, shop_day: pd.DataFrame, as_of_ts: 
         if hist is None or hist.empty:
             hist = _monthly_as_purchases(row, as_of_ts)
         stats = _shop_demand_stats(hist, as_of_ts, window_start)
-        out.at[i, "cycle_days"] = stats["api"]
+        observed = int(stats["n_intervals"] or 0) >= 1
+        out.at[i, "cycle_days"] = stats["api"] if observed else np.nan
         out.at[i, "api_days"] = stats["api"]
         out.at[i, "typical_drop_mt"] = stats["expected_drop"]
         out.at[i, "expected_drop_mt"] = stats["expected_drop"]

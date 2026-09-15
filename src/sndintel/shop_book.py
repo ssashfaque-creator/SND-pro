@@ -1,0 +1,1154 @@
+"""Shop-wise issues pack: every door in a scope, MTD or a closed month.
+
+Does not invent Ask, last bill, or Target. Shop Expected is the existing
+last-3 / last-6 run-rate, scaled so the doors in this scope add to the
+official city (or distributor / DSR) Expected.
+
+Closed month and open MTD share one skeleton (KPIs → issue mix → shop list)
+and differ in what counts as an issue:
+
+- Closed month is a result. Cover Billed, Expected, and Gap are this pack’s
+  shops: Gap = max(0, Expected − billed). The mix totals to those figures
+  (beat shops net against misses). Issues are the doors that missed.
+- Open MTD is the beat. Full-month Expected − billed so far is not a miss
+  mid-month, so it is not the issue list. Issues are due this week (Ask),
+  visited with no bill, and lost doors.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+from xml.sax.saxutils import escape as xml_escape
+
+import pandas as pd
+from openpyxl import Workbook
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import mm
+from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from sndintel.action import ActionPack, build_action_pack
+from sndintel.briefing import _sheet_table
+from sndintel.mtd import period_state
+from sndintel.plan import attach_plan
+
+HOLE_MT = 0.05
+ASK_MT = 0.0005
+BILL_MT = 0.005
+PDF_ISSUE_N = 200
+MIX_OTHER = f"Shops (<{HOLE_MT:.2f} MT)"
+MIX_TOTAL = "Total"
+ISSUE_LAPSED = "Lapsed (lost door)"
+ISSUE_MISSED = "Missed Expected"
+ISSUE_UNBILLED = "Unbilled"
+ISSUE_UNVISITED = "Unvisited"
+# Mix billed must be 0 for these. Any rounding dust moves into MIX_OTHER.
+NO_BILL_ISSUES = {
+    ISSUE_UNBILLED,
+    ISSUE_UNVISITED,
+    ISSUE_LAPSED,
+    "Visited, no bill",
+    "Due · no bill",
+    "Due · unvisited",
+}
+
+CLOSED_ISSUE_RANK = {
+    ISSUE_MISSED: 0,
+    ISSUE_LAPSED: 1,
+    "Beat Expected": 8,
+    "On Expected": 9,
+    MIX_OTHER: 10,
+    "No run-rate": 11,
+}
+MTD_ISSUE_RANK = {
+    "Due · unvisited": 0,
+    "Due · no bill": 1,
+    "Due · light drop": 2,
+    "Visited, no bill": 3,
+    ISSUE_LAPSED: 4,
+    ISSUE_UNVISITED: 6,
+    "On cycle": 9,
+    MIX_OTHER: 10,
+    "No run-rate": 11,
+}
+MIX_SKIP = {"No run-rate", MIX_OTHER}
+ISSUE_LAG = {
+    "Due · unvisited",
+    "Due · no bill",
+    "Due · light drop",
+    "Visited, no bill",
+    ISSUE_MISSED,
+    ISSUE_UNBILLED,
+    ISSUE_UNVISITED,
+    ISSUE_LAPSED,
+}
+
+
+@dataclass
+class ShopBook:
+    period: str
+    label: str
+    scope: str = "national"
+    scope_label: str = "Country"
+    open_mtd: bool = False
+    headline: str = ""
+    weather: str = ""
+    how_to_read: list[str] = field(default_factory=list)
+    kpis: dict[str, Any] = field(default_factory=dict)
+    mix: pd.DataFrame = field(default_factory=pd.DataFrame)
+    issues: pd.DataFrame = field(default_factory=pd.DataFrame)
+    shops: pd.DataFrame = field(default_factory=pd.DataFrame)
+    raw: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def empty_shop_book(period: str = "") -> ShopBook:
+    return ShopBook(period=period or "", label=period or "")
+
+
+def build_shop_book(
+    *,
+    action: ActionPack | None = None,
+    shop_month: pd.DataFrame | None = None,
+    stores: pd.DataFrame | None = None,
+    shop_day: pd.DataFrame | None = None,
+    visits: pd.DataFrame | None = None,
+    ledger: pd.DataFrame | None = None,
+    shop_targets: pd.DataFrame | None = None,
+    units: pd.DataFrame | None = None,
+    period: str | None = None,
+    scope: str = "national",
+    city: str | None = None,
+    distributor: str | None = None,
+    dsr: str | None = None,
+) -> ShopBook:
+    """Classify existing shop rows. Does not recompute Expected or Ask."""
+    period = str(period or (getattr(action, "period", None) or "") or "")
+    if action is None or getattr(action, "raw_shops", None) is None or action.raw_shops.empty:
+        if shop_month is None or shop_month.empty:
+            return empty_shop_book(period)
+        action = build_action_pack(
+            shop_month,
+            stores,
+            shop_day=shop_day,
+            visits=visits,
+            ledger=ledger,
+            period=period or None,
+        )
+    period = str(action.period or period or "")
+    shops = action.raw_shops.copy()
+    if shops.empty:
+        book = empty_shop_book(period)
+        book.label = action.label or period
+        book.open_mtd = bool(action.open_mtd)
+        return book
+
+    shops = _attach_shop_targets(shops, shop_targets)
+    scope = (scope or "national").strip().lower()
+    if scope in {"country", "national hq", ""}:
+        scope = "national"
+    shops = _scope_shops(shops, scope, city, distributor, dsr)
+    open_mtd = bool(action.open_mtd)
+    if ledger is not None:
+        open_mtd = bool(period_state(ledger, period).get("open"))
+    shops = _absorb_missing_billed(shops, shop_month, period, scope, city, distributor, dsr)
+    units = _ensure_plan(units, shop_targets)
+    row = _scope_unit(units, scope, city, distributor, dsr)
+    shops = _align_expected(shops, _official_expected(row, open_mtd))
+    shops = _classify_rows(shops, open_mtd, period=period)
+    shops = _sort_rows(shops, open_mtd)
+
+    scope_label = _scope_label(scope, city, distributor, dsr)
+    kpis = _kpis(shops, open_mtd)
+    kpis = _apply_cover_kpis(
+        kpis,
+        units=units,
+        shop_targets=shop_targets,
+        scope=scope,
+        city=city,
+        distributor=distributor,
+        dsr=dsr,
+        open_mtd=open_mtd,
+        row=row,
+    )
+    mix = _issue_mix(shops, open_mtd)
+    headline, weather = _headline(kpis, scope_label, action.label or period, open_mtd)
+    presented = _present(shops, scope, open_mtd, bool(kpis.get("has_plan")), period=period)
+    issues = presented[presented["Issue"].isin(ISSUE_LAG)].copy() if not presented.empty else presented
+    return ShopBook(
+        period=period,
+        label=action.label or period,
+        scope=scope,
+        scope_label=scope_label,
+        open_mtd=open_mtd,
+        headline=headline,
+        weather=weather,
+        how_to_read=_how_to_read(open_mtd),
+        kpis=kpis,
+        mix=mix,
+        issues=issues,
+        shops=presented,
+        raw=shops,
+    )
+
+
+def list_shop_book_entities(shops: pd.DataFrame | None, kind: str) -> list[str]:
+    kind = (kind or "").strip().lower()
+    if shops is None or shops.empty:
+        return []
+    work = shops.copy()
+    if kind == "city":
+        return sorted({str(x).strip() for x in work.get("city", pd.Series(dtype=str)).dropna().astype(str) if str(x).strip() not in {"", "nan", "(unmapped)"}})
+    if kind == "distributor":
+        out = []
+        for _, r in work.iterrows():
+            name = str(r.get("distributor") or "").strip()
+            city = str(r.get("city") or "").strip()
+            if not name or name in {"nan", "(unmapped)"}:
+                continue
+            out.append(f"{city} · {name}" if city and city not in {"nan", "(unmapped)"} else name)
+        return sorted(set(out))
+    if kind == "dsr":
+        out = []
+        for _, r in work.iterrows():
+            name = str(r.get("dsr_name") or "").strip()
+            city = str(r.get("city") or "").strip()
+            dist = str(r.get("distributor") or "").strip()
+            if not name or name in {"nan", "(unnamed)"}:
+                continue
+            if city and city not in {"nan", "(unmapped)"} and dist and dist not in {"nan", "(unmapped)"}:
+                out.append(f"{city} · {dist} · {name}")
+            elif city and city not in {"nan", "(unmapped)"}:
+                out.append(f"{city} · {name}")
+            else:
+                out.append(name)
+        return sorted(set(out))
+    return []
+
+
+def parse_shop_scope(kind: str, entity: str | None) -> dict[str, str | None]:
+    parts = [p.strip() for p in str(entity or "").split(" · ") if str(p).strip()]
+    kind = (kind or "national").strip().lower()
+    if kind == "city":
+        return {"city": entity, "distributor": None, "dsr": None}
+    if kind == "distributor":
+        if len(parts) >= 2:
+            return {"city": parts[0], "distributor": " · ".join(parts[1:]), "dsr": None}
+        return {"city": None, "distributor": entity, "dsr": None}
+    if kind == "dsr":
+        if len(parts) >= 3:
+            return {"city": parts[0], "distributor": parts[1], "dsr": " · ".join(parts[2:])}
+        if len(parts) == 2:
+            return {"city": parts[0], "distributor": None, "dsr": parts[1]}
+        return {"city": None, "distributor": None, "dsr": entity}
+    return {"city": None, "distributor": None, "dsr": None}
+
+
+def _attach_shop_targets(shops: pd.DataFrame, shop_targets: pd.DataFrame | None) -> pd.DataFrame:
+    out = shops.copy()
+    out["shop_target_mt"] = 0.0
+    if shop_targets is None or shop_targets.empty or "store_id" not in shop_targets.columns:
+        return out
+    work = shop_targets.copy()
+    work["store_id"] = work["store_id"].astype(str).str.strip()
+    method = work["match_method"].fillna("unmatched").astype(str) if "match_method" in work.columns else pd.Series("id", index=work.index)
+    matched = work.loc[method.ne("unmatched") & work["store_id"].ne("") & work["store_id"].ne("nan")]
+    if matched.empty or "target_mt" not in matched.columns:
+        return out
+    tgt = matched.groupby(matched["store_id"].astype(str))["target_mt"].sum()
+    out["shop_target_mt"] = out["store_id"].astype(str).map(tgt).fillna(0.0)
+    return out
+
+
+def _scope_shops(
+    shops: pd.DataFrame,
+    scope: str,
+    city: str | None,
+    distributor: str | None,
+    dsr: str | None,
+) -> pd.DataFrame:
+    out = shops.copy()
+    if scope == "national" or not scope:
+        return out
+    if city:
+        out = out[out["city"].astype(str) == str(city)]
+    if scope in {"distributor", "dsr"} and distributor:
+        out = out[out["distributor"].astype(str) == str(distributor)]
+    if scope == "dsr" and dsr:
+        out = out[out["dsr_name"].astype(str) == str(dsr)]
+    return out.reset_index(drop=True)
+
+
+def _geo_filter(
+    df: pd.DataFrame,
+    scope: str,
+    city: str | None,
+    distributor: str | None,
+    dsr: str | None,
+) -> pd.DataFrame:
+    out = df
+    if city and "city" in out.columns:
+        out = out[_series_eq(out["city"], city)]
+    if scope in {"distributor", "dsr"} and distributor and "distributor" in out.columns:
+        out = out[_series_eq(out["distributor"], distributor)]
+    if scope == "dsr" and dsr and "dsr_name" in out.columns:
+        out = out[_series_eq(out["dsr_name"], dsr)]
+    return out
+
+
+def _absorb_missing_billed(
+    shops: pd.DataFrame,
+    shop_month: pd.DataFrame | None,
+    period: str,
+    scope: str,
+    city: str | None,
+    distributor: str | None,
+    dsr: str | None,
+) -> pd.DataFrame:
+    """Bring in doors that billed this month but are missing from the action universe."""
+    if shops is None:
+        shops = pd.DataFrame()
+    if shop_month is None or shop_month.empty or not period:
+        return shops
+    cur = shop_month.copy()
+    cur["store_id"] = cur["store_id"].astype(str)
+    cur = cur[cur["period"].astype(str) == str(period)]
+    cur = _geo_filter(cur, scope, city, distributor, dsr)
+    if cur.empty:
+        return shops
+    billed = cur.groupby("store_id")["volume_mt"].sum()
+    billed = billed[pd.to_numeric(billed, errors="coerce").fillna(0) > ASK_MT]
+    have = set(shops["store_id"].astype(str)) if not shops.empty and "store_id" in shops.columns else set()
+    missing = [sid for sid in billed.index.astype(str) if sid not in have]
+    if not missing:
+        return shops
+    attrs = cur.sort_values("period").drop_duplicates("store_id", keep="last")
+    attr_map = attrs.set_index("store_id") if not attrs.empty else pd.DataFrame()
+    rows = []
+    for sid in missing:
+        rec = {c: (0.0 if c.endswith("_mt") else "") for c in shops.columns} if not shops.empty else {}
+        rec["store_id"] = sid
+        rec["billed_mt"] = float(billed.loc[sid])
+        rec["expected_mt"] = 0.0
+        rec["remaining_mt"] = 0.0
+        rec["week_target_mt"] = 0.0
+        rec["shop_target_mt"] = 0.0
+        rec["is_lapsed"] = False
+        rec["call_status"] = "Billed"
+        if sid in attr_map.index:
+            hit = attr_map.loc[sid]
+            if isinstance(hit, pd.DataFrame):
+                hit = hit.iloc[0]
+            for col in ("store_name", "city", "distributor", "dsr_name", "section"):
+                if col in hit.index:
+                    rec[col] = str(hit.get(col) or "")
+        rec.setdefault("store_name", sid)
+        rows.append(rec)
+    extra = pd.DataFrame(rows)
+    if shops.empty:
+        return extra
+    return pd.concat([shops, extra], ignore_index=True, sort=False)
+
+
+def _official_expected(row: pd.Series | None, open_mtd: bool) -> float | None:
+    if row is None:
+        return None
+    today = _f(row.get("expected_mt"))
+    if today <= 1e-9:
+        return None
+    if not open_mtd:
+        return today
+    pace = _f(row.get("intra_month_frac"), 1.0) or 1.0
+    full = today / pace if pace > 1e-6 else today
+    return full if full > 1e-9 else None
+
+
+def _align_expected(shops: pd.DataFrame, official_expected: float | None) -> pd.DataFrame:
+    """Scale shop Expected so it adds to this scope’s official Expected."""
+    if shops is None or shops.empty or official_expected is None or official_expected <= 1e-9:
+        return shops
+    out = shops.copy()
+    series = pd.to_numeric(out.get("expected_mt"), errors="coerce").fillna(0.0)
+    total = float(series.sum())
+    if total <= 1e-9:
+        return out
+    factor = official_expected / total
+    if abs(factor - 1.0) < 1e-9:
+        return out
+    out["own_expected_mt"] = series
+    out["expected_mt"] = series * factor
+    billed = pd.to_numeric(out.get("billed_mt"), errors="coerce").fillna(0.0)
+    out["remaining_mt"] = (out["expected_mt"] - billed).clip(lower=0)
+    return out
+
+
+def _scope_label(scope: str, city: str | None, distributor: str | None, dsr: str | None) -> str:
+    if scope == "dsr":
+        bits = [b for b in (city, distributor, dsr) if b]
+        return " · ".join(bits) if bits else "DSR"
+    if scope == "distributor":
+        return f"{city} · {distributor}" if city and distributor else (distributor or city or "Distributor")
+    if scope == "city":
+        return city or "City"
+    return "Country"
+
+
+def _classify_rows(shops: pd.DataFrame, open_mtd: bool, period: str = "") -> pd.DataFrame:
+    out = shops.copy()
+    billed = pd.to_numeric(out.get("billed_mt"), errors="coerce").fillna(0.0)
+    expected = pd.to_numeric(out.get("expected_mt"), errors="coerce").fillna(0.0)
+    remaining = (expected - billed).clip(lower=0)
+    ask = pd.to_numeric(out.get("week_target_mt"), errors="coerce").fillna(0.0)
+    lapsed = out["is_lapsed"].fillna(False).astype(bool) if "is_lapsed" in out.columns else pd.Series(False, index=out.index)
+    call = out["call_status"].astype(str) if "call_status" in out.columns else pd.Series("", index=out.index)
+    unvisited = call.eq("Unvisited")
+    visited_no_bill = call.eq("Visited · not billed")
+    issues = []
+    flags = []
+    comments = []
+    for i, row in out.iterrows():
+        rec = row.to_dict()
+        rec["billed_mt"] = float(billed.loc[i])
+        rec["expected_mt"] = float(expected.loc[i])
+        rec["remaining_mt"] = float(remaining.loc[i])
+        rec["week_target_mt"] = float(ask.loc[i])
+        rec["is_lapsed"] = bool(lapsed.loc[i])
+        rec["call_status"] = str(call.loc[i])
+        issue = _issue(rec, open_mtd, bool(unvisited.loc[i]), bool(visited_no_bill.loc[i]))
+        issues.append(issue)
+        flags.append(issue in ISSUE_LAG)
+        comments.append(_comment(rec, issue, open_mtd, period=period))
+    out["remaining_mt"] = remaining
+    out["issue"] = issues
+    out["is_issue"] = flags
+    out["comment"] = comments
+    rank_map = MTD_ISSUE_RANK if open_mtd else CLOSED_ISSUE_RANK
+    out["issue_rank"] = out["issue"].map(lambda x: rank_map.get(str(x), 7))
+    return out
+
+
+def _issue(row: dict[str, Any], open_mtd: bool, unvisited: bool, visited_no_bill: bool) -> str:
+    billed = float(row.get("billed_mt") or 0)
+    expected = float(row.get("expected_mt") or 0)
+    remaining = float(row.get("remaining_mt") or 0)
+    ask = float(row.get("week_target_mt") or 0)
+    lapsed = bool(row.get("is_lapsed"))
+    has_bill = round(billed, 2) > 0
+    tiny_exp = expected <= HOLE_MT
+    if open_mtd:
+        if tiny_exp and not (ask > ASK_MT):
+            if billed <= ASK_MT and expected <= ASK_MT:
+                return "No run-rate"
+            return MIX_OTHER
+        if lapsed and not has_bill:
+            return ISSUE_LAPSED
+        if ask > ASK_MT and unvisited:
+            return "Due · unvisited"
+        if ask > ASK_MT and visited_no_bill:
+            return "Due · no bill"
+        if ask > ASK_MT:
+            return "Due · light drop"
+        if visited_no_bill or (not has_bill and not unvisited):
+            return "Visited, no bill"
+        if tiny_exp and not has_bill:
+            return "No run-rate"
+        return "On cycle"
+    # Closed month: Shops (<0.05 MT) is Expected-only. A door with Expected
+    # above that cut is a live miss or a lost door — never the tiny bucket.
+    if tiny_exp:
+        if billed <= ASK_MT and expected <= ASK_MT:
+            return "No run-rate"
+        return MIX_OTHER
+    if not has_bill and lapsed:
+        return ISSUE_LAPSED
+    if remaining > HOLE_MT:
+        return ISSUE_MISSED
+    if billed > expected + HOLE_MT:
+        return "Beat Expected"
+    return "On Expected"
+
+
+def _comment(row: dict[str, Any], issue: str, open_mtd: bool, period: str = "") -> str:
+    if open_mtd:
+        text = str(row.get("instruction") or "").strip()
+        if text:
+            if "usual drop" not in text.lower() and "every" not in text.lower():
+                extra = _usual_cycle_text(row)
+                if extra:
+                    text = text.rstrip(".") + "." + extra
+            return text
+        rec = str(row.get("recommended_action") or "").strip()
+        name = str(row.get("store_name") or row.get("store_id") or "Shop")
+        base = rec if rec else f"{name} is inside its cycle. Leave it."
+        return (base.rstrip(".") + "." + _usual_cycle_text(row)).strip()
+    name = str(row.get("store_name") or row.get("store_id") or "Shop")
+    billed = float(row.get("billed_mt") or 0)
+    expected = float(row.get("expected_mt") or 0)
+    remaining = float(row.get("remaining_mt") or 0)
+    last = _date_text(row.get("last_bill_date"), period)
+    last_drop = float(row.get("last_drop_mt") or 0)
+    last_bit = last or "no billed sale"
+    drop_bit = f"{last_drop:.2f} MT" if last_drop >= BILL_MT else "—"
+    cycle_bit = _usual_cycle_text(row)
+    call = str(row.get("call_status") or "")
+    unvisited = call == "Unvisited"
+    has_bill = round(billed, 2) > 0
+    if issue in {ISSUE_UNVISITED, ISSUE_UNBILLED} or (issue == ISSUE_MISSED and not has_bill):
+        if unvisited:
+            return (
+                f"{name} was not visited. Expected {expected:.2f} MT, billed 0.00. "
+                f"Last billed {last_bit}.{cycle_bit} "
+                f"This is Missed Expected (a live shop short this month), not a lost door. "
+                f"Next month: put on the beat before the first drop is due."
+            )
+        return (
+            f"{name} was visited but billed 0.00 versus Expected {expected:.2f} MT. "
+            f"Last billed {last_bit} ({drop_bit}).{cycle_bit} "
+            f"This is Missed Expected (a live shop short this month), not a lost door. "
+            f"Next month: do not leave without the usual drop."
+        )
+    if issue == ISSUE_LAPSED:
+        return (
+            f"{name} is a lost door: last billed {last_bit}, quiet longer than 3× the usual cycle. "
+            f"Billed 0.00 because they stopped buying — not Unbilled and not Missed Expected.{cycle_bit} "
+            f"Next month: recover or drop from the beat."
+        )
+    if issue == ISSUE_MISSED:
+        return (
+            f"{name} billed {billed:.2f} MT versus Expected {expected:.2f} MT. "
+            f"Last drop {drop_bit} on {last_bit}.{cycle_bit} "
+            f"Next month: recover the {remaining:.2f} MT hole."
+        )
+    if issue == "Beat Expected":
+        return (
+            f"{name} billed {billed:.2f} MT versus Expected {expected:.2f} MT.{cycle_bit} "
+            f"Keep the same drop next month."
+        )
+    if issue == "No run-rate":
+        return f"{name} has no material Expected this month. Last billed {last_bit}.{cycle_bit}"
+    if issue == MIX_OTHER:
+        return (
+            f"{name} has Expected {expected:.2f} MT (under {HOLE_MT:.2f} MT), so it sits in {MIX_OTHER}. "
+            f"Not an issue this month. Last billed {last_bit}.{cycle_bit}"
+        )
+    return f"{name} landed on Expected ({billed:.2f} MT). Last billed {last_bit}.{cycle_bit}"
+
+
+def _usual_cycle_text(row: dict[str, Any]) -> str:
+    usual = float(row.get("expected_drop_mt") or row.get("typical_drop_mt") or 0)
+    cycle_n = None
+    cycle = row.get("cycle_days")
+    try:
+        if cycle is not None and not pd.isna(cycle):
+            n = int(round(float(cycle)))
+            if n > 0:
+                cycle_n = n
+    except (TypeError, ValueError):
+        cycle_n = None
+    if usual >= BILL_MT and cycle_n:
+        return f" Usual drop is {usual:.2f} MT every {cycle_n} days."
+    if usual >= BILL_MT:
+        return f" Usual drop is {usual:.2f} MT."
+    return ""
+
+
+def _sort_rows(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
+    out = shops.copy()
+    if open_mtd:
+        out["_ask"] = pd.to_numeric(out.get("week_target_mt"), errors="coerce").fillna(0.0)
+        out = out.sort_values(
+            ["is_issue", "issue_rank", "_ask", "remaining_mt"],
+            ascending=[False, True, False, False],
+        )
+        return out.drop(columns=["_ask"]).reset_index(drop=True)
+    out = out.sort_values(
+        ["is_issue", "remaining_mt", "issue_rank"],
+        ascending=[False, False, True],
+    )
+    return out.reset_index(drop=True)
+
+
+def _kpis(shops: pd.DataFrame, open_mtd: bool) -> dict[str, Any]:
+    billed = float(pd.to_numeric(shops.get("billed_mt"), errors="coerce").fillna(0).sum()) if not shops.empty else 0.0
+    expected = float(pd.to_numeric(shops.get("expected_mt"), errors="coerce").fillna(0).sum()) if not shops.empty else 0.0
+    remaining = float(pd.to_numeric(shops.get("remaining_mt"), errors="coerce").fillna(0).sum()) if not shops.empty else 0.0
+    matched_target = float(pd.to_numeric(shops.get("shop_target_mt"), errors="coerce").fillna(0).sum()) if not shops.empty else 0.0
+    ask = float(pd.to_numeric(shops.get("week_target_mt"), errors="coerce").fillna(0).sum()) if not shops.empty else 0.0
+    issues = shops[shops["is_issue"]] if not shops.empty and "is_issue" in shops.columns else shops.iloc[0:0]
+    issue_mt = float(pd.to_numeric(issues.get("remaining_mt"), errors="coerce").fillna(0).sum()) if not issues.empty else 0.0
+    quiet_n = int((shops["issue"] == "No run-rate").sum()) if not shops.empty and "issue" in shops.columns else 0
+    due_n = int((pd.to_numeric(shops.get("week_target_mt"), errors="coerce").fillna(0) > ASK_MT).sum()) if open_mtd and not shops.empty else 0
+    return {
+        "open_mtd": open_mtd,
+        "billed_mt": billed,
+        "expected_mt": expected,
+        "gap_mt": max(0.0, expected - billed),
+        "target_mt": matched_target,
+        "matched_target_mt": matched_target,
+        "has_plan": matched_target > HOLE_MT,
+        "vs_target_mt": billed - matched_target if matched_target > HOLE_MT else 0.0,
+        "ask_mt": ask,
+        "n_shops": int(len(shops)),
+        "n_issues": int(len(issues)),
+        "issue_mt": issue_mt,
+        "shop_remaining_mt": remaining,
+        "n_quiet": quiet_n,
+        "n_due": due_n,
+        "n_unvisited": int((shops["issue"] == ISSUE_UNVISITED).sum()) if not shops.empty else 0,
+        "n_unbilled": int(
+            (
+                shops["issue"].isin([ISSUE_UNBILLED, "Visited, no bill", "Due · no bill"])
+                | (
+                    shops["issue"].eq(ISSUE_MISSED)
+                    & (pd.to_numeric(shops.get("billed_mt"), errors="coerce").fillna(0).round(2) <= 0)
+                )
+            ).sum()
+        )
+        if not shops.empty
+        else 0,
+        "cover_from_scorecard": False,
+    }
+
+
+def _mt2(value: Any) -> float:
+    try:
+        return round(float(value or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _f(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if pd.isna(value):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fold_key(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _series_eq(series: pd.Series, value: str | None) -> pd.Series:
+    if value is None or not str(value).strip():
+        return pd.Series(True, index=series.index)
+    return series.fillna("").astype(str).map(_fold_key).eq(_fold_key(value))
+
+
+def _scope_unit(
+    units: pd.DataFrame | None,
+    scope: str,
+    city: str | None,
+    distributor: str | None,
+    dsr: str | None,
+) -> pd.Series | None:
+    if units is None or units.empty or "grain" not in units.columns:
+        return None
+    g = units["grain"].astype(str)
+    if scope == "national":
+        hit = units[g == "national"]
+        return None if hit.empty else hit.iloc[0]
+    if scope == "city" and city:
+        grain_id = units["grain_id"] if "grain_id" in units.columns else pd.Series("", index=units.index)
+        hit = units[(g == "city") & _series_eq(grain_id, city)]
+        return None if hit.empty else hit.iloc[0]
+    if scope == "distributor" and distributor:
+        hit = units[g == "distributor"].copy()
+        if hit.empty:
+            return None
+        if city and "city" in hit.columns:
+            hit = hit[_series_eq(hit["city"], city)]
+        name = hit["grain_id"] if "grain_id" in hit.columns else pd.Series("", index=hit.index)
+        alt = hit["distributor"] if "distributor" in hit.columns else pd.Series("", index=hit.index)
+        hit = hit[_series_eq(name, distributor) | _series_eq(alt, distributor)]
+        return None if hit.empty else hit.iloc[0]
+    if scope == "dsr" and dsr:
+        hit = units[g == "dsr"].copy()
+        if hit.empty:
+            return None
+        if city and "city" in hit.columns:
+            hit = hit[_series_eq(hit["city"], city)]
+        if distributor and "distributor" in hit.columns:
+            hit = hit[_series_eq(hit["distributor"], distributor)]
+        name = hit["dsr_name"] if "dsr_name" in hit.columns else pd.Series("", index=hit.index)
+        grain_id = hit["grain_id"].astype(str) if "grain_id" in hit.columns else pd.Series("", index=hit.index)
+        want = str(dsr).strip()
+        hit = hit[_series_eq(name, dsr) | grain_id.str.startswith(want + " |") | _series_eq(grain_id, dsr)]
+        return None if hit.empty else hit.iloc[0]
+    return None
+
+
+def _book_target(
+    shop_targets: pd.DataFrame | None,
+    scope: str,
+    city: str | None,
+    distributor: str | None,
+    dsr: str | None,
+) -> float:
+    """Full plan book for this geography, including unmatched names."""
+    if shop_targets is None or shop_targets.empty or "target_mt" not in shop_targets.columns:
+        return 0.0
+    work = shop_targets.copy()
+    if scope in {"city", "distributor", "dsr"} and city and "city" in work.columns:
+        work = work[_series_eq(work["city"], city)]
+    if scope in {"distributor", "dsr"} and distributor and "distributor" in work.columns:
+        work = work[_series_eq(work["distributor"], distributor)]
+    if scope == "dsr" and dsr and "dsr_name" in work.columns:
+        work = work[_series_eq(work["dsr_name"], dsr)]
+    return float(pd.to_numeric(work["target_mt"], errors="coerce").fillna(0).sum())
+
+
+def _ensure_plan(units: pd.DataFrame | None, shop_targets: pd.DataFrame | None) -> pd.DataFrame | None:
+    if units is None or units.empty or shop_targets is None or shop_targets.empty:
+        return units
+    pace = 1.0
+    if "intra_month_frac" in units.columns:
+        pace = float(pd.to_numeric(units["intra_month_frac"], errors="coerce").dropna().max() or 1.0) or 1.0
+    return attach_plan(units, shop_targets, pace=pace)
+
+
+def _apply_cover_kpis(
+    kpis: dict[str, Any],
+    *,
+    units: pd.DataFrame | None,
+    shop_targets: pd.DataFrame | None,
+    scope: str,
+    city: str | None,
+    distributor: str | None,
+    dsr: str | None,
+    open_mtd: bool,
+    row: pd.Series | None = None,
+) -> dict[str, Any]:
+    """Cover Billed / Expected / Gap are this pack’s shops. Target is the plan book."""
+    billed = float(kpis.get("billed_mt") or 0)
+    expected = float(kpis.get("expected_mt") or 0)
+    kpis["shop_billed_mt"] = billed
+    kpis["shop_expected_mt"] = expected
+    if row is None:
+        units = _ensure_plan(units, shop_targets)
+        row = _scope_unit(units, scope, city, distributor, dsr)
+    if row is not None:
+        kpis["scorecard_billed_mt"] = _f(row.get("volume_mt"))
+        kpis["scorecard_expected_mt"] = _official_expected(row, open_mtd) or _f(row.get("expected_mt"))
+        kpis["cover_from_scorecard"] = abs(float(kpis["scorecard_expected_mt"] or 0) - expected) <= HOLE_MT
+        target = _f(row.get("target_mt"))
+        if target > HOLE_MT:
+            kpis["target_mt"] = target
+            kpis["has_plan"] = True
+    kpis["billed_mt"] = billed
+    kpis["expected_mt"] = expected
+    kpis["expected_full_mt"] = expected
+    kpis["gap_mt"] = max(0.0, expected - billed)
+    if float(kpis.get("target_mt") or 0) <= HOLE_MT:
+        book_t = _book_target(shop_targets, scope, city, distributor, dsr)
+        if book_t > HOLE_MT:
+            kpis["target_mt"] = book_t
+            kpis["has_plan"] = True
+    target = float(kpis.get("target_mt") or 0)
+    if open_mtd and row is not None:
+        pace = _f(row.get("intra_month_frac"), 1.0) or 1.0
+        projected = billed / pace if pace > 1e-6 else billed
+        kpis["projected_mt"] = projected
+        if target > HOLE_MT:
+            kpis["vs_target_mt"] = projected - target
+    elif target > HOLE_MT:
+        kpis["vs_target_mt"] = billed - target
+    extra = float(kpis.get("billed_mt") or 0) - float(kpis.get("expected_mt") or 0)
+    kpis["beat_extra_mt"] = max(0.0, extra)
+    return kpis
+
+
+def _issue_mix(shops: pd.DataFrame, open_mtd: bool) -> pd.DataFrame:
+    if shops is None or shops.empty:
+        return pd.DataFrame()
+    order = list(MTD_ISSUE_RANK) if open_mtd else list(CLOSED_ISSUE_RANK)
+    rows = []
+    expected_all = pd.to_numeric(shops.get("expected_mt"), errors="coerce").fillna(0.0)
+    billed_all = pd.to_numeric(shops.get("billed_mt"), errors="coerce").fillna(0.0)
+    tiny_mask = expected_all <= HOLE_MT
+    quiet = shops["issue"].astype(str).eq("No run-rate") if "issue" in shops.columns else pd.Series(False, index=shops.index)
+
+    def rec_for(label: str, part: pd.DataFrame, billed: float | None = None, expected: float | None = None) -> dict[str, Any]:
+        raw = pd.to_numeric(part["billed_mt"], errors="coerce").fillna(0.0) if billed is None else None
+        if billed is None:
+            shown = raw.map(lambda x: round(float(x), 2))
+            if label in {MIX_OTHER, MIX_TOTAL}:
+                billed = float(raw.sum())
+            else:
+                billed = float(raw.where(shown > 0, 0.0).sum())
+        if expected is None:
+            expected = float(pd.to_numeric(part["expected_mt"], errors="coerce").fillna(0).sum())
+        if label in NO_BILL_ISSUES:
+            billed = 0.0
+        rec = {
+            "Issue": label,
+            "Shops": int(len(part)),
+            "Billed (MT)": _mt2(billed),
+            "Expected (MT)": _mt2(expected),
+            "Gap (MT)": _mt2(expected - billed),
+            "_raw_billed": billed,
+            "_raw_expected": expected,
+        }
+        if open_mtd:
+            rec["Ask (KG)"] = int(round(float(pd.to_numeric(part["week_target_mt"], errors="coerce").fillna(0).sum()) * 1000))
+        return rec
+
+    for issue in order:
+        if issue in MIX_SKIP:
+            continue
+        part = shops.loc[(shops["issue"] == issue) & ~tiny_mask]
+        if part.empty:
+            continue
+        rows.append(rec_for(issue, part))
+    tiny = shops.loc[tiny_mask & ~quiet]
+    if not tiny.empty:
+        tiny = tiny.loc[(billed_all.reindex(tiny.index).fillna(0) > ASK_MT) | (expected_all.reindex(tiny.index).fillna(0) > ASK_MT)]
+    if tiny is not None and not tiny.empty:
+        rows.append(rec_for(MIX_OTHER, tiny))
+    named_idx = shops.index.difference(tiny.index if tiny is not None and not tiny.empty else shops.iloc[0:0].index)
+    named_idx = named_idx.difference(shops.loc[quiet].index)
+    dust = 0.0
+    if len(named_idx):
+        raw = billed_all.reindex(named_idx).fillna(0.0)
+        shown = raw.map(lambda x: round(float(x), 2))
+        dust = float(raw.where(shown <= 0, 0.0).sum())
+    if _mt2(dust) > 0:
+        other_i = next((i for i, rec in enumerate(rows) if rec["Issue"] == MIX_OTHER), None)
+        if other_i is None:
+            empty = shops.iloc[0:0]
+            rows.append(rec_for(MIX_OTHER, empty, billed=0.0, expected=0.0))
+            other_i = len(rows) - 1
+        billed_other = float(rows[other_i]["_raw_billed"]) + dust
+        expected_other = float(rows[other_i]["_raw_expected"])
+        rows[other_i]["_raw_billed"] = billed_other
+        rows[other_i]["Billed (MT)"] = _mt2(billed_other)
+        rows[other_i]["Gap (MT)"] = _mt2(expected_other - billed_other)
+    if rows:
+        rows.append(rec_for(MIX_TOTAL, shops))
+    mix = pd.DataFrame(rows)
+    return mix.drop(columns=[c for c in mix.columns if str(c).startswith("_")], errors="ignore")
+
+
+def _headline(kpis: dict[str, Any], scope_label: str, label: str, open_mtd: bool) -> tuple[str, str]:
+    billed = float(kpis.get("billed_mt") or 0)
+    expected = float(kpis.get("expected_mt") or 0)
+    n_iss = int(kpis.get("n_issues") or 0)
+    issue_mt = float(kpis.get("issue_mt") or 0)
+    n_shops = int(kpis.get("n_shops") or 0)
+    n_quiet = int(kpis.get("n_quiet") or 0)
+    n_active = max(0, n_shops - n_quiet)
+    if open_mtd:
+        n_due = int(kpis.get("n_due") or 0)
+        ask_kg = int(round(float(kpis.get("ask_mt") or 0) * 1000))
+        headline = (
+            f"{scope_label} · {label}: billed {_mt2(billed):.2f} MT so far versus Expected {_mt2(expected):.2f} MT. "
+            f"{n_due} shops due this week (Ask {ask_kg:,} KG)."
+        )
+        weather = (
+            "Issues are due this week, visited with no bill, and lost doors. "
+            "Still-to-Expected is the full month, not a miss yet. Mix Billed / Expected add to the cover."
+        )
+        return headline, weather
+    hole = float(kpis.get("gap_mt") or 0)
+    headline = (
+        f"{scope_label} closed {label}: billed {_mt2(billed):.2f} MT versus Expected {_mt2(expected):.2f} MT "
+        f"(gap {_mt2(hole):.2f} MT)."
+    )
+    weather = (
+        f"Gap vs Expected is Expected − billed = {_mt2(hole):.2f} MT. "
+        f"{n_iss} shops missed Expected or are lost doors ({_mt2(issue_mt):.2f} MT of holes); shops that beat Expected net against that in the mix total. "
+        f"{n_active} doors had a bill or a run-rate this month"
+        + (f"; {n_quiet:,} universe doors with neither are omitted from the mix." if n_quiet else ".")
+    )
+    return headline, weather
+
+
+def _how_to_read(open_mtd: bool) -> list[str]:
+    tiny = MIX_OTHER
+    if open_mtd:
+        return [
+            "Cover Billed, Expected, and Target match Situation cascade for this scope. Mix Total billed and Expected are the same cover figures.",
+            "A shop that has not yet billed its full Expected is not a miss mid-month. Issues are due this week (Ask), visited with no bill, and lost doors.",
+            f"{ISSUE_LAPSED} = last bill older than 3× the usual cycle. Billed 0 because they stopped — not a this-week miss.",
+            "Ask (KG) is the 90-day expected drop when the depletion ratio is ≥ 0.8. That is the next-order number for this week.",
+            "Usual drop is X MT. 'Every N days' is printed only when a gap was measured between purchases — a single bill does not assume 14 days.",
+        ]
+    return [
+        "Cover Billed, Expected, Gap, and Target match Situation cascade for this scope. Gap = Expected − billed (floored at 0). Mix Total billed, Expected, and Gap are the same cover figures.",
+        f"{tiny} is Expected-only: every door with Expected under {HOLE_MT:.2f} MT, even if it billed. If Expected is {HOLE_MT:.2f} MT or more, the shop is Missed Expected or {ISSUE_LAPSED} — never {tiny}.",
+        f"Issue shops are the working list: {ISSUE_MISSED} (live shop short of Expected, including billed 0.00) and {ISSUE_LAPSED}. Excel has every door.",
+        f"{ISSUE_LAPSED} = last bill older than 3× the usual cycle. Billed is 0 because they fell off the beat, not because this month’s visit failed. Not Missed Expected.",
+        f"{ISSUE_MISSED} = still a live shop (not a lost door) and Expected ≥ {HOLE_MT:.2f} MT, but billed less than Expected by more than {HOLE_MT:.2f} MT. Billed 0.00 is a miss, not a separate Unbilled row.",
+        "Shop Expected is last-3 / last-6, scaled so the doors in this scope add to the official Expected — the same figure as Situation cascade.",
+        "Target on the cover is the plan book. Shop Target is only shown when a matched POP quota is material. Unmatched names still count on the cover if Area folds onto this city.",
+        f"Invoices that round to 0.00 on the page do not sit as mix billed on Missed Expected — those kilos park in {tiny}. Situation Unbilled (MT) is the city hole split, not this shop-count billed volume.",
+        "Usual drop is X MT. 'Every N days' is printed only when a gap was measured between purchases — a single bill does not assume 14 days. Comment is next month, not this week.",
+    ]
+
+
+def _shop_labels(shops: pd.DataFrame) -> list[str]:
+    names = shops.get("store_name", pd.Series("", index=shops.index)).fillna("").astype(str)
+    ids = shops.get("store_id", pd.Series("", index=shops.index)).astype(str)
+    folded = names.str.strip().str.casefold()
+    counts = folded.value_counts()
+    labels = []
+    for name, sid, key in zip(names, ids, folded):
+        label = name.strip() or sid
+        if label and key and int(counts.get(key, 0) or 0) > 1:
+            tail = sid[-6:] if len(sid) >= 4 else sid
+            labels.append(f"{label} · {tail}")
+        else:
+            labels.append(label)
+    return labels
+
+
+def _present(shops: pd.DataFrame, scope: str, open_mtd: bool, has_plan: bool, period: str = "") -> pd.DataFrame:
+    if shops is None or shops.empty:
+        return pd.DataFrame()
+    labels = _shop_labels(shops)
+    rows = []
+    for label, (_, r) in zip(labels, shops.iterrows()):
+        rec: dict[str, Any] = {"Shop": label}
+        if scope == "national":
+            rec["City"] = str(r.get("city") or "")
+            rec["Distributor"] = str(r.get("distributor") or "")
+            rec["DSR"] = str(r.get("dsr_name") or "")
+        elif scope == "city":
+            rec["Distributor"] = str(r.get("distributor") or "")
+            rec["DSR"] = str(r.get("dsr_name") or "")
+        elif scope == "distributor":
+            rec["DSR"] = str(r.get("dsr_name") or "")
+        billed = _mt2(r.get("billed_mt"))
+        expected = _mt2(r.get("expected_mt"))
+        rec["Billed (MT)"] = billed
+        rec["Expected (MT)"] = expected
+        if not open_mtd:
+            rec["Gap (MT)"] = _mt2(expected - billed)
+            if has_plan:
+                tgt = float(r.get("shop_target_mt") or 0)
+                rec["Target (MT)"] = round(tgt, 2) if tgt > HOLE_MT else None
+        rec["Last billed"] = _date_text(r.get("last_bill_date"), period)
+        if open_mtd:
+            days = r.get("days_since_bill")
+            rec["Days since"] = int(round(float(days))) if days is not None and pd.notna(days) else None
+            rec["Ask (KG)"] = int(round(float(r.get("week_target_mt") or 0) * 1000))
+        else:
+            rec["Last drop (MT)"] = round(float(r.get("last_drop_mt") or 0), 2) if float(r.get("last_drop_mt") or 0) >= BILL_MT else 0.0
+            usual = float(r.get("expected_drop_mt") or r.get("typical_drop_mt") or 0)
+            rec["Usual drop (MT)"] = round(usual, 2) if usual >= BILL_MT else 0.0
+        rec["Issue"] = str(r.get("issue") or "")
+        rec["Comment" if not open_mtd else "Do this"] = str(r.get("comment") or "")
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+
+def _date_text(value: Any, period: str = "") -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat", "none"}:
+        return ""
+    ts = pd.to_datetime(text, errors="coerce")
+    if pd.isna(ts):
+        return text
+    if period and str(period)[:7] and ts.strftime("%Y-%m") != str(period)[:7]:
+        return ts.strftime("%d %b %Y")
+    return ts.strftime("%d %b")
+
+
+# --- Excel / PDF --------------------------------------------------------------
+
+
+def excel_bytes(book: ShopBook) -> bytes:
+    from openpyxl.styles import Alignment, Font
+    from sndintel.briefing import NAVY as HEX_NAVY, SLATE as HEX_SLATE, _fill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "00 Cover"
+    cut = "MTD" if book.open_mtd else "Closed month"
+    ws["A1"] = "SND Intelligence · Shop-wise issues"
+    ws["A1"].font = Font(name="Calibri", size=14, bold=True, color=HEX_NAVY)
+    ws["A2"] = f"{book.scope_label} · {book.label} · {cut}"
+    ws["A2"].font = Font(name="Calibri", size=18, bold=True, color=HEX_NAVY)
+    ws["A3"] = book.headline or ""
+    ws["A3"].font = Font(name="Calibri", size=12, bold=True, color=HEX_NAVY)
+    ws.merge_cells("A3:H3")
+    kpis = book.kpis or {}
+    if book.open_mtd:
+        metric_row = [
+            ("Billed so far (MT)", kpis.get("billed_mt")),
+            ("Expected (MT)", kpis.get("expected_mt")),
+            ("Due shops", kpis.get("n_due")),
+            ("Ask (KG)", int(round(float(kpis.get("ask_mt") or 0) * 1000))),
+            ("Issue shops", kpis.get("n_issues")),
+        ]
+    else:
+        metric_row = [
+            ("Billed (MT)", kpis.get("billed_mt")),
+            ("Expected (MT)", kpis.get("expected_mt")),
+            ("Gap vs Expected (MT)", kpis.get("gap_mt")),
+            ("Issue shops", kpis.get("n_issues")),
+        ]
+    if kpis.get("has_plan"):
+        metric_row.append(("Target (MT)", kpis.get("target_mt")))
+        metric_row.append(("vs Target (MT)", kpis.get("vs_target_mt")))
+    for i, (name, val) in enumerate(metric_row, start=1):
+        cell = ws.cell(5, i, name)
+        cell.font = Font(bold=True, color="FFFFFF", size=9)
+        cell.fill = _fill(HEX_NAVY)
+        show_mt = isinstance(val, (int, float)) and str(name).endswith("(MT)")
+        v = ws.cell(6, i, round(float(val), 2) if show_mt else val)
+        v.font = Font(size=12, bold=True)
+    ws.cell(8, 1, book.weather or "")
+    ws.merge_cells("A8:H8")
+    ws.cell(8, 1).font = Font(size=9, italic=True, color=HEX_SLATE)
+    row = 10
+    ws.cell(row, 1, "How to read")
+    ws.cell(row, 1).font = Font(bold=True, size=12, color=HEX_NAVY)
+    row += 1
+    for step in book.how_to_read:
+        ws.cell(row, 1, step)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.cell(row, 1).font = Font(size=10, italic=True, color=HEX_SLATE)
+        row += 1
+    ws.column_dimensions["A"].width = 28
+    _sheet_table(
+        wb,
+        "01 Issue mix",
+        "Issue mix",
+        f"Mix Total billed, Expected, and Gap (Expected − billed) match the cover. {MIX_OTHER} is Expected under {HOLE_MT:.2f} MT. Lost-door billed is always 0. Universe doors with no bill and no run-rate are omitted from named rows (they are 0 on the Total).",
+        book.mix,
+    )
+    note_iss = "Shops that are an issue on this cut, largest hole / Ask first."
+    _sheet_table(wb, "02 Issues", "Issues", note_iss, book.issues)
+    note_all = (
+        "Every shop in this scope. Mid-month still-to-Expected is not a miss. "
+        if book.open_mtd
+        else "Every shop in this scope, including those that landed on Expected. "
+    )
+    _sheet_table(wb, "03 All shops", "All shops", note_all + "Excel is the full list; the PDF is issues only.", book.shops)
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def pdf_bytes(book: ShopBook) -> bytes:
+    buf = BytesIO()
+    write_pdf(book, buf)
+    return buf.getvalue()
+
+
+def write_pdf(book: ShopBook, path: Path | str | BytesIO) -> None:
+    from sndintel.situation_report import (
+        LINE,
+        NAVY,
+        WASH,
+        WHITE,
+        _pdf_styles,
+        _pdf_table,
+    )
+
+    pagesize = landscape(A4)
+    doc = SimpleDocTemplate(
+        path if not isinstance(path, (str, Path)) else str(path),
+        pagesize=pagesize,
+        leftMargin=12 * mm,
+        rightMargin=12 * mm,
+        topMargin=16 * mm,
+        bottomMargin=12 * mm,
+        title=f"SND Intelligence · {book.scope_label} shops",
+        author="SND Intelligence",
+    )
+    styles = _pdf_styles()
+    usable = pagesize[0] - doc.leftMargin - doc.rightMargin
+    cut = "MTD SHOP ISSUES" if book.open_mtd else "CLOSED-MONTH SHOP ISSUES"
+    story: list[Any] = [
+        Paragraph(cut, styles["kicker"]),
+        Paragraph(xml_escape(f"{book.scope_label} · {book.label}"), styles["h1"]),
+        Paragraph(xml_escape(book.headline or ""), styles["headline"]),
+    ]
+    kpis = book.kpis or {}
+    if book.open_mtd:
+        kpi_cells = [
+            ("Billed so far", f"{float(kpis.get('billed_mt') or 0):.2f} MT"),
+            ("Expected", f"{float(kpis.get('expected_mt') or 0):.2f} MT"),
+            ("Due shops", str(int(kpis.get("n_due") or 0))),
+            ("Ask", f"{int(round(float(kpis.get('ask_mt') or 0) * 1000)):,} KG"),
+            ("Issue shops", str(int(kpis.get("n_issues") or 0))),
+        ]
+    else:
+        kpi_cells = [
+            ("Billed", f"{float(kpis.get('billed_mt') or 0):.2f} MT"),
+            ("Expected", f"{float(kpis.get('expected_mt') or 0):.2f} MT"),
+            ("Gap vs Expected", f"{float(kpis.get('gap_mt') or 0):.2f} MT"),
+            ("Issue shops", str(int(kpis.get("n_issues") or 0))),
+        ]
+    if kpis.get("has_plan"):
+        kpi_cells.append(("Target", f"{float(kpis.get('target_mt') or 0):.2f} MT"))
+        kpi_cells.append(("vs Target", f"{float(kpis.get('vs_target_mt') or 0):.2f} MT"))
+    labels = [Paragraph(xml_escape(n), styles["kpi_l"]) for n, _ in kpi_cells]
+    values = [Paragraph(xml_escape(v), styles["kpi_v"]) for _, v in kpi_cells]
+    n = max(len(kpi_cells), 1)
+    kpi_table = Table([labels, values], colWidths=[usable / n] * n)
+    kpi_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+                ("BACKGROUND", (0, 1), (-1, 1), WASH),
+                ("BOX", (0, 0), (-1, -1), 0.4, LINE),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, LINE),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, 0), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+                ("TOPPADDING", (0, 1), (-1, 1), 6),
+                ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    story.append(kpi_table)
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(xml_escape(book.weather or ""), styles["lead"]))
+    story.append(Paragraph("How to read", styles["h3"]))
+    for line in book.how_to_read:
+        story.append(Paragraph(xml_escape("- " + line), styles["body"]))
+    mix = book.mix
+    if mix is not None and not mix.empty:
+        heading = Paragraph("Issue mix", styles["h2"])
+        note = Paragraph(
+            "Mix Total billed, Expected, and Gap (Expected − billed) match the cover. "
+            f"{MIX_OTHER} is every door with Expected under {HOLE_MT:.2f} MT. "
+            f"{ISSUE_LAPSED} billed is always 0 — they stopped, they are not a this-month miss.",
+            styles["note"],
+        )
+        table = _pdf_table(mix, styles, usable)
+        story.append(KeepTogether([heading, note, Spacer(1, 2), table]))
+    issues = book.issues
+    n_iss = 0 if issues is None or issues.empty else int(len(issues))
+    shown = issues.head(PDF_ISSUE_N) if n_iss else issues
+    heading = Paragraph("Shop issues", styles["h2"])
+    extra = f" Showing {PDF_ISSUE_N} of {n_iss}. Excel has every shop." if n_iss > PDF_ISSUE_N else " Excel has every shop in this scope."
+    note = Paragraph(
+        (
+            "Working list: live shops that missed Expected (including billed 0.00) and lost doors. "
+            "The mix Total is the full pack. "
+        )
+        + extra.strip(),
+        styles["note"],
+    )
+    table = _pdf_table(shown, styles, usable)
+    story.append(PageBreak())
+    story.append(KeepTogether([heading, note, Spacer(1, 2)]))
+    story.append(table)
+    doc.build(story)
+
+
+def write_excel(book: ShopBook, path: Path | str) -> None:
+    Path(path).write_bytes(excel_bytes(book))
