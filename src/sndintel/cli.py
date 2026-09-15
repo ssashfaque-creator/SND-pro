@@ -546,6 +546,7 @@ def shops(
             action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
     book = build_shop_book(
         action=action,
+        shop_month=shop_month,
         shop_targets=shop_targets,
         units=units,
         ledger=ledger,

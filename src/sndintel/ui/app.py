@@ -1389,6 +1389,7 @@ def _page_shop_book(data, period, mtd, ledger):
     scoped = parse_shop_scope(kind, entity)
     book = build_shop_book(
         action=action,
+        shop_month=data.get("shop_month"),
         shop_targets=data.get("shop_targets"),
         units=sit_units,
         ledger=ledger,
@@ -1404,28 +1405,28 @@ def _page_shop_book(data, period, mtd, ledger):
     has_plan = bool(kpis.get("has_plan"))
     if open_mtd:
         cols = st.columns(6 if has_plan else 5)
-        cols[0].metric("Billed so far (MT)", f"{float(kpis.get('billed_mt') or 0):.1f}")
-        cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.1f}")
+        cols[0].metric("Billed so far (MT)", f"{float(kpis.get('billed_mt') or 0):.2f}")
+        cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.2f}")
         cols[2].metric("Due this week", int(kpis.get("n_due") or 0))
         cols[3].metric("Ask (KG)", f"{int(round(float(kpis.get('ask_mt') or 0) * 1000)):,}")
         cols[4].metric("Issue shops", int(kpis.get("n_issues") or 0))
         if has_plan:
-            cols[5].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.1f}")
+            cols[5].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.2f}")
     else:
         n_cols = 6 if has_plan else 4
         cols = st.columns(n_cols)
-        cols[0].metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.1f}")
-        cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.1f}")
-        cols[2].metric("Gap vs Expected (MT)", f"{float(kpis.get('gap_mt') or 0):.1f}")
+        cols[0].metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.2f}")
+        cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.2f}")
+        cols[2].metric("Gap vs Expected (MT)", f"{float(kpis.get('gap_mt') or 0):.2f}")
         cols[3].metric("Issue shops", int(kpis.get("n_issues") or 0))
         if has_plan:
-            cols[4].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.1f}")
-            cols[5].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.1f}")
+            cols[4].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.2f}")
+            cols[5].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.2f}")
     if kpis.get("cover_from_scorecard"):
         st.caption(
-            "Cover Billed / Expected / Target / Gap match Situation cascade for this scope. "
-            f"Shop-level holes total {float(kpis.get('issue_mt') or 0):.1f} MT and do not net shops that beat Expected. "
-            "Shop Target is a matched POP only."
+            "Cover Billed / Expected / Gap are the shops in this pack and add to the mix Total. "
+            "Shop Expected is scaled to this scope’s official Expected (Situation cascade). "
+            "Target is the plan book. Shop Target is only a matched POP."
         )
 
     with st.expander("How to read this pack", expanded=False):
@@ -1436,11 +1437,11 @@ def _page_shop_book(data, period, mtd, ledger):
     quiet = int(kpis.get("n_quiet") or 0)
     if quiet:
         st.caption(
-            f"{quiet:,} universe doors with no material Expected and no bill are omitted from this mix. "
-            "Unbilled is visited with billed 0 — a small invoice is Missed Expected, not unbilled."
+            f"{quiet:,} universe doors with no bill and no run-rate are omitted from named mix rows (they are 0 on Total). "
+            "Mix Total billed, Expected, and Gap match the cover. Unbilled is visited with billed 0."
         )
     else:
-        st.caption("Unbilled is visited with billed 0 this month. A small invoice is Missed Expected, not unbilled.")
+        st.caption("Mix Total billed, Expected, and Gap (Expected − billed) match the cover. Unbilled is visited with billed 0.")
     _shop_book_table(book.mix, height=220)
 
     view = st.radio(
@@ -1855,7 +1856,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.9.6 (not 0.9.7), curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.9.7 (not 0.9.8), curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
