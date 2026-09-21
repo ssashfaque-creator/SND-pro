@@ -562,7 +562,15 @@ def _bridge_row(
         }
     )
     uni = rec["universe"]
-    rec["strike_rate"] = (rec["billed"] / uni) if uni else None
+    # Strike rate is billed *universe* doors over universe doors. Off-master
+    # billed POPs still count in volume and in ``billed`` but cannot push the
+    # strike rate past the list they are not on.
+    in_uni = len(c_ids)
+    if not cpart.empty and "in_universe" in cpart.columns:
+        flag = pd.to_numeric(cpart["in_universe"], errors="coerce").fillna(1).astype(int)
+        in_uni = len(_billed_ids(cpart.loc[flag == 1]))
+    rec["billed_in_universe"] = in_uni
+    rec["strike_rate"] = (min(in_uni, uni) / uni) if uni else None
     return rec
 
 

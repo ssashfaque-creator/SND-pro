@@ -145,7 +145,11 @@ def build_kpi_snapshots(
             billed = int((cur["billed"] == 1).sum()) if not cur.empty else 0
             vol = float(cur["volume_mt"].sum()) if not cur.empty else 0.0
             uni_n = int(uni["store_id"].nunique()) if not uni.empty else int(cur["store_id"].nunique() if not cur.empty else 0)
-            strike = billed / uni_n if uni_n else 0.0
+            billed_uni = billed
+            if not cur.empty and "in_universe" in cur.columns and not uni.empty:
+                flag = pd.to_numeric(cur["in_universe"], errors="coerce").fillna(1).astype(int)
+                billed_uni = int(((cur["billed"] == 1) & (flag == 1)).sum())
+            strike = min(billed_uni, uni_n) / uni_n if uni_n else 0.0
             drop = vol / billed if billed else 0.0
             depth = float(cur.merge(sku_depth, left_on="store_id", right_index=True, how="left")["sku_n"].mean()) if billed and len(sku_depth) else 0.0
             prev_vol = float(prv["volume_mt"].sum()) if prv is not None and not prv.empty else 0.0

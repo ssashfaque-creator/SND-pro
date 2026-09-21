@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS shop_month (
     store_name TEXT,
     zone TEXT,
     city TEXT,
+    in_universe INTEGER DEFAULT 1,
     PRIMARY KEY (store_id, period)
 );
 
@@ -629,6 +630,7 @@ def init_db(path: Optional[Path] = None) -> Path:
         ):
             _ensure_column(conn, "unit_scorecards", col, ddl)
         _ensure_column(conn, "stores", "source", "TEXT")
+        _ensure_column(conn, "shop_month", "in_universe", "INTEGER DEFAULT 1")
         _ensure_column(conn, "shop_targets", "section", "TEXT")
         for col, ddl in (
             ("competitive_mt", "REAL"),

@@ -283,7 +283,8 @@ def _page_upload(empty: bool):
     st.title("Upload files")
     st.caption(
         "POP code is the shop. Names, DSR, distributor, and city change — the **Universe shop list** is the live book. "
-        "Sales history of POPs not on that list is ignored. Visit calls land weekly with the sales extract."
+        "Billed POPs not on that list are kept and flagged **off-master** (they count in billed volume, not in "
+        "coverage). Visit calls land weekly with the sales extract."
     )
     if empty:
         st.warning("No billed months yet. Universe can stay as it is — upload one or more Outlet Date Wise files.")
@@ -1946,7 +1947,7 @@ def _page_warehouse(data):
             st.rerun()
     sm = data.get("shop_month", pd.DataFrame())
     if sm is not None and not sm.empty:
-        from sndintel.reconcile import distributor_shop_sales, match_distributors, period_totals
+        from sndintel.reconcile import distributor_shop_sales, match_distributors, off_master_shops, period_totals
 
         st.subheader("Check billed vs your extract")
         st.caption(
@@ -1957,10 +1958,35 @@ def _page_warehouse(data):
         nat = period_totals(sm)
         if not nat.empty:
             st.dataframe(
-                nat.rename(columns={"period": "Month", "shops": "Billed shops", "volume_mt": "Billed (MT)"}),
+                nat.rename(
+                    columns={
+                        "period": "Month",
+                        "shops": "Billed shops",
+                        "volume_mt": "Billed (MT)",
+                        "off_master_shops": "Off-master shops",
+                        "off_master_mt": "Off-master (MT)",
+                    }
+                ),
                 use_container_width=True,
                 hide_index=True,
             )
+            off = off_master_shops(sm)
+            if not off.empty:
+                with st.expander(f"Off-master billed POPs ({off['store_id'].nunique()}) — add to the universe or confirm closed"):
+                    st.dataframe(
+                        off.rename(
+                            columns={
+                                "store_id": "POP",
+                                "store_name": "Shop",
+                                "distributor": "Distributor",
+                                "dsr_name": "DSR",
+                                "period": "Month",
+                                "volume_mt": "Billed (MT)",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
         names = match_distributors(sm)
         periods = sorted(sm["period"].astype(str).unique().tolist())
         if names and periods:

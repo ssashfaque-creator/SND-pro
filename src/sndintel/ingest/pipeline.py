@@ -97,21 +97,33 @@ def combine_daily_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 def combine_sales_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    """Collapse copies inside each file, then add the same POP+SKU+month across files."""
-    parts = [collapse_sales_facts(frame.copy()) for frame in frames if frame is not None and not frame.empty]
+    """Collapse copies inside each file; across files the later file wins per shop-month.
+
+    Files in one drop are usually a region or distributor split of the same
+    tablix, so no shop-month appears twice and the frames simply concatenate.
+    When the same shop-month *does* appear in two files (an old and a new cut of
+    the same month), the later file replaces it — the same override rule the
+    daily overlay uses — instead of adding a second copy of the month.
+    """
+    parts = []
+    for i, frame in enumerate(frames):
+        if frame is None or frame.empty:
+            continue
+        part = collapse_sales_facts(frame.copy())
+        if part is None or part.empty:
+            continue
+        part = part.copy()
+        part["_file_ix"] = i
+        parts.append(part)
     if not parts:
         return pd.DataFrame()
     out = pd.concat(parts, ignore_index=True)
-    key = [c for c in ("store_id", "sku", "period") if c in out.columns]
-    if len(key) < 3:
-        return collapse_sales_facts(out)
-    extra = [c for c in out.columns if c not in key]
-    agg = {c: "last" for c in extra}
-    if "volume_mt" in agg:
-        agg["volume_mt"] = "sum"
-    grouped = out.groupby(key, as_index=False, sort=False).agg(agg)
-    grouped = grouped.loc[pd.to_numeric(grouped["volume_mt"], errors="coerce").fillna(0) > 0].copy()
-    return grouped.reset_index(drop=True)
+    if not {"store_id", "period"}.issubset(out.columns):
+        return collapse_sales_facts(out.drop(columns=["_file_ix"]))
+    latest = out.groupby(["store_id", "period"])["_file_ix"].transform("max")
+    out = out.loc[out["_file_ix"] == latest].drop(columns=["_file_ix"])
+    out = out.loc[pd.to_numeric(out["volume_mt"], errors="coerce").fillna(0) > 0].copy()
+    return out.reset_index(drop=True)
 
 
 def merge_sales_reports(reports: list[ParseReport]) -> ParseReport | None:
@@ -305,10 +317,12 @@ def run_pipeline(
                 )
             )
             existing = set(read_sql(conn, "SELECT store_id FROM stores")["store_id"].astype(str))
-            live = read_sql(conn, "SELECT store_id FROM stores WHERE in_universe = 1")
-            has_universe = not live.empty
             new_ids = discovered[~discovered["store_id"].astype(str).isin(existing)].copy()
-            if not new_ids.empty and not has_universe:
+            if not new_ids.empty:
+                # Every billed POP is registered, whether or not a universe is
+                # loaded. Off-master doors carry in_universe = 0 so coverage
+                # denominators ignore them, but their volume is never dropped —
+                # the warehouse must still tie to the extract's Grand Total.
                 for col in ("zone", "city", "category_1", "category_2", "category_3", "category_4"):
                     new_ids[col] = None
                 new_ids["in_universe"] = 0
@@ -318,7 +332,8 @@ def run_pipeline(
                 _upsert_stores(conn, new_ids)
 
             label = _sales_label(file_paths)
-            execution = parse_execution_date(sales_report.params if sales_report else None)
+            file_periods = sorted(sales["period"].dropna().astype(str).unique().tolist()) if "period" in sales.columns else []
+            execution = parse_execution_date(sales_report.params if sales_report else None, file_periods)
             daily = getattr(sales_report, "daily", None) if sales_report else None
             has_daily = daily is not None and not daily.empty
             ingest_mode = "daily_overlay" if has_daily else "month_replace"
@@ -347,11 +362,7 @@ def run_pipeline(
                 facts["ingested_at"] = utcnow()
                 touched_periods = sorted(facts["period"].dropna().unique().tolist())
                 if not replace_sales and touched_periods:
-                    placeholders = ", ".join("?" * len(touched_periods))
-                    conn.execute(
-                        f"DELETE FROM sales_facts WHERE period IN ({placeholders})",
-                        tuple(touched_periods),
-                    )
+                    _replace_month_scope(conn, facts, touched_periods)
                 upsert_dataframe(
                     conn,
                     "sales_facts",
@@ -643,6 +654,37 @@ def _delete_sales_facts(conn, store_ids: list[str], periods: list[str]) -> None:
         )
 
 
+def _replace_month_scope(conn, facts: pd.DataFrame, periods: list[str]) -> None:
+    """Shop SKU Wise month replace, scoped to the hierarchy the file contains.
+
+    A full national extract lists every distributor, so the whole month is
+    replaced and shop-SKU lines that vanished from the new cut are removed. A
+    regional or single-distributor export only replaces its own distributors'
+    rows for those months; other regions' history is left alone. Shops in the
+    file whose distributor is blank are replaced individually.
+    """
+    if facts is None or facts.empty or not periods:
+        return
+    pph = ", ".join("?" * len(periods))
+    dists: list[str] = []
+    if "distributor" in facts.columns:
+        dists = sorted(
+            {
+                str(d).strip()
+                for d in facts["distributor"].dropna().astype(str)
+                if str(d).strip() and str(d).strip().lower() not in {"nan", "(unmapped)"}
+            }
+        )
+    for part in _chunked(dists):
+        dph = ", ".join("?" * len(part))
+        conn.execute(
+            f"DELETE FROM sales_facts WHERE period IN ({pph}) AND distributor IN ({dph})",
+            tuple(periods) + tuple(part),
+        )
+    store_ids = sorted({str(s).strip() for s in facts["store_id"].astype(str) if str(s).strip()})
+    _delete_sales_facts(conn, store_ids, list(periods))
+
+
 def _read_shop_day_slice(conn, store_ids: list[str], periods: list[str]) -> pd.DataFrame:
     if not store_ids or not periods:
         return pd.DataFrame()
@@ -717,7 +759,54 @@ def _rebuild_facts_from_shop_day(
     return periods
 
 
+def _max_period_on_file(conn) -> Optional[str]:
+    row = read_sql(conn, "SELECT MAX(period) AS p FROM sales_facts")
+    if row is None or row.empty or row.iloc[0]["p"] is None or pd.isna(row.iloc[0]["p"]):
+        return None
+    return str(row.iloc[0]["p"])
+
+
+def _shop_day_last_day(conn, period: str) -> Optional[int]:
+    try:
+        row = read_sql(conn, "SELECT MAX(day) AS d FROM shop_day WHERE period = ?", (period,))
+    except Exception:
+        return None
+    if row is None or row.empty or row.iloc[0]["d"] is None or pd.isna(row.iloc[0]["d"]):
+        return None
+    return int(row.iloc[0]["d"])
+
+
+def _existing_open_as_of(conn, period: str) -> Optional[int]:
+    row = read_sql(conn, "SELECT status, as_of_day FROM period_ledger WHERE period = ?", (period,))
+    if row is None or row.empty:
+        return None
+    if str(row.iloc[0]["status"]) != "mtd_open" or pd.isna(row.iloc[0]["as_of_day"]):
+        return None
+    return int(row.iloc[0]["as_of_day"])
+
+
+def _close_superseded_months(conn) -> None:
+    """Any open MTD month older than the newest month on file is a finished month."""
+    latest = _max_period_on_file(conn)
+    if not latest:
+        return
+    conn.execute(
+        """UPDATE period_ledger
+           SET status = 'closed', as_of_day = days_in_month
+           WHERE status = 'mtd_open' AND period < ?""",
+        (latest,),
+    )
+
+
 def _refresh_period_ledger(conn, periods: list[str], label: str, execution, open_period: Optional[str]) -> None:
+    """Upsert the month ledger for the periods this file touched.
+
+    ``as_of_day`` never moves backwards: re-dropping an older cut of a month
+    that already holds later days keeps the later as-of (and its volume), so
+    the run-rate factor cannot inflate. A month can only be open when it is
+    the newest month on file — an older month's re-upload is a closed month.
+    """
+    latest_on_file = _max_period_on_file(conn)
     for per in periods:
         part = read_sql(conn, "SELECT volume_mt FROM sales_facts WHERE period = ?", (per,))
         vol = (
@@ -727,9 +816,21 @@ def _refresh_period_ledger(conn, periods: list[str], label: str, execution, open
         )
         n_rows = int(len(part)) if part is not None and not part.empty else 0
         status = "mtd_open" if per == open_period else "closed"
+        if status == "mtd_open" and latest_on_file and str(per) < latest_on_file:
+            status = "closed"
         as_of = days = None
         if status == "mtd_open":
             _factor, as_of, days = run_rate_factor(execution, per)
+            candidates = [int(as_of)]
+            prior = _existing_open_as_of(conn, per)
+            if prior:
+                candidates.append(prior)
+            last_day = _shop_day_last_day(conn, per)
+            if last_day:
+                candidates.append(last_day)
+            as_of = int(min(max(candidates), int(days)))
+            if as_of >= int(days):
+                status = "closed"
         else:
             year, month = int(str(per)[:4]), int(str(per)[5:7])
             days = monthrange(year, month)[1]
@@ -773,6 +874,7 @@ def _refresh_period_ledger(conn, periods: list[str], label: str, execution, open
                 """,
                 (per, int(as_of), int(days), vol, label, utcnow()),
             )
+    _close_superseded_months(conn)
 
 
 SHOP_MONTH_COLS = [
@@ -789,7 +891,47 @@ SHOP_MONTH_COLS = [
     "store_name",
     "zone",
     "city",
+    "in_universe",
 ]
+
+
+def _flag_universe_membership(shop_month: pd.DataFrame, stores_all: pd.DataFrame | None) -> pd.DataFrame:
+    """Mark each shop-month row as on/off the live universe and place off-master doors.
+
+    An off-master door has no city on the extract. Its distributor does, so it
+    is reported under the city (and zone) where that distributor's universe
+    shops sit instead of forming a spurious "(unmapped)" city.
+    """
+    if shop_month is None or shop_month.empty:
+        return shop_month
+    out = shop_month.copy()
+    if stores_all is None or stores_all.empty or "in_universe" not in stores_all.columns:
+        out["in_universe"] = 1
+        return out
+    st = stores_all.copy()
+    st["in_universe"] = pd.to_numeric(st["in_universe"], errors="coerce").fillna(0).astype(int)
+    if not (st["in_universe"] == 1).any():
+        out["in_universe"] = 1
+        return out
+    live = set(st.loc[st["in_universe"] == 1, "store_id"].astype(str))
+    out["in_universe"] = out["store_id"].astype(str).isin(live).astype(int)
+
+    off = out["in_universe"] == 0
+    if not off.any() or "distributor" not in out.columns:
+        return out
+    live_rows = st.loc[st["in_universe"] == 1]
+    for col in ("city", "zone"):
+        if col not in out.columns or col not in live_rows.columns or "distributor" not in live_rows.columns:
+            continue
+        lookup = (
+            live_rows.dropna(subset=["distributor", col])
+            .groupby("distributor")[col]
+            .agg(lambda s: s.value_counts().idxmax())
+        )
+        need = off & out[col].isna() & out["distributor"].notna()
+        if need.any():
+            out.loc[need, col] = out.loc[need, "distributor"].map(lookup)
+    return out
 
 
 STORE_UPSERT_COLS = [
@@ -850,18 +992,19 @@ def _rebuild_intelligence(conn, run_id: int) -> dict:
             if cols and not cleaned.empty:
                 upsert_dataframe(conn, "sales_facts", cleaned[cols], ["store_id", "sku", "period"])
         facts_all = cleaned
+    _close_superseded_months(conn)
     stores_df = _active_universe(stores_all)
+    # Billed history is never filtered by the universe: every fact on file is
+    # scored, so national billed always ties to the extract. Off-master doors
+    # are flagged (in_universe = 0) and stay out of coverage denominators.
     facts_df = facts_all
-    if stores_df is not None and not stores_df.empty and stores_all is not None and len(stores_df) < len(stores_all):
-        ids = set(stores_df["store_id"].astype(str))
-        if not facts_all.empty:
-            facts_df = facts_all[facts_all["store_id"].astype(str).isin(ids)].copy()
     try:
         visits_df = read_sql(conn, "SELECT * FROM shop_visits")
     except Exception:
         visits_df = pd.DataFrame()
     shop_month = rebuild_shop_month(facts_df, stores_df)
     shop_month = add_calendar_panel(shop_month, stores_df)
+    shop_month = _flag_universe_membership(shop_month, stores_all)
     if not shop_month.empty:
         replace_table(conn, "shop_month", shop_month[SHOP_MONTH_COLS])
     else:
