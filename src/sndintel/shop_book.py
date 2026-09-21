@@ -38,6 +38,7 @@ from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemp
 
 from sndintel.action import ActionPack, build_action_pack
 from sndintel.briefing import _sheet_table
+from sndintel.fmt import fmt_kg, fmt_mt, kg
 from sndintel.mtd import period_state
 from sndintel.plan import attach_plan
 
@@ -580,20 +581,6 @@ def _issue(row: dict[str, Any], open_mtd: bool, unvisited: bool, visited_no_bill
     return "On Expected"
 
 
-def fmt_mt(value: Any, *, zero: str = "0 kg") -> str:
-    """Kilograms under 0.1 MT, otherwise MT to two decimals. Never '0.00 MT' for 4 kg."""
-    v = _f(value)
-    if abs(v) < 0.0005:
-        return zero
-    if abs(v) < 0.1:
-        return f"{v * 1000:,.0f} kg"
-    return f"{v:,.2f} MT"
-
-
-def kg(value: Any) -> int:
-    return int(round(_f(value) * 1000))
-
-
 def _cutoff_text(row: dict[str, Any]) -> str:
     from sndintel.demand import lapse_cutoff_days
 
@@ -625,7 +612,7 @@ def _comment(row: dict[str, Any], issue: str, open_mtd: bool, period: str = "") 
     last = _date_text(row.get("last_bill_date"), period)
     last_drop = float(row.get("last_drop_mt") or 0)
     last_bit = last or "no billed sale"
-    drop_bit = fmt_mt(last_drop) if last_drop >= BILL_MT else "—"
+    drop_bit = fmt_kg(last_drop) if last_drop >= BILL_MT else "—"
     cycle_bit = _usual_cycle_text(row)
     call = str(row.get("call_status") or "")
     unvisited = call == "Unvisited"
@@ -635,13 +622,13 @@ def _comment(row: dict[str, Any], issue: str, open_mtd: bool, period: str = "") 
     if issue in {ISSUE_UNVISITED, ISSUE_UNBILLED} or (issue == ISSUE_MISSED and not has_bill):
         if unvisited:
             return (
-                f"{name} was not visited. Expected {fmt_mt(expected)}, billed 0. "
+                f"{name} was not visited. Expected {fmt_kg(expected)}, billed 0. "
                 f"Last billed {last_bit}.{cycle_bit} "
                 f"This is Missed Expected (a live shop short this month), not a lost door.{flag_bit} "
                 f"Next month: put on the beat before the first drop is due."
             )
         return (
-            f"{name} was visited but billed 0 versus Expected {fmt_mt(expected)}. "
+            f"{name} was visited but billed 0 versus Expected {fmt_kg(expected)}. "
             f"Last billed {last_bit} ({drop_bit}).{cycle_bit} "
             f"This is Missed Expected (a live shop short this month), not a lost door.{flag_bit} "
             f"Next month: do not leave without the usual drop."
@@ -656,32 +643,32 @@ def _comment(row: dict[str, Any], issue: str, open_mtd: bool, period: str = "") 
         pair = str(row.get("flag_pair") or "").strip()
         return (
             f"{name} stopped billing under this POP code; the same door continues as {pair or 'a new code'}. "
-            f"Not a lost door. Fix the universe (retire this code) so its Expected {fmt_mt(expected)} stops showing as a hole."
+            f"Not a lost door. Fix the universe (retire this code) so its Expected {fmt_kg(expected)} stops showing as a hole."
         )
     if issue == ISSUE_NOT_DUE:
         return (
             f"{name} was not due this month: last billed {last_bit}, inside its usual cycle at month-end.{cycle_bit} "
-            f"Run-rate Expected {fmt_mt(expected)} is timing, not a miss. Next month: it falls due — take the usual drop."
+            f"Run-rate Expected {fmt_kg(expected)} is timing, not a miss. Next month: it falls due — take the usual drop."
         )
     if issue == ISSUE_MISSED:
         return (
-            f"{name} billed {fmt_mt(billed)} versus Expected {fmt_mt(expected)}. "
+            f"{name} billed {fmt_kg(billed)} versus Expected {fmt_kg(expected)}. "
             f"Last drop {drop_bit} on {last_bit}.{cycle_bit}{flag_bit} "
-            f"Next month: recover the {fmt_mt(remaining)} hole."
+            f"Next month: recover the {fmt_kg(remaining)} hole."
         )
     if issue == "Beat Expected":
         return (
-            f"{name} billed {fmt_mt(billed)} versus Expected {fmt_mt(expected)}.{cycle_bit}{flag_bit} "
+            f"{name} billed {fmt_kg(billed)} versus Expected {fmt_kg(expected)}.{cycle_bit}{flag_bit} "
             f"Keep the same drop next month."
         )
     if issue == "No run-rate":
         return f"{name} has no material Expected this month. Last billed {last_bit}.{cycle_bit}"
     if issue == MIX_OTHER:
         return (
-            f"{name} is a tail door for its DSR (Expected {fmt_mt(expected)}, billed {fmt_mt(billed)}). "
+            f"{name} is a tail door for its DSR (Expected {fmt_kg(expected)}, billed {fmt_kg(billed)}). "
             f"Judged in the tail coverage panel, not as an individual hole. Last billed {last_bit}.{cycle_bit}{flag_bit}"
         )
-    return f"{name} landed on Expected ({fmt_mt(billed)}). Last billed {last_bit}.{cycle_bit}{flag_bit}"
+    return f"{name} landed on Expected ({fmt_kg(billed)}). Last billed {last_bit}.{cycle_bit}{flag_bit}"
 
 
 def _usual_cycle_text(row: dict[str, Any]) -> str:
@@ -696,9 +683,9 @@ def _usual_cycle_text(row: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         cycle_n = None
     if usual >= BILL_MT and cycle_n:
-        return f" Usual drop is {fmt_mt(usual)} every {cycle_n} days."
+        return f" Usual drop is {fmt_kg(usual)} every {cycle_n} days."
     if usual >= BILL_MT:
-        return f" Usual drop is {fmt_mt(usual)}."
+        return f" Usual drop is {fmt_kg(usual)}."
     return ""
 
 
@@ -1045,7 +1032,7 @@ def _headline(kpis: dict[str, Any], scope_label: str, label: str, open_mtd: bool
         n_due = int(kpis.get("n_due") or 0)
         ask_kg = int(round(float(kpis.get("ask_mt") or 0) * 1000))
         headline = (
-            f"{scope_label} · {label}: billed {_mt2(billed):.2f} MT so far versus Expected {_mt2(expected):.2f} MT. "
+            f"{scope_label} · {label}: billed {fmt_mt(billed)} so far versus Expected {fmt_mt(expected)}. "
             f"{n_due} shops due this week (Ask {ask_kg:,} KG)."
         )
         weather = (
@@ -1107,7 +1094,8 @@ def _how_to_read(open_mtd: bool) -> list[str]:
         f"{tiny}: within each DSR, doors outside the top {pct}% of size (max of Expected and billed), and every door under {kg(MATERIAL_FLOOR_MT)} kg. Any door at or above {kg(HOLE_MT)} kg is always core.",
         "Target on the cover is the plan book. The credibility line splits a shortfall into execution (vs run-rate, recoverable on the beat) and ambition (Target above run-rate).",
         "Flags mark POP codes that look like a duplicate or a migrated code (same bills on the same days, or a same-name door that started when this one stopped). Check before calling them lost.",
-        "Shop rows print kg; cover, roll-up and mix print MT. 'Every N days' appears only when a gap was measured between purchases. Comment is next month, not this week.",
+        "Shop rows print kg; cover, roll-up and mix print MT. In the Issue mix, Gap is signed so the rows add to the Total — a negative Gap on Beat / On Expected is volume above run-rate netting against the holes. Everywhere else Gap is floored at 0.",
+        "'Every N days' appears only when a gap was measured between purchases. Comment is next month, not this week.",
     ]
 
 

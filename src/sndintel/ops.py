@@ -815,9 +815,9 @@ def _city_driver_table(units: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(
         {
             "City": cities["grain_id"].astype(str),
-            "Billed (MT)": pd.to_numeric(cities.get("volume_mt"), errors="coerce").round(0),
-            "Expected (MT)": pd.to_numeric(cities.get("expected_mt"), errors="coerce").round(0),
-            "Gap (MT)": rec.round(0),
+            "Billed (MT)": pd.to_numeric(cities.get("volume_mt"), errors="coerce").round(2),
+            "Expected (MT)": pd.to_numeric(cities.get("expected_mt"), errors="coerce").round(2),
+            "Gap (MT)": rec.round(2),
             "Visit %": (pd.to_numeric(cities.get("visit_rate"), errors="coerce") * 100).round(0),
             "Strike %": (pd.to_numeric(cities.get("strike_rate"), errors="coerce") * 100).round(0),
             "Driver": driver,

@@ -343,18 +343,20 @@ def test_pack_from_columns_sum_to_recoverable_after_rounding():
     cities = report.cities
     assert list(cities.columns)[-1] == "Remarks"
     from_cols = ["From drop size (MT)", "From unvisited shops (MT)", "From unbilled shops (MT)"]
+    def _hundredths(v) -> int:
+        return 0 if v is None or pd.isna(v) else int(round(float(v) * 100))
+
     for _, row in cities.iterrows():
-        rec = row["Gap (MT)"]
-        rec_i = 0 if rec is None or pd.isna(rec) else int(rec)
-        parts = [0 if row[c] is None or pd.isna(row[c]) else int(row[c]) for c in from_cols]
-        if rec_i > 0:
-            assert sum(parts) == rec_i
+        rec_c = _hundredths(row["Gap (MT)"])
+        parts = [_hundredths(row[c]) for c in from_cols]
+        if rec_c > 0:
+            assert sum(parts) == rec_c
             assert all(p >= 0 for p in parts)
-        # whole numbers in the table
+        # MT columns are numeric at two decimals — never rounded to whole tons
         for col in ["Billed this period (MT)", "Gap (MT)"]:
             val = row[col]
             if val is not None and pd.notna(val):
-                assert float(val) == float(int(round(float(val))))
+                assert float(val) == round(float(val), 2)
     cities_opt = list_report_entities(report, "City")
     assert "Karachi" in cities_opt
     focused = focus_pack(report, "City", "Karachi")

@@ -17,6 +17,40 @@ from sndintel.config import (
 )
 from sndintel.io_utils import shift_period
 
+# One tolerance for "off Expected" at unit grain (DSR / distributor / city /
+# country), shared by the situation label, the cascade packs and the boards.
+# Small books: 5% of Expected. Large books: 2%, never under 0.5 MT once the
+# book passes 10 MT. Never under 150 kg anywhere — a 4 kg wobble is not a hole.
+UNIT_FLOOR_MT = 0.15
+UNIT_SMALL_SHARE = 0.05
+UNIT_LARGE_SHARE = 0.02
+UNIT_LARGE_FLOOR_MT = 0.5
+
+
+def unit_material_mt(expected: Any) -> float:
+    """MT by which a unit must miss (or beat) its Expected before it is called off Expected.
+
+    Continuous in Expected: ``max(0.15, min(5% × E, max(0.5, 2% × E)))`` — 5% up to
+    10 MT, a flat 0.5 MT from 10 to 25 MT, then 2%. A flat 0.5 MT for every unit
+    let a 1.3 MT city hide a 40% miss and flagged a 100 MT city for a 0.5% wobble.
+    """
+    try:
+        exp = float(expected or 0)
+    except (TypeError, ValueError):
+        exp = 0.0
+    if pd.isna(exp) or exp < 0:
+        exp = 0.0
+    return max(UNIT_FLOOR_MT, min(UNIT_SMALL_SHARE * exp, max(UNIT_LARGE_FLOOR_MT, UNIT_LARGE_SHARE * exp)))
+
+
+def driver_floor_mt(hole: Any) -> float:
+    """A gap driver is named when it carries at least a fifth of the hole (and 20 kg)."""
+    try:
+        h = max(0.0, float(hole or 0))
+    except (TypeError, ValueError):
+        h = 0.0
+    return max(0.02, 0.2 * h)
+
 
 def tier_from_volumes(volumes: pd.Series) -> pd.DataFrame:
     """Pareto tiers on a reference month (usually last year).

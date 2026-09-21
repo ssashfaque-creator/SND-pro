@@ -27,6 +27,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from sndintel.config import EXPECTED_FORMULA
 from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibling_z_frame
+from sndintel.fmt import excel_number_format, fmt_mt, round_mt
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
 from sndintel.io_utils import prior_periods, shift_period
@@ -118,7 +119,7 @@ CALCULATION_NOTES = [
     ),
     (
         "Rounding and lists",
-        "MT, shop counts, and percents print as whole numbers. From-columns still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names volume top-10 and seriousness top-10 for distributors and DSRs, whales, then the top 50 most serious shops. Remainder lines are the tail.",
+        "MT prints to two decimals — never whole tons, a 1 MT step is a DSR-week. Shop counts and percents are whole numbers. From-columns still add to Gap after rounding. Prose writes volumes under 0.1 MT in kg. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names volume top-10 and seriousness top-10 for distributors and DSRs, whales, then the top 50 most serious shops. Remainder lines are the tail.",
     ),
     (
         "Top-N lists",
@@ -443,7 +444,7 @@ def build_strategy_pack(
     shop_note = (
         f"Top {SUMMARY_SHOP_N} most serious lagging shops (miss versus own Expected given size). "
         f"{int(lag_meta.get('n_hidden') or 0)} other doors totalling "
-        f"{float(lag_meta.get('hidden_mt') or 0):.0f} MT gap are the remainder line "
+        f"{fmt_mt(lag_meta.get('hidden_mt'))} gap are the remainder line "
         f"(includes gaps ≤ {hole_floor:.2f} MT)."
     )
     presented_dists = _present_with_remainder(
@@ -850,20 +851,20 @@ def _append_remainder(
     top_n = meta.get("top_n")
     if top_n:
         rest[name_field] = (
-            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            f"Not listed — {n_hidden} {noun} totalling {fmt_mt(hidden_mt)} gap. "
             f"Ranked by how serious the miss is versus own Expected; only the top {int(top_n)} are named on this sheet."
         )
     elif name_field == "Shop":
         rest[name_field] = (
-            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            f"Not listed — {n_hidden} {noun} totalling {fmt_mt(hidden_mt)} gap. "
             "Gaps of 0.25 MT or less, not a first call."
         )
     else:
         rest[name_field] = (
-            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            f"Not listed — {n_hidden} {noun} totalling {fmt_mt(hidden_mt)} gap. "
             "The rest of the hole after the named rows."
         )
-    rest["Gap (MT)"] = _round_num(hidden_mt)
+    rest["Gap (MT)"] = _round_mt_num(hidden_mt)
     extra = pd.DataFrame([rest])
     if table is None or table.empty:
         return extra
@@ -1312,8 +1313,17 @@ def _round_num(val: Any) -> Any:
         return val
 
 
+def _round_mt_num(val: Any) -> Any:
+    v = round_mt(val)
+    return pd.NA if v is None else v
+
+
 def _round_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Whole numbers for MT, counts, and percents. From-columns still sum to Gap."""
+    """Two decimals for MT (never integer MT), whole numbers for counts and percents.
+
+    The three From-columns are nudged so they still sum to Gap after rounding —
+    the largest driver absorbs the rounding residue.
+    """
     if df is None or df.empty:
         return df
     out = df.copy()
@@ -1328,30 +1338,25 @@ def _round_display(df: pd.DataFrame) -> pd.DataFrame:
         if col == "Remarks":
             continue
         name = str(col)
-        if name == "Drop size (MT)":
-            out[col] = [
-                (round(float(v), 2) if v is not None and pd.notna(v) else pd.NA) for v in out[col]
-            ]
+        if "(MT)" in name:
+            out[col] = [_round_mt_num(v) for v in out[col]]
             continue
-        if "(MT)" in name or name.endswith("%") or name in count_cols:
+        if name.endswith("%") or name in count_cols:
             out[col] = [_round_num(v) for v in out[col]]
     if rec_col in out.columns and len(from_cols) == 3:
         for i in out.index:
             rec = out.loc[i, rec_col]
-            rec_i = int(rec) if rec is not None and pd.notna(rec) else 0
+            rec_c = int(round(float(rec) * 100)) if rec is not None and pd.notna(rec) else 0
             parts = []
             for c in from_cols:
                 v = out.loc[i, c]
-                parts.append(int(v) if v is not None and pd.notna(v) else 0)
-            if rec_i != 0:
-                target = rec_i
-            else:
-                target = int(round(sum(parts)))
+                parts.append(int(round(float(v) * 100)) if v is not None and pd.notna(v) else 0)
+            target = rec_c if rec_c != 0 else sum(parts)
             diff = target - sum(parts)
             if diff:
                 j = max(range(len(parts)), key=lambda k: abs(parts[k]))
                 parts[j] += diff
-                out.loc[i, from_cols[j]] = parts[j]
+                out.loc[i, from_cols[j]] = parts[j] / 100.0
     return out
 
 
@@ -1734,24 +1739,12 @@ def _excel_value(value: Any) -> Any:
 
 
 def _format_metric_cell(cell, header: str) -> None:
-    h = str(header)
-    if h == "Drop size (MT)":
-        cell.number_format = "0.00"
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
+    """Two-decimal MT (signed for directional columns), whole kg/counts/percents, right aligned."""
+    fmt = excel_number_format(header)
+    if fmt is None:
         return
-    if "(MT)" in h:
-        cell.number_format = (
-            "+0;-0;0"
-            if h.startswith("Extra") or h.startswith("vs ") or h.startswith("From ") or "Gap" in h
-            else "#,##0"
-        )
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
-    elif h.endswith("%") or "Strike" in h:
-        cell.number_format = "0"
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
-    elif h in {"Billed shops", "Visited shops", "Universe", "Visits MTD"}:
-        cell.number_format = "#,##0"
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
+    cell.number_format = fmt
+    cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
 
 
 def row_tone(row: pd.Series) -> str:

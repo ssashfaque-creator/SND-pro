@@ -192,8 +192,9 @@ def test_unbilled_is_billed_zero_not_a_tiny_invoice():
     assert "not a lost door" in zero_comment
     tiny_comment = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Comment"].iloc[0]).lower()
     assert "visited but billed 0 versus" not in tiny_comment
-    assert "2.92" in tiny_comment
-    assert "usual drop is 1.71 mt every 14 days" in tiny_comment
+    # Shop rows are in kg, so the sentence beside the kg columns is in kg too.
+    assert "billed 20 kg versus expected 2,920 kg" in tiny_comment
+    assert "usual drop is 1,710 kg every 14 days" in tiny_comment
     last = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Last billed"].iloc[0])
     assert "2025" in last
 
@@ -708,7 +709,7 @@ def test_unmeasured_cycle_does_not_claim_fourteen_days():
     book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
     comment = str(book.issues.loc[book.issues["Shop"] == "Once", "Comment"].iloc[0]).lower()
     assert book.raw.set_index("store_name").loc["Once", "issue"] == ISSUE_MISSED
-    assert "usual drop is 1.50 mt" in comment
+    assert "usual drop is 1,500 kg" in comment
     assert "every" not in comment
     assert "14" not in comment
     assert "not a lost door" in comment

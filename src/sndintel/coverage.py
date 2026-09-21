@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from sndintel.fmt import fmt_mt, fmt_pct
 from sndintel.isolate import robust_z
 from sndintel.io_utils import shift_period
 
@@ -239,9 +240,13 @@ def allocate_recoverable_drivers(df: pd.DataFrame) -> pd.DataFrame:
             target = r
             weights = [max(0.0, -d), max(0.0, -u), max(0.0, -b)]
         elif ahead:
-            surplus = isolated_f
-            if surplus <= 1e-9 and pd.notna(billed) and pd.notna(share):
+            # The surplus is the true Billed − Expected, the same number the Gap
+            # column is built from. The shrunk residual only ranks; it is never
+            # printed as an amount.
+            if pd.notna(billed) and pd.notna(share):
                 surplus = max(0.0, float(billed) - float(share))
+            else:
+                surplus = isolated_f
             target = -max(0.0, surplus)
             weights = [max(0.0, d), max(0.0, u), max(0.0, b)]
         else:
@@ -388,12 +393,12 @@ def _trend_bit(r: pd.Series, parent: dict[str, Any]) -> str:
     parts = ["Trend:"]
     if ams is not None and ams > 1e-9 and vs_ams is not None:
         pct = 100.0 * vs_ams / ams
-        parts.append(f"{vs_ams:+.0f} MT vs AMS ({pct:+.0f}%).")
+        parts.append(f"{fmt_mt(vs_ams, signed=True)} vs AMS ({fmt_pct(pct, decimals=0)}).")
     elif vol is not None:
-        parts.append(f"billed {vol:.0f} MT.")
+        parts.append(f"billed {fmt_mt(vol)}.")
     if exp is not None and vol is not None:
         gap = vol - exp
-        parts.append(f"{gap:+.0f} MT vs Expected.")
+        parts.append(f"{fmt_mt(gap, signed=True)} vs Expected.")
     if ly is not None and ly > 1e-9 and vol is not None:
         from sndintel.capacity import yoy_is_printable
 

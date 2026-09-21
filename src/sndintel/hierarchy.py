@@ -29,6 +29,7 @@ import pandas as pd
 from sndintel.config import MIN_MATERIAL_MT
 from sndintel.coverage import attach_coverage_split, build_coverage_book
 from sndintel.features import latest_period
+from sndintel.fmt import fmt_mt
 from sndintel.io_utils import shift_period
 from sndintel.identity import attach_dsr_identity
 from sndintel.isolate import (
@@ -1134,9 +1135,9 @@ def plays_from_pack(run_id: int, pack: HierarchyPack) -> pd.DataFrame:
             {
                 "theme": "close_month" if mtd.get("open") else "recover",
                 "title": nat.get("headline") or (
-                    f"National hole {nat['gap_mt']:+.0f} MT vs expected"
+                    f"National hole {fmt_mt(nat['gap_mt'], signed=True)} vs expected"
                     if nat.get("gap_mt", 0) < -1
-                    else f"National {nat['volume_mt']:.0f} MT"
+                    else f"National {fmt_mt(nat['volume_mt'])}"
                 ),
                 "why": nat.get("weather") or "",
                 "do_this_week": nat.get("action_summary") or nat.get("problem") or "",
@@ -1183,7 +1184,7 @@ def plays_from_pack(run_id: int, pack: HierarchyPack) -> pd.DataFrame:
         plays.append(
             {
                 "theme": theme,
-                "title": f"{city_name}: {city['verdict']} · {str(city['diagnosis']).replace('_', ' ')} ({city['gap_mt']:+.0f} MT)",
+                "title": f"{city_name}: {city['verdict']} · {str(city['diagnosis']).replace('_', ' ')} ({fmt_mt(city['gap_mt'], signed=True)})",
                 "why": city["do_this_week"],
                 "do_this_week": (
                     ("Focus distributors: " + ", ".join(str(d) for d in dist_names) + ". " if dist_names else "")

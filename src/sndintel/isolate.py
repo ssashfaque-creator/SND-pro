@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from sndintel.io_utils import shift_period
+from sndintel.materiality import unit_material_mt
 from sndintel.season import intra_month_fraction  # re-export for callers / tests
 
 
@@ -261,7 +262,7 @@ def _situation_label(r: pd.Series) -> str:
         vol = r.get("volume_mt")
         comp = (float(vol) - exp) if vol is not None and not pd.isna(vol) and exp else r.get("isolated_mt")
     gap = float(comp or 0)
-    material = max(0.5, 0.02 * exp) if exp >= 8 else max(0.15, 0.05 * max(exp, 0.0))
+    material = unit_material_mt(exp)
     if gap <= -material:
         return "lagging"
     if gap >= material:
