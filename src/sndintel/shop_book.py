@@ -1041,10 +1041,14 @@ def _headline(kpis: dict[str, Any], scope_label: str, label: str, open_mtd: bool
         )
         return headline, weather
     hole = float(kpis.get("gap_mt") or 0)
-    headline = (
-        f"{scope_label} closed {label}: billed {fmt_mt(billed)} versus Expected {fmt_mt(expected)} "
-        f"(gap {fmt_mt(hole)})."
-    )
+    ahead = max(0.0, billed - expected)
+    if hole > 0.0005:
+        verdict = f"(gap {fmt_mt(hole)})"
+    elif ahead > 0.0005:
+        verdict = f"(ahead by {fmt_mt(ahead)}, gap 0 kg)"
+    else:
+        verdict = "(on Expected, gap 0 kg)"
+    headline = f"{scope_label} closed {label}: billed {fmt_mt(billed)} versus Expected {fmt_mt(expected)} {verdict}."
     official = kpis.get("official_expected_mt")
     factor = kpis.get("expected_factor")
     recon = ""
