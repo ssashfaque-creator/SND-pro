@@ -96,7 +96,7 @@ def rescore():
     """Rebuild city → shop scorecards from the warehouse. Does not re-read a sales file."""
     result = rescore_warehouse()
     console.print_json(data=result)
-    brief()
+    brief(limit=20)
 
 
 @app.command()
@@ -109,7 +109,7 @@ def demo(
     console.print(f"Wrote sample files to {SAMPLE_DIR}")
     result = run_pipeline(paths["sales"], shop_path=paths["shops"])
     console.print_json(data={k: v for k, v in result.items() if k != "warnings"})
-    brief()
+    brief(limit=20)
 
 
 @app.command()
@@ -132,10 +132,14 @@ def brief(limit: int = typer.Option(20, help="How many ranked insights to show")
         if state["open"] and pd.notna(row.get("run_rate_yoy_pct")):
             yoy_txt = f"run-rate {row['run_rate_yoy_pct']:+.1f}%"
         console.print(banner_text(ledger, row["period"]))
+        mom_val = row["comparable_mom_pct"] if pd.notna(row.get("comparable_mom_pct")) else row["mom_pct"]
+        mom_txt = f"{float(mom_val):+.1f}%" if pd.notna(mom_val) else "n/a"
+        if isinstance(yoy_txt, (int, float)) and pd.notna(yoy_txt):
+            yoy_txt = f"{float(yoy_txt):+.1f}%"
         console.print(
             f"[bold]Period {row['period']}[/]  volume {vol_label}  "
             f"strike {row['strike_rate']*100:.0f}%  billed {int(row['billed_outlets'])}/{int(row['universe_outlets'])}  "
-            f"MoM {row['comparable_mom_pct'] if pd.notna(row.get('comparable_mom_pct')) else (row['mom_pct'] if pd.notna(row['mom_pct']) else 'n/a')}  "
+            f"MoM {mom_txt}  "
             f"YoY {yoy_txt}"
         )
     with connect() as conn:

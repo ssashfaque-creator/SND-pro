@@ -203,7 +203,9 @@ def city_driver_table(units: pd.DataFrame, shops: pd.DataFrame | None = None) ->
     cities = units[units["grain"] == "city"].copy()
     if cities.empty:
         return pd.DataFrame()
-    rec = pd.to_numeric(cities.get("isolated_mt"), errors="coerce").fillna(0).clip(upper=0).abs()
+    from sndintel.briefing import true_gap_mt
+
+    rec = true_gap_mt(cities)
     unb = pd.to_numeric(cities.get("from_unbilled_mt"), errors="coerce").fillna(0)
     unv = pd.to_numeric(cities.get("from_unvisited_mt"), errors="coerce").fillna(0)
     drop = pd.to_numeric(cities.get("from_drop_size_mt"), errors="coerce").fillna(0)

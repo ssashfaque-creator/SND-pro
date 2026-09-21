@@ -666,7 +666,7 @@ def focus_pack(pack: StrategyPack, report_type: str, entity: str) -> StrategyPac
 
 
 def score_shops(shop_month: pd.DataFrame, cities: pd.DataFrame, period: str, pace: float) -> pd.DataFrame:
-    """Shop hole versus its own Expected. Recoverable = that miss after EB shrink."""
+    """Shop hole versus its own Expected. Gap = Expected − billed; EB shrink only orders the list."""
     if shop_month is None or shop_month.empty or not period:
         return pd.DataFrame()
     yoy = shift_period(period, -12)
@@ -699,7 +699,9 @@ def score_shops(shop_month: pd.DataFrame, cities: pd.DataFrame, period: str, pac
     k_shop = k_from_ly(gaps["ly_mt"], 0.05)
     size = ly_s.where(ly_s >= exp, exp)
     gaps["isolated_mt"] = [empirical_bayes(c, s, k_shop) for c, s in zip(gaps["competitive_mt"], size)]
-    gaps["recoverable_mt"] = gaps["isolated_mt"].clip(upper=0).abs()
+    # One Gap definition across every pack: Expected − billed, floored at 0.
+    # The shrunk residual stays as isolated_mt for ordering only.
+    gaps["recoverable_mt"] = (exp - vol).clip(lower=0)
     gaps["store_name"] = gaps["store_name"].replace("", pd.NA).fillna(gaps["store_id"])
     return gaps.loc[gaps["recoverable_mt"] > 0].copy()
 
@@ -1187,11 +1189,25 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
 
 # ----- internals -----
 
+def true_gap_mt(frame: pd.DataFrame) -> pd.Series:
+    """Gap (MT) printed on every pack: Expected − billed, floored at 0.
+
+    ``isolated_mt`` (the Empirical-Bayes shrunk residual) is kept for ranking
+    and the situation label's ordering, but is never printed as the gap — a
+    reader adds the column and expects it to meet the scope's gap.
+    """
+    if frame is None or frame.empty:
+        return pd.Series(dtype=float)
+    exp = pd.to_numeric(frame.get("expected_mt"), errors="coerce") if "expected_mt" in frame.columns else pd.Series(0.0, index=frame.index)
+    vol = pd.to_numeric(frame.get("volume_mt"), errors="coerce") if "volume_mt" in frame.columns else pd.Series(0.0, index=frame.index)
+    return (exp.fillna(0.0) - vol.fillna(0.0)).clip(lower=0)
+
+
 def _grain(units: pd.DataFrame, grain: str) -> pd.DataFrame:
     out = units[units["grain"] == grain].copy()
     if out.empty:
         return out
-    out["recoverable_mt"] = pd.to_numeric(out.get("isolated_mt"), errors="coerce").fillna(0).clip(upper=0).abs()
+    out["recoverable_mt"] = true_gap_mt(out)
     drop = pd.to_numeric(out.get("from_drop_size_mt"), errors="coerce")
     if drop.isna().all():
         drop = pd.to_numeric(out.get("velocity_effect_mt"), errors="coerce")

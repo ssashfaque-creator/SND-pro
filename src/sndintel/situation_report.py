@@ -692,17 +692,10 @@ def _with_gap_parts(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df if df is not None else pd.DataFrame()
     out = df.copy()
-    if "isolated_mt" in out.columns:
-        iso = pd.to_numeric(out["isolated_mt"], errors="coerce")
-        rec = iso.clip(upper=0).abs()
-    else:
-        rec = pd.Series(0.0, index=out.index)
     exp = pd.to_numeric(out["expected_mt"], errors="coerce") if "expected_mt" in out.columns else pd.Series(0.0, index=out.index)
     vol = pd.to_numeric(out["volume_mt"], errors="coerce") if "volume_mt" in out.columns else pd.Series(0.0, index=out.index)
-    hole = (exp.fillna(0) - vol.fillna(0)).clip(lower=0)
-    if float(rec.fillna(0).sum()) < 0.05:
-        rec = hole
-    out["recoverable_mt"] = rec.fillna(hole)
+    # Gap is Expected − billed on every pack; the EB residual never replaces it.
+    out["recoverable_mt"] = (exp.fillna(0) - vol.fillna(0)).clip(lower=0)
     for col in ("from_drop_size_mt", "from_unbilled_mt", "from_unvisited_mt"):
         if col not in out.columns:
             out[col] = 0.0

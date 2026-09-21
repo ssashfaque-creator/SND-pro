@@ -19,6 +19,8 @@ import pandas as pd
 WINDOW_DAYS = 90
 DUE_RATIO = 0.8
 LAPSE_MULTIPLIER = 3.0
+LAPSE_MIN_DAYS = 45.0
+COLD_LAPSE_DAYS = 60.0
 DEFAULT_API_DAYS = 14.0
 MIN_GAP_DAYS = 2
 MAX_GAP_DAYS = 120
@@ -47,6 +49,11 @@ def attach_demand_cycles(shops: pd.DataFrame, shop_day: pd.DataFrame, as_of_ts: 
       second bill is observed (cycle_days stays empty — 14 is not a measured gap).
     * 2 purchases → mean drop; cycle = the one interval (else Ask still uses 14).
     * 3+ in the window → median drop and median gap (2–120 days).
+
+    Lapse cut-off is ``max(3 × API, 45 days)``. A weekly shop that skipped a
+    fortnight is not a lost door; a five-day cycle must not produce a 15-day
+    lapse. When the cycle is not measured (one bill, default API) the door is
+    only lapsed after 60 quiet days.
     """
     out = shops.copy()
     out["cycle_days"] = np.nan
@@ -142,6 +149,19 @@ def _monthly_as_purchases(row: pd.Series, as_of_ts: pd.Timestamp) -> pd.DataFram
     return pd.DataFrame([{"store_id": str(row["store_id"]), "sale_date": ts, "volume_mt": last_vol}])
 
 
+def lapse_cutoff_days(api: float | None, measured: bool = True) -> float:
+    """Quiet days after which a door counts as lapsed."""
+    if not measured or api is None or pd.isna(api) or float(api) <= 0:
+        return float(COLD_LAPSE_DAYS)
+    return float(max(LAPSE_MULTIPLIER * float(api), LAPSE_MIN_DAYS))
+
+
+def is_lapsed(dslp: float | None, api: float | None, measured: bool = True) -> bool:
+    if dslp is None or pd.isna(dslp):
+        return False
+    return bool(float(dslp) > lapse_cutoff_days(api, measured))
+
+
 def _shop_demand_stats(hist: pd.DataFrame, as_of_ts: pd.Timestamp, window_start: pd.Timestamp) -> dict[str, Any]:
     empty = {
         "api": np.nan,
@@ -182,17 +202,17 @@ def _shop_demand_stats(hist: pd.DataFrame, as_of_ts: pd.Timestamp, window_start:
     elif n_90d == 1:
         expected_drop = float(vols.iloc[0]) if len(vols) else 0.0
         api = DEFAULT_API_DAYS
-        lapsed = bool(pd.notna(dslp) and dslp > LAPSE_MULTIPLIER * api)
+        lapsed = is_lapsed(dslp, api, measured=False)
         ratio = dslp / api if api else np.nan
     elif n_90d == 2:
         expected_drop = float(vols.mean()) if len(vols) else 0.0
         api = float(gaps.iloc[0]) if len(gaps) else DEFAULT_API_DAYS
-        lapsed = bool(pd.notna(dslp) and dslp > LAPSE_MULTIPLIER * api)
+        lapsed = is_lapsed(dslp, api, measured=bool(len(gaps)))
         ratio = dslp / api if api else np.nan
     else:
         expected_drop = float(vols.median()) if len(vols) else 0.0
         api = float(gaps.median()) if len(gaps) else DEFAULT_API_DAYS
-        lapsed = bool(pd.notna(dslp) and dslp > LAPSE_MULTIPLIER * api)
+        lapsed = is_lapsed(dslp, api, measured=bool(len(gaps)))
         ratio = dslp / api if api else np.nan
 
     return {

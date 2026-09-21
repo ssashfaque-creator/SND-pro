@@ -27,6 +27,11 @@ from sndintel.io_utils import prior_periods
 
 NATIONAL_DAY_MIN_MONTHS = 2
 NATIONAL_DAY_MIN_DAYS = 8
+# A single shop-month above this multiple of the shop's own billed-month median
+# is a stock-up or a promotion load, not a new run-rate. It is capped before
+# the shop's Expected is formed (city and national levels are never capped).
+SHOP_WINSOR_MULT = 2.5
+SHOP_WINSOR_MIN_BILLED = 3
 
 
 def _finite(value: Any, default: float = 1.0) -> float:
@@ -540,6 +545,34 @@ def reconcile_expected(
     return pd.concat(parts, ignore_index=True) if parts else children
 
 
+def winsorise_shop_months(
+    hist: pd.DataFrame,
+    mult: float = SHOP_WINSOR_MULT,
+    min_billed: int = SHOP_WINSOR_MIN_BILLED,
+) -> pd.DataFrame:
+    """Cap each shop-month at ``mult`` × that shop's median billed month.
+
+    Only shops with at least ``min_billed`` billed months are capped — with
+    fewer there is no "typical" month to compare against. Zero months are left
+    as they are (they are the shop's real cadence, not outliers).
+    """
+    if hist is None or hist.empty or "volume_mt" not in hist.columns or "store_id" not in hist.columns:
+        return hist
+    work = hist.copy()
+    work["volume_mt"] = pd.to_numeric(work["volume_mt"], errors="coerce").fillna(0.0)
+    billed = work.loc[work["volume_mt"] > 0]
+    if billed.empty:
+        return work
+    grp = billed.groupby("store_id")["volume_mt"]
+    med = grp.median()
+    n = grp.size()
+    cap = (med * float(mult)).where(n >= int(min_billed))
+    cap_s = work["store_id"].map(cap)
+    over = cap_s.notna() & (work["volume_mt"] > cap_s)
+    work.loc[over, "volume_mt"] = cap_s[over]
+    return work
+
+
 def fit_shop_expected(
     shop_month: pd.DataFrame,
     period: str,
@@ -549,7 +582,8 @@ def fit_shop_expected(
     """Per-shop Expected: last-3-month AMS blended with last-6-month median, shrunk toward the city.
 
     Sparse doors borrow the city's Expected via AMS mix. Never-billed whitespace stays 0.
-    No calendar-month seasonal index.
+    No calendar-month seasonal index. Shop months are winsorised first so one
+    loading month does not become the shop's Expected for the next quarter.
     """
     empty = pd.DataFrame(columns=["store_id", "city", "expected_full_mt", "expected_mt", "credibility"])
     if shop_month is None or shop_month.empty or not period:
@@ -567,7 +601,7 @@ def fit_shop_expected(
         for _, r in fit.city_expected.iterrows():
             city_full[str(r["city"])] = float(r.get("expected_full_mt") or 0.0)
 
-    hist = hist.copy()
+    hist = winsorise_shop_months(hist.copy())
     recent_list = prior_periods(period, 3)
     recent_ps = set(recent_list)
     longer_ps = set(prior_periods(period, 6))

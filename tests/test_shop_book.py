@@ -36,7 +36,7 @@ def test_closed_month_lists_missed_expected_largest_hole_first():
     assert "Quiet K" in set(issues["Shop"].astype(str))
     # Lahore Ace beat or held Expected — not an issue.
     assert "Big L" not in set(issues["Shop"].astype(str))
-    gap = pd.to_numeric(issues["Gap (MT)"], errors="coerce").fillna(0)
+    gap = pd.to_numeric(issues["Gap (kg)"], errors="coerce").fillna(0)
     assert gap.is_monotonic_decreasing or len(issues) <= 1
     blob = " ".join(issues["Comment"].astype(str).tolist()).lower()
     assert "this week" not in blob
@@ -49,8 +49,8 @@ def test_closed_month_lists_missed_expected_largest_hole_first():
             assert "every" in blob
             assert "days" in blob
     assert "Ask (KG)" not in issues.columns
-    assert "Usual drop (MT)" in issues.columns
-    assert "Gap (MT)" in issues.columns
+    assert "Usual drop (kg)" in issues.columns
+    assert "Gap (kg)" in issues.columns
 
 
 def test_closed_expected_matches_action_pack():
@@ -99,7 +99,7 @@ def test_mtd_does_not_flag_still_to_expected_as_the_issue_list():
     assert book.open_mtd is True
     assert "Ask (KG)" in book.shops.columns
     assert "Do this" in book.shops.columns
-    assert "Gap (MT)" not in book.shops.columns
+    assert "Gap (kg)" not in book.shops.columns
     remaining = pd.to_numeric(book.raw["remaining_mt"], errors="coerce").fillna(0)
     # Mid-month almost every shop still has a full-month hole. That must not be the issue list.
     behind = int((remaining > 0.05).sum())
@@ -188,10 +188,10 @@ def test_unbilled_is_billed_zero_not_a_tiny_invoice():
     assert float(mix.loc[ISSUE_MISSED, "Billed (MT)"]) == 0.02
     assert float(mix.loc[ISSUE_MISSED, "Expected (MT)"]) == 4.92
     zero_comment = str(book.issues.loc[book.issues["Shop"] == "Visited Zero", "Comment"].iloc[0]).lower()
-    assert "visited but billed 0.00" in zero_comment
+    assert "visited but billed 0 versus" in zero_comment
     assert "not a lost door" in zero_comment
     tiny_comment = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Comment"].iloc[0]).lower()
-    assert "visited but billed 0.00" not in tiny_comment
+    assert "visited but billed 0 versus" not in tiny_comment
     assert "2.92" in tiny_comment
     assert "usual drop is 1.71 mt every 14 days" in tiny_comment
     last = str(book.issues.loc[book.issues["Shop"] == "Tiny Invoice", "Last billed"].iloc[0])
@@ -267,8 +267,9 @@ def test_pdf_and_excel_are_real_files():
     assert xls[:2] == b"PK"
     wb = load_workbook(BytesIO(xls))
     assert "00 Cover" in wb.sheetnames
-    assert "02 Issues" in wb.sheetnames
-    assert "03 All shops" in wb.sheetnames
+    assert any(name.endswith("Roll-up") for name in wb.sheetnames)
+    assert any(name.endswith("Issues") for name in wb.sheetnames)
+    assert any(name.endswith("All shops") for name in wb.sheetnames)
 
 
 def _karachi_cover_units(*, volume: float, expected: float) -> pd.DataFrame:
@@ -334,7 +335,7 @@ def test_cover_gap_is_net_not_sum_of_shop_remainings():
     assert abs(float(book.kpis["expected_mt"]) - 8.0) < 1e-9
     assert abs(float(book.kpis["gap_mt"])) < 1e-9
     assert abs(float(book.kpis["issue_mt"]) - 4.0) < 1e-9
-    assert "gap 0.00 mt" in book.headline.lower()
+    assert "gap 0 kg" in book.headline.lower()
 
 
 def test_cover_target_is_plan_book_not_matched_pop_sum():
@@ -400,12 +401,21 @@ def test_cover_target_is_plan_book_not_matched_pop_sum():
     )
     assert abs(float(book.kpis["matched_target_mt"]) - 2.0) < 1e-9
     assert abs(float(book.kpis["target_mt"]) - 10.0) < 1e-9
-    # Cover billed is the shops in the pack (11), not a separate scorecard overlay.
+    # Cover billed and Expected are the shops in the pack (11 vs 8), never rescaled to the scorecard.
     assert abs(float(book.kpis["billed_mt"]) - 11.0) < 1e-9
-    assert abs(float(book.kpis["expected_mt"]) - 30.0) < 1e-9
-    assert abs(float(book.kpis["gap_mt"]) - 19.0) < 1e-9
+    assert abs(float(book.kpis["expected_mt"]) - 8.0) < 1e-9
+    assert abs(float(book.kpis["gap_mt"])) < 1e-9
+    # The cascade figure is carried beside it with its factor, not blended in.
+    assert abs(float(book.kpis["official_expected_mt"]) - 30.0) < 1e-9
+    assert abs(float(book.kpis["expected_factor"]) - 3.75) < 1e-9
+    assert "3.75" in book.weather
     assert abs(float(book.kpis["vs_target_mt"]) - 1.0) < 1e-9
     assert abs(float(book.raw.set_index("store_id").loc["K1", "shop_target_mt"]) - 2.0) < 1e-9
+    # Shop K1 is judged on its own run-rate: 1 vs 5 is a miss regardless of the city factor.
+    assert book.raw.set_index("store_id").loc["K1", "issue"] == ISSUE_MISSED
+    # Target 10 vs run-rate 8: 2 MT of the plan is ambition, not execution.
+    assert abs(float(book.kpis["ambition_mt"]) - 2.0) < 1e-9
+    assert "ambition" in book.kpis["target_credibility"].lower()
 
 
 def test_city_cover_matches_situation_scorecard():
@@ -493,10 +503,10 @@ def test_presented_gap_equals_expected_minus_billed():
     by_name = book.raw.set_index("store_name")["issue"].astype(str)
     assert by_name["Zero Display"] == ISSUE_MISSED
     for _, row in book.shops.iterrows():
-        billed = float(row["Billed (MT)"])
-        expected = float(row["Expected (MT)"])
-        gap = float(row["Gap (MT)"])
-        assert abs(gap - (expected - billed)) < 1e-9
+        billed = int(row["Billed (kg)"])
+        expected = int(row["Expected (kg)"])
+        gap = int(row["Gap (kg)"])
+        assert gap == expected - billed
     tot = book.mix.set_index("Issue").loc["Total"]
     assert abs(float(tot["Gap (MT)"]) - (float(tot["Expected (MT)"]) - float(tot["Billed (MT)"]))) < 1e-9
     assert abs(float(book.kpis["gap_mt"]) - max(0.0, float(book.kpis["expected_mt"]) - float(book.kpis["billed_mt"]))) < 1e-9
@@ -774,7 +784,8 @@ def test_tiny_bucket_is_expected_not_billed():
     )
     book = build_shop_book(action=pack, period="2026-08", scope="city", city="Lahore")
     by_name = book.raw.set_index("store_name")["issue"].astype(str)
-    assert by_name["Tiny Expected Whale"] == MIX_OTHER
+    # A door that billed 2 MT is material whatever its 30 kg history says.
+    assert by_name["Tiny Expected Whale"] == "Beat Expected"
     assert by_name["Small Expected"] == MIX_OTHER
     assert by_name["Live Zero"] == ISSUE_MISSED
     assert by_name["Lost Door"] == ISSUE_LAPSED
@@ -784,11 +795,13 @@ def test_tiny_bucket_is_expected_not_billed():
     assert "Unvisited" not in mix.index
     assert MIX_OTHER in mix.index
     tiny = mix.loc[MIX_OTHER]
-    assert int(tiny["Shops"]) == 2
-    assert float(tiny["Expected (MT)"]) <= 0.05 + 0.04 + 1e-9
+    assert int(tiny["Shops"]) == 1
+    assert float(tiny["Expected (MT)"]) <= 0.04 + 1e-9
     for _, row in book.raw.iterrows():
-        if float(row["expected_mt"]) > 0.05:
+        if max(float(row["expected_mt"]), float(row["billed_mt"])) >= 0.05:
             assert str(row["issue"]) != MIX_OTHER
+    assert not book.tail.empty
+    assert int(book.tail.iloc[0]["Tail doors"]) == 1
     lost = str(book.issues.loc[book.issues["Shop"] == "Lost Door", "Comment"].iloc[0]).lower()
     assert "lost door" in lost
     assert "not unbilled" in lost
@@ -796,4 +809,4 @@ def test_tiny_bucket_is_expected_not_billed():
     live = str(book.issues.loc[book.issues["Shop"] == "Live Zero", "Comment"].iloc[0]).lower()
     assert "missed expected" in live
     assert "not a lost door" in live
-    assert "billed 0.00" in live
+    assert "billed 0 versus" in live

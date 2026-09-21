@@ -28,7 +28,9 @@ from sndintel.demand import (
     ACTION_LIFT,
     ACTION_RECOVER,
     DUE_RATIO,
+    LAPSE_MIN_DAYS,
     LAPSE_MULTIPLIER,
+    lapse_cutoff_days,
     attach_demand_cycles,
     attach_pipeline,
     classify_demand_actions,
@@ -654,7 +656,8 @@ def _instruction(row: Any) -> str:
         )
     if action == ACTION_RECOVER:
         if pd.notna(cycle):
-            cut = f"(cut-off is {int(LAPSE_MULTIPLIER)}× the {cycle_s} cycle)"
+            cut_days = int(round(lapse_cutoff_days(float(cycle), measured=True)))
+            cut = f"(cut-off is {cut_days} days: {int(LAPSE_MULTIPLIER)}× the {cycle_s} cycle, never under {int(LAPSE_MIN_DAYS)})"
         else:
             cut = "(no purchase in the last 90 days)"
         return f"Lapsed — lost door: {name} has been quiet {since_s} {cut}. Ask is 0.{last_bit}"
