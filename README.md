@@ -56,25 +56,38 @@ This is **not** a forecast. The model keeps three numbers the way Oracle SVP / S
 
 Stretch = max(0, paced Target − Expected) is ambition, not a coverage miss. Gap on the board is still billed vs Expected. Shop matching is conservative (exact city+distributor+name; whales ≥ 1 MT are never fuzzy-matched). Unmatched names still count in the city/DSR book if Area folds onto a unique live city. Warehouse → Shop plan shows match rate and unmatched rows.
 
-No extra LLM or ML is used on this file. Name-matching models mis-assign kiryana whales; XGBoost Expected already carries seasonality and national day shape.
+No extra LLM or ML is used on this file. Name-matching models mis-assign kiryana whales; the run-rate Expected already carries the national day shape.
 
-## What the machine actually learns
+## What the machine actually computes
 
-Monthly shop data is sparse. The pipeline does **not** pretend a neural net can “understand Excel”. It builds a stack that companies like Nielsen / IRI / FireAI-style S&D platforms use, adapted to one monthly MTD file:
+Monthly shop data is sparse. The pipeline does **not** pretend a neural net can “understand Excel”, and it does not run a second model beside the pack's Expected. There is **one Expected** and every number in every pack is derived from it:
 
-1. **Baselines (XGBoost, with a rolling-median fallback)**  
-   For every shop-month: lags, 3/6-month rolling means, seasonality (month sine/cosine), SKU depth, billed rate. The model answers: *given this outlet’s history, what volume was expected this month?* Residual = surprise.
+1. **Expected (run-rate baseline)**  
+   For every unit and every shop: last-three-month AMS blended with the last-six-month median, paced by the national day curve when the month is open. Shop months are **winsorised** (capped at 2.5× the shop's median billed month) before the run-rate is taken, so one loading month does not become next quarter's Expected. Sparse doors shrink toward their city. The shop history chart draws this same line — there is no separate ML forecast.
 
-2. **Anomalies (Isolation Forest + rules)**  
-   A shop-month vector (own z-score, MoM, vs section, drop-size vs median, mix concentration, recency) is scored. Rules then *name* the surprise:
-   - **Trade loading / stock dump** — this month ≥ 2.5× the shop’s typical drop
-   - **Drop-off / lapse** — regular billed shop went quiet
+2. **Gap = Expected − Billed, floored at 0**  
+   The same definition on the briefing, the Monday dispatch, the situation cascade and the shop book. A unit that beat Expected shows Gap 0 and the surplus under *Ahead by*. The Empirical-Bayes shrunk residual only **ranks** lists; it is never printed as an amount.
+
+3. **Materiality is relative**  
+   A unit (DSR / distributor / city / country) is off Expected when the difference exceeds 5% of Expected for small books, 2% for large ones, never under 150 kg (`materiality.unit_material_mt`). A shop is off Expected past 20% and 10 kg. Within each DSR the doors outside the top 80% of size are **tail** and are judged as a coverage panel (doors billed vs usual), not as individual holes.
+
+4. **Anomalies (rules only, against that Expected)**  
+   - **Trade loading / stock dump** — this month ≥ 2.5× the shop’s run-rate Expected (the same multiple the winsoriser distrusts)
+   - **Drop-off** — closed month, billed under 40% of a material Expected
+   - **Quiet month** — closed month, billed 0 on a regular small biller (billed in at least half of the prior twelve months, run-rate ≥ 10 kg). The shop book decides *lost door* by days since last bill, `max(3 × cycle, 45 days)`; this is the early-warning list
    - **Lumpy** — high coefficient of variation (spike-and-skip cadence)
+   No unsupervised outlier bucket: every flag names the rule that raised it.
 
-3. **Outlet clustering (K-Means on RFM + trend)**  
-   Recency, billed-month frequency, average drop, 3-vs-3 trend, SKU breadth, lumpiness. Clusters are relabelled into language a NSM can use: Star Account, Growth Target, Declining Core, Churn Risk, Dormant, Lumpy / Loaded, Long Tail, Stable Core.
+5. **Outlet segments (fixed thresholds on RFM + trend)**  
+   Recency, billed-month frequency, average drop, 3-vs-3 trend **relative to the market median**, SKU breadth, lumpiness → Star Account, Growth Target, Declining Core, Churn Risk, Dormant, Lumpy / Loaded, Long Tail, Stable Core. The same shop gets the same label on the same data; nothing is seeded.
 
-4. **Diagnostics (no model required, but they use the baselines)**  
+6. **Next-order size (`nextdrop`)**  
+   The only fitted model left: a pooled gradient-boosted regressor on billed-day sequences, using only what was known before each bill, that sizes this week's Ask when the last drop was fat or thin. Thin history falls back to the median drop. It never touches Expected or Gap.
+
+7. **POP code hygiene (`dupes`)**  
+   Two codes under one DSR with the same invoices on the same days are flagged *duplicate*; a same-name door that started billing when another stopped is *migrated*. Flagged codes are shown on the shop book instead of being called lost.
+
+8. **Diagnostics (no model required, but they use the same Expected)**  
    - Micro vs macro divergence (section −10% while national +5% = local execution miss)
    - SKU cannibalization (share shift + negative correlation of month-to-month changes)
    - Strike rate / numeric distribution vs universe
@@ -201,7 +214,12 @@ src/sndintel/
   ui/app.py            Local app: upload + strategy pack
   mtd.py               Closed vs open MTD from SSRS execution date
   features.py          Shop-month panel, lags, z-scores
-  models.py            XGBoost, Isolation Forest, K-Means
+  models.py            Run-rate baseline per shop-month, rule anomalies, RFM segments
+  nextdrop.py          Next-order size (pooled GBM on billed-day sequences, median fallback)
+  dupes.py             Duplicate / migrated POP-code detection
+  demand.py            Depletion cycle, due / not due, lapse cut-off
+  season.py            Expected engine (winsorised last-3 / last-6 run-rate, day curve)
+  fmt.py               Number formatting: kg under 0.1 MT, two-decimal MT, never whole tons
   insights.py          Ranked narratives + KPI snapshots
   dashboard_app.py     Streamlit briefing
   api.py               FastAPI
@@ -209,6 +227,6 @@ src/sndintel/
   sampledata.py        Synthetic company (Quetta / Karachi / Lahore edible oil)
 ```
 
-Warehouse: `data/warehouse.db`. Models: `data/models/`.
+Warehouse: `data/warehouse.db`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full blueprint (ingestion, scoring, agent contract).

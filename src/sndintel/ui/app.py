@@ -49,6 +49,7 @@ from sndintel.situation_report import (
 )
 from sndintel import __version__
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
+from sndintel.fmt import fmt_mt
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
 from sndintel.mtd import banner_text, format_period_label, period_state
 from sndintel.monday import monday_summary_sheets
@@ -500,7 +501,7 @@ def _page_upload(empty: bool):
         f"latest {result.get('latest_period')} · "
         f"{result.get('n_cities', 0)} cities · universe {result.get('n_universe') or '—'} · "
         f"visits {result.get('n_visits') or '—'} · "
-        f"plan {result.get('n_plan_matched') or '—'} shops / {result.get('plan_matched_mt') or 0:.0f} MT matched. "
+        f"plan {result.get('n_plan_matched') or '—'} shops / {fmt_mt(result.get('plan_matched_mt'))} matched. "
         f"{'Replaced all billed sales. ' if result.get('replace_sales') else overlay_note}"
         f"Months: {', '.join(result.get('replaced_periods') or []) or '—'}"
     )
@@ -634,7 +635,7 @@ def _page_strategy(data, _latest, period, mtd, ledger):
         )
     st.caption(
         "Excel is the working file (filters, one sheet per layer). "
-        "PDF is the board pack — whole numbers, remarks as bullets in the last column. "
+        "PDF is the board pack — MT to two decimals, remarks as bullets in the last column. "
         "For a city / distributor / DSR pack, use **Report**. "
         "National summary has two rankings per grain: Gap tons (the books that close the month) "
         "and seriousness (Gap ÷ √Expected — collapsed mid-size names). Whales are AMS / last drop ≥ 1 MT. "
@@ -1163,16 +1164,16 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
     has_plan = float(kpis.get("target_mt") or 0) > 0.05
     if open_mtd:
         cols = st.columns(6 if has_plan else 4)
-        cols[0].metric("Billed so far (MT)", f"{float(kpis.get('billed_mt') or 0):.0f}")
-        cols[1].metric("Projected month-end (MT)", f"{float(kpis.get('projected_mt') or 0):.0f}")
+        cols[0].metric("Billed so far", fmt_mt(float(kpis.get('billed_mt') or 0)))
+        cols[1].metric("Projected month-end", fmt_mt(float(kpis.get('projected_mt') or 0)))
         if has_plan:
             attain = kpis.get("attain_pct")
             cols[2].metric(
-                "Monthly target (MT)",
-                f"{float(kpis.get('target_mt') or 0):.0f}",
+                "Monthly target",
+                fmt_mt(float(kpis.get('target_mt') or 0)),
                 delta=None if attain is None else f"{float(attain)*100:.0f}% of target",
             )
-            cols[3].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.0f}")
+            cols[3].metric("vs Target", fmt_mt(float(kpis.get('vs_target_mt') or 0), signed=True))
             cols[4].metric("Situation", str(kpis.get("situation_label") or "—"))
             cols[5].metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
         else:
@@ -1180,20 +1181,20 @@ def _page_situation_cascade(data, units, period, mtd, ledger):
             cols[3].metric("Lagging people", int(kpis.get("n_lagging_people") or 0))
         today = float(kpis.get("expected_today_mt") or 0)
         if today > 0.05:
-            st.caption(f"Should have billed {today:.0f} MT by today (Expected × the national day curve).")
+            st.caption(f"Should have billed {fmt_mt(today)} by today (Expected × the national day curve).")
     else:
         cols = st.columns(6 if has_plan else 4)
-        cols[0].metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.0f}")
-        cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_full_mt') or kpis.get('expected_mt') or 0):.0f}")
-        cols[2].metric("Gap vs Expected (MT)", f"{float(kpis.get('gap_mt') or 0):.0f}")
+        cols[0].metric("Billed", fmt_mt(float(kpis.get('billed_mt') or 0)))
+        cols[1].metric("Expected", fmt_mt(float(kpis.get('expected_full_mt') or kpis.get('expected_mt') or 0)))
+        cols[2].metric("Gap vs Expected", fmt_mt(float(kpis.get('gap_mt') or 0)))
         if has_plan:
             attain = kpis.get("attain_pct")
             cols[3].metric(
-                "Monthly target (MT)",
-                f"{float(kpis.get('target_mt') or 0):.0f}",
+                "Monthly target",
+                fmt_mt(float(kpis.get('target_mt') or 0)),
                 delta=None if attain is None else f"{float(attain)*100:.0f}% of target",
             )
-            cols[4].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.0f}")
+            cols[4].metric("vs Target", fmt_mt(float(kpis.get('vs_target_mt') or 0), signed=True))
             cols[5].metric("Situation", str(kpis.get("situation_label") or "—"))
         else:
             cols[3].metric("Situation", str(kpis.get("situation_label") or "—"))
@@ -1849,12 +1850,12 @@ def _page_shops(data, period):
     fc = data["forecasts"]
     fc = fc[(fc["entity_type"] == "shop") & (fc["entity_id"] == sid)]
     if not fc.empty:
-        fig.add_scatter(x=fc["period"], y=fc["predicted"], name="ML forecast (not official Expected)", mode="lines+markers")
+        fig.add_scatter(x=fc["period"], y=fc["predicted"], name="Run-rate Expected (same formula as the pack)", mode="lines+markers")
     fig.update_layout(height=320)
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
-        "Official Expected on the board pack is last-three-month run-rate, paced. "
-        "The line above is a shop-month ML forecast and is not used for Gap or this-week Ask."
+        "The line is this shop's own run-rate Expected for each month (last-three-month AMS blended with the "
+        "last-six-month median, winsorised) — the same formula the packs use, unpaced. There is no separate ML forecast."
     )
     st.dataframe(hist, use_container_width=True, hide_index=True)
 
@@ -1900,8 +1901,8 @@ def _page_warehouse(data):
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Plan shops", f"{len(plan):,}")
         c2.metric("Matched shops", f"{len(matched):,}")
-        c3.metric("Book (MT)", f"{book_mt:.0f}")
-        c4.metric("Matched (MT)", f"{matched_mt:.0f}", delta=f"{coverage:.0%} of book")
+        c3.metric("Book", fmt_mt(book_mt))
+        c4.metric("Matched", fmt_mt(matched_mt), delta=f"{coverage:.0%} of book")
         st.caption(
             "Target is the sales-team quota, not Expected. Country / city / DSR plan uses the full submitted book "
             "(unmatched names still roll if Area matches a live city). Shop identity is conservative — whales need an exact name."

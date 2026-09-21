@@ -11,6 +11,7 @@ import pandas as pd
 
 from sndintel.config import DIVERGENCE_GAP_PP, MIN_VOLUME_FLAG_MT
 from sndintel.features import latest_period, previous_period
+from sndintel.fmt import fmt_mt
 from sndintel.io_utils import shift_period
 from sndintel.materiality import classify_gap_shops, must_visit_recoveries
 from sndintel.mtd import period_state
@@ -575,7 +576,7 @@ def _anomaly_insights(
                     entity_name=store_name,
                     title=f"Possible stock dump at {store_name}",
                     narrative=(
-                        f"{store_name} ({sid}) took {vol:.2f} MT in {period} versus a typical drop of {exp:.2f} MT "
+                        f"{store_name} ({sid}) took {fmt_mt(vol)} in {period} versus a run-rate Expected of {fmt_mt(exp)} "
                         f"({multiple:.1f}x). DSR {dsr}, section {section}. This pattern is classic trade-loading — "
                         "volume that will likely reverse next month if it is not genuine offtake."
                         + (
@@ -589,7 +590,7 @@ def _anomaly_insights(
                     metrics={"volume_mt": vol, "expected_mt": exp, "multiple": multiple, "dsr": dsr, "section": section, **details},
                 )
             )
-        elif kind in {"drop_off", "lapse"}:
+        elif kind in {"drop_off", "quiet_month", "lapse"}:
             rows.append(
                 _insight(
                     type="drop_off",
@@ -599,7 +600,7 @@ def _anomaly_insights(
                     entity_name=store_name,
                     title=f"{store_name} has fallen off its baseline",
                     narrative=(
-                        f"{store_name} billed {vol:.2f} MT vs expected {exp:.2f} MT in {period}. "
+                        f"{store_name} billed {fmt_mt(vol)} vs run-rate Expected {fmt_mt(exp)} in {period}. "
                         f"DSR {dsr} / {section}. Treat as a recovery call, not a lost account, until proven otherwise."
                         + (
                             f" Extract is {mtd['label']}; they may still bill before month-end."
@@ -622,7 +623,7 @@ def _anomaly_insights(
                     entity_name=store_name,
                     title=f"{store_name} buys in irregular spikes",
                     narrative=(
-                        f"Coefficient of variation is high and latest drop is {vol:.2f} MT (baseline {exp:.2f}). "
+                        f"Coefficient of variation is high and latest drop is {fmt_mt(vol)} (run-rate Expected {fmt_mt(exp)}). "
                         "Irregular spikes often hide loading or skipped calls."
                     ),
                     action="Move the account onto a fixed replenishment cadence.",
@@ -639,7 +640,7 @@ def _anomaly_insights(
                     entity_id=sid,
                     entity_name=store_name,
                     title=f"Unusual pattern at {store_name}",
-                    narrative=f"Isolation Forest flagged {store_name} ({sid}) in {period}: {vol:.2f} MT vs {exp:.2f} expected.",
+                    narrative=f"{store_name} ({sid}) in {period}: {fmt_mt(vol)} vs {fmt_mt(exp)} run-rate Expected ({kind.replace('_', ' ')}).",
                     action="Review the shop scorecard before month-end cut-off.",
                     metric_value=abs(vol - exp),
                     metrics={"volume_mt": vol, "expected_mt": exp, "kind": kind},
@@ -852,7 +853,7 @@ def _forecast_gap_insights(
         sid = r["entity_id"]
         name = names.loc[sid, "store_name"] if sid in names.index else sid
         direction = "ahead of" if r["pace_resid"] > 0 else "behind"
-        pace_note = f" vs prorated MTD baseline {r['prorated']:.2f} MT" if pace < 1 else f" vs model {r['predicted']:.2f} MT"
+        pace_note = f" vs paced run-rate Expected {fmt_mt(r['prorated'])}" if pace < 1 else f" vs run-rate Expected {fmt_mt(r['predicted'])}"
         rows.append(
             _insight(
                 type="forecast_gap",
@@ -860,10 +861,10 @@ def _forecast_gap_insights(
                 entity_type="shop",
                 entity_id=sid,
                 entity_name=name,
-                title=f"{name} is {direction} the expected baseline",
+                title=f"{name} is {direction} its run-rate Expected",
                 narrative=(
-                    f"Actual {r['actual']:.2f} MT{pace_note} "
-                    f"({r['pace_resid']:+.2f} MT). Full-month model {r['predicted']:.2f} MT."
+                    f"Actual {fmt_mt(r['actual'])}{pace_note} "
+                    f"({fmt_mt(r['pace_resid'], signed=True)}). Full-month Expected {fmt_mt(r['predicted'])}."
                 ),
                 action="If ahead: confirm genuine offtake. If behind: recovery call before month close.",
                 metric_value=float(r["abs_resid"]),

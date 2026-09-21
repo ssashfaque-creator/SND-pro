@@ -11,28 +11,36 @@ Shop targets ──┘
 ```
 
 - Parsers are heuristic. They do not assume column G; they look for SSRS field ids, then human headers, then a positional distributor + POP-code + year/month + numeric MTD pattern.
-- Totals (any header containing `Total`) and repeated A–F labels are dropped.
-- Facts for months **in the incoming file** are snapshot-replaced (DELETE then insert). An August-only extract is the new truth for August MTD and **leaves July (and every other month) untouched**. Shop–SKU lines that disappear from the new extract are removed, not left as stale MTD.
-- `period_ledger` records whether each month is `closed` or `mtd_open` (SSRS execution date before month-end). Insights for an open month use run-rate vs last year's closed month, not raw MTD vs a full August.
+- Totals are recognised **structurally** (an SKU label that reads as a total, repeated A–F labels). No arithmetic guess: with carton-quantised volumes a real SKU equal to the sum of two others is routine, and deleting it silently understates the shop.
+- One fact per shop + SKU + month. An identical line (same hierarchy, same volume) is a copy and is dropped; the same POP under two DSRs in one month is real and adds up to the extract's Grand Total. When the MTD measure exists for a key, year-group fallback rows for that key never add to it.
+- Facts for months **in the incoming file** are replaced **only for the distributors and shops the file carries** (DELETE then insert, scoped). A regional cut of August replaces that region's August and leaves the other regions' August — and every other month — untouched. Two cuts of the same shop-month in one drop: the later file wins, they never add.
+- Billed POPs that are not on the universe master are **kept and flagged off-master** (`stores.in_universe = 0`, `shop_month.in_universe`). They count in national and distributor volume so the warehouse ties to the extract's Grand Total; they are excluded from strike-rate denominators and coverage. Reconciliation shows their count and MT per period.
+- `period_ledger` records whether each month is `closed` or `mtd_open` (SSRS execution date before month-end). `as_of_day` never moves backwards on an older cut; an open month closes when a later month arrives. Insights for an open month use run-rate vs last year's closed month, not raw MTD vs a full August.
 - Indexes: `store_id`, `section`, `city`, `period`.
 - Shop-month panel starts at each outlet's **first billed month**. Leading zeros are not invented for areas that were not on the file yet. Later gaps *after* that first bill are real zeros (skipped / lapsed).
 - On ingest we materialise composite metrics: calendar-aware lags (MoM and YoY, not "12 rows back"), 3/6-month rolling mean and median, own z-score, recency, 12-month billed rate, top-SKU share, vs-section / vs-city, `yoy_comparable` flag.
 
 SQLite is the right first backbone: one file, WAL mode, portable to a sales laptop, queryable by a ReAct agent without a server. Move to Postgres later if several users write concurrently.
 
-## 2. Machine learning engine
+## 2. Expected engine and the analytical layer
 
-| Model | Grain | Job |
+| Component | Grain | Job |
 |---|---|---|
-| XGBoost regressor | shop-month | Expected volume. Trained on all shops together with shop-normalised lags (global model, local history). Latest period held out of the fit when enough history exists. |
-| Seasonal / rolling-median fallback | shop-month | Used when history < 8 periods or the booster cannot fit. |
-| Isolation Forest | latest shop-month vector | Unsupervised surprise. Contamination ~6%. |
-| Rule layer | same | Names the surprise: trade load, drop-off, lapse, lumpy. |
-| K-Means (k via silhouette 3–6) | shop snapshot | RFM + trend + breadth + CV → business segment labels. |
+| Run-rate Expected (`season`) | every unit and shop | Last-three-month AMS blended with the last-six-month median; shop months winsorised at 2.5× the shop's median billed month first; sparse doors shrink toward the city. Paced by the national day curve when the month is open. Children are reconciled to the parent on the cascade; the shop book shows the unscaled shop sum beside the cascade figure with its factor. |
+| Gap | every unit and shop | `max(0, Expected − Billed)`. One definition on every pack. Empirical-Bayes shrinkage orders lists only. |
+| Unit materiality (`materiality.unit_material_mt`) | DSR / distributor / city / country | `max(0.15, min(5% × E, max(0.5, 2% × E)))` MT. Shared by the situation label, the boards, the KPI colours and the step list, so a row's label never contradicts its printed Gap. |
+| Shop materiality (`shop_book`) | shop | Off Expected past 20% and 10 kg. Pareto tail per DSR (outside the top 80% by size, or under 10 kg) is judged as a coverage panel. |
+| Depletion cycle (`demand`) | shop | Average purchase interval from billed days; due / not due; lost door past `max(3 × cycle, 45 days)` (60 quiet days with no measured cycle). A shop that billed this month is never lapsed. |
+| Rule anomalies (`models.detect_anomalies`) | latest shop-month | Trade loading (≥ 2.5× Expected), drop-off (closed month, < 40% of a material Expected), quiet month (closed month, billed 0 on a regular biller), lumpy (CV ≥ 1.2). Every flag names its rule. |
+| Segments (`models.cluster_shops`) | shop snapshot | RFM + market-relative trend + breadth + CV → fixed-threshold labels. Deterministic. |
+| Next-order size (`nextdrop`) | shop, this week | Pooled gradient-boosted regressor on billed-day sequences (features known before each bill), median fallback under 80 training rows. Sizes the Ask; never Expected or Gap. |
+| POP hygiene (`dupes`) | shop | Duplicate codes (same DSR, same invoices on the same days) and migrated codes (same folded name, one stops as the other starts). |
 
-Why not a shop-specific Isolation Forest? Monthly history is too short. A global forest on *normalised* features is the standard pattern for retail exception detection.
+Why no global forecast model, Isolation Forest or K-Means any more? Each produced a second number beside the pack's Expected ("model 0.31 MT" against "Expected 0.27 MT"), flagged doors nobody could explain, or relabelled the same shop when a random-seeded fit moved. A field manager acts on one Expected, one Gap and a rule she can repeat; the system now has exactly that.
 
-Why XGBoost not ARIMA/Prophet per shop? Hundreds of shops × short series. A pooled tree model with calendar features and lags is the usual CPG demand-planning choice at this grain.
+### Presentation rules (`fmt`)
+
+MT prints to two decimals in tables and prose under 10 MT, one decimal above; never whole tons (a 1 MT rounding step is a DSR-week at city grain). Volumes under 0.1 MT are written in kg; shop rows are entirely in kg. Signs appear only on directional columns (vs Target, From …). Excel cells stay numeric with matching number formats so they still sum.
 
 ## 3. Diagnostic modules
 

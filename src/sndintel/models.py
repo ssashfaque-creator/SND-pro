@@ -1,121 +1,107 @@
-"""Forecasting, anomaly detection, and outlet clustering."""
+"""Shop-month baseline, rule-based anomaly tags, and outlet segments.
+
+There is one Expected in this system: the shop's own run-rate (last-three-month
+AMS blended with the last-six-month median, winsorised) from ``season``. This
+module used to fit a second, global XGBoost forecast, an Isolation Forest and a
+K-Means clustering on top of it. Those produced numbers that contradicted the
+pack ("model 0.31 MT" beside "Expected 0.27 MT"), flagged doors nobody could
+explain, and re-labelled the same shop differently month to month when a
+random-seeded fit moved. They are gone.
+
+* ``forecast_shop_month`` — the run-rate baseline for every observed shop-month
+  (same formula as the pack), so the shop chart line *is* the official Expected.
+* ``detect_anomalies``   — four explainable rules against that baseline:
+  trade loading, drop-off, lumpy buying, and (closed month only) a quiet month
+  on a regular biller. No statistical outlier bucket.
+* ``cluster_shops``      — RFM-style segments from deterministic thresholds.
+  The name is kept for the pipeline; ``cluster_id`` is a stable code per segment.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Optional
-
-import joblib
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
-from sklearn.ensemble import IsolationForest
-from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import StandardScaler
 
-from sndintel.config import (
-    CLUSTER_RANDOM_STATE,
-    FORECAST_MIN_PERIODS,
-    ISOLATION_CONTAMINATION,
-    MODEL_DIR,
-    ensure_dirs,
-)
+from sndintel.config import MIN_MATERIAL_MT
+from sndintel.season import SHOP_WINSOR_MULT, fit_shop_expected
 
-try:
-    from xgboost import XGBRegressor
-except Exception:  # pragma: no cover
-    XGBRegressor = None
+BASELINE_MODEL = "run_rate_baseline"
 
+# Anomaly rules. Trade loading uses the same multiple the winsoriser caps at —
+# a month the Expected engine refuses to believe is the month worth a call.
+LOADING_MULT = SHOP_WINSOR_MULT
+DROP_OFF_SHARE = 0.4  # billed under this share of Expected on a closed month
+LUMPY_CV = 1.2
+QUIET_MIN_BILL_RATE = 0.5  # billed in at least half of the prior 12 months
+QUIET_MIN_EXPECTED_MT = 0.01  # ... and with a run-rate of at least 10 kg
+CRITICAL_MT = 0.2
 
-FEATURE_COLS = [
-    "month_num",
-    "month_sin",
-    "month_cos",
-    "lag_1",
-    "lag_2",
-    "lag_3",
-    "lag_12",
-    "roll_mean_3",
-    "roll_mean_6",
-    "sku_count",
-    "billed_rate_12",
-]
+FORECAST_COLS = ["entity_type", "entity_id", "period", "actual", "predicted", "residual", "residual_pct", "model"]
+
+SEGMENT_CODES = {
+    "New / Ramp-up": 0,
+    "Churn Risk": 1,
+    "Dormant": 2,
+    "Lumpy / Loaded": 3,
+    "Star Account": 4,
+    "Growth Target": 5,
+    "Declining Core": 6,
+    "Long Tail": 7,
+    "Stable Core": 8,
+}
 
 
-def _xgb() -> Optional[object]:
-    if XGBRegressor is None:
-        return None
-    return XGBRegressor(
-        n_estimators=120,
-        max_depth=4,
-        learning_rate=0.08,
-        subsample=0.9,
-        colsample_bytree=0.8,
-        objective="reg:squarederror",
-        n_jobs=2,
-        random_state=CLUSTER_RANDOM_STATE,
-    )
+def _baseline_by_period(shop_month: pd.DataFrame, periods: list[str]) -> pd.DataFrame:
+    """Run-rate Expected for every shop for each period in ``periods``."""
+    parts = []
+    for p in periods:
+        exp = fit_shop_expected(shop_month, str(p), None, 1.0)
+        if exp is None or exp.empty:
+            continue
+        part = exp[["store_id", "expected_full_mt"]].copy()
+        part["period"] = str(p)
+        parts.append(part)
+    if not parts:
+        return pd.DataFrame(columns=["store_id", "period", "expected_full_mt"])
+    return pd.concat(parts, ignore_index=True)
 
 
 def forecast_shop_month(features: pd.DataFrame, shop_month: pd.DataFrame) -> pd.DataFrame:
-    """Train a global shop-month model and score every observed period.
+    """Score every observed shop-month against its own run-rate baseline.
 
-    Sparse shops fall back to a seasonal-naive / rolling-median baseline so
-    the residual is still useful for delta scoring.
+    ``features`` is accepted for signature stability; the baseline comes from
+    ``season.fit_shop_expected`` so it matches the pack exactly. Periods with no
+    prior history (the first month on file) have no baseline and are omitted.
     """
-    if features.empty or shop_month.empty:
-        return pd.DataFrame(columns=["entity_type", "entity_id", "period", "actual", "predicted", "residual", "residual_pct", "model"])
-    df = features.merge(
-        shop_month[["store_id", "period", "month", "billed"]],
-        on=["store_id", "period"],
-        how="left",
-    )
-    df["month_num"] = df["month"].fillna(df["period"].str.slice(5, 7).astype(int))
-    df["month_sin"] = np.sin(2 * np.pi * df["month_num"] / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df["month_num"] / 12)
-    for col in FEATURE_COLS:
-        if col not in df.columns:
-            df[col] = 0
-        df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-    df["actual"] = df["volume_mt"].fillna(0)
-    # Prefer last-year same month when the shop actually existed then.
-    df["baseline"] = df["lag_12"].where(df["lag_12"].notna(), df["roll_median_6"])
-    df["baseline"] = df["baseline"].fillna(df["roll_mean_3"]).fillna(df["lag_1"]).fillna(0)
-
-    model_name = "seasonal_naive"
-    preds = df["baseline"].to_numpy()
-    train = df.dropna(subset=FEATURE_COLS).copy()
-    train = train[train[FEATURE_COLS].notna().all(axis=1)]
-    n_periods = df["period"].nunique()
-    model = _xgb()
-    if model is not None and len(train) >= 80 and n_periods >= FORECAST_MIN_PERIODS:
-        X = train[FEATURE_COLS]
-        y = train["actual"]
-        # Time-aware-ish fit: drop the latest period from training when possible.
-        latest = sorted(train["period"].unique())[-1]
-        mask = train["period"] != latest
-        if mask.sum() >= 60:
-            model.fit(X.loc[mask], y.loc[mask])
-        else:
-            model.fit(X, y)
-        preds = model.predict(df[FEATURE_COLS])
-        model_name = "xgboost_shop_month"
-        ensure_dirs()
-        joblib.dump({"model": model, "features": FEATURE_COLS}, MODEL_DIR / "forecast_xgb.joblib")
-
+    if shop_month is None or shop_month.empty:
+        return pd.DataFrame(columns=FORECAST_COLS)
+    sm = shop_month.copy()
+    sm["store_id"] = sm["store_id"].astype(str)
+    sm["period"] = sm["period"].astype(str)
+    sm["volume_mt"] = pd.to_numeric(sm.get("volume_mt"), errors="coerce").fillna(0.0)
+    periods = sorted(sm["period"].unique())
+    if len(periods) < 2:
+        return pd.DataFrame(columns=FORECAST_COLS)
+    base = _baseline_by_period(sm, periods[1:])
+    if base.empty:
+        return pd.DataFrame(columns=FORECAST_COLS)
+    actual = sm.groupby(["store_id", "period"], as_index=False)["volume_mt"].sum()
+    df = base.merge(actual, on=["store_id", "period"], how="left")
+    df["volume_mt"] = df["volume_mt"].fillna(0.0)
+    df = df.loc[(df["expected_full_mt"] > 1e-9) | (df["volume_mt"] > 1e-9)]
     out = pd.DataFrame(
         {
             "entity_type": "shop",
-            "entity_id": df["store_id"],
-            "period": df["period"],
-            "actual": df["actual"],
-            "predicted": np.clip(preds, 0, None),
+            "entity_id": df["store_id"].to_numpy(),
+            "period": df["period"].to_numpy(),
+            "actual": df["volume_mt"].to_numpy(dtype=float),
+            "predicted": np.clip(df["expected_full_mt"].to_numpy(dtype=float), 0, None),
         }
     )
     out["residual"] = out["actual"] - out["predicted"]
     out["residual_pct"] = np.where(out["predicted"] > 0.01, out["residual"] / out["predicted"] * 100, np.nan)
-    out["model"] = model_name
-    return out
+    out["model"] = BASELINE_MODEL
+    return out.reset_index(drop=True)
 
 
 def detect_anomalies(
@@ -124,107 +110,91 @@ def detect_anomalies(
     period: str,
     mtd_open: bool = False,
 ) -> pd.DataFrame:
-    """Isolation Forest on shop-normalized latest-month vectors, plus rule tags."""
-    if features.empty:
+    """Rule tags on the latest month against the shop's run-rate Expected.
+
+    * ``trade_loading`` — billed ≥ 2.5× Expected (and ≥ 50 kg). Same multiple
+      the winsoriser caps, so this is the month the Expected engine distrusts.
+    * ``drop_off``      — closed month, Expected ≥ 50 kg, billed under 40% of it.
+    * ``quiet_month``   — closed month, billed 0, a regular biller (≥ half of the
+      prior twelve months) with a run-rate of at least 10 kg but under the
+      drop-off materiality. The shop book decides *lost door* by days since last
+      bill; this is only the monthly early-warning list.
+    * ``lumpy``         — coefficient of variation ≥ 1.2 over six months, ≥ 50 kg.
+
+    Open MTD months never raise drop-off or quiet flags — a quiet shop may still
+    bill before month-end.
+    """
+    if features is None or features.empty or shop_month is None or shop_month.empty or not period:
         return pd.DataFrame()
-    latest = features[features["period"] == period].copy()
+    latest = features[features["period"].astype(str) == str(period)].copy()
     if latest.empty:
         return pd.DataFrame()
-    latest = latest.merge(
-        shop_month[["store_id", "period", "volume_mt", "section", "city", "dsr_name", "store_name"]],
-        on=["store_id", "period"],
-        how="left",
-        suffixes=("", "_sm"),
-    )
-    cols = [
-        "volume_mt",
-        "sku_count",
-        "zscore_own",
-        "mom_pct",
-        "cv_6m",
-        "vs_section_pct",
-        "top_sku_share",
-        "recency_months",
-        "roll_median_6",
-    ]
-    for c in cols:
-        if c not in latest.columns:
-            latest[c] = 0
-    X = latest[cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    scores = np.zeros(len(latest))
-    if_flag = np.zeros(len(latest), dtype=bool)
-    if len(latest) >= 15:
-        scaler = StandardScaler()
-        Xs = scaler.fit_transform(X)
-        iso = IsolationForest(
-            contamination=min(ISOLATION_CONTAMINATION, 0.2),
-            random_state=CLUSTER_RANDOM_STATE,
-            n_estimators=200,
-        )
-        pred = iso.fit_predict(Xs)
-        scores = -iso.score_samples(Xs)
-        if_flag = pred == -1
-        ensure_dirs()
-        joblib.dump({"model": iso, "scaler": scaler, "cols": cols}, MODEL_DIR / "isolation_forest.joblib")
+    latest["store_id"] = latest["store_id"].astype(str)
+    sm = shop_month.copy()
+    sm["store_id"] = sm["store_id"].astype(str)
+    meta_cols = [c for c in ("volume_mt", "section", "city", "dsr_name", "store_name") if c in sm.columns]
+    meta = sm.loc[sm["period"].astype(str) == str(period), ["store_id", *meta_cols]].drop_duplicates("store_id")
+    latest = latest.drop(columns=[c for c in meta_cols if c in latest.columns], errors="ignore")
+    latest = latest.merge(meta, on="store_id", how="left")
+    exp = fit_shop_expected(sm, str(period), None, 1.0)
+    exp_map = exp.set_index("store_id")["expected_full_mt"].to_dict() if exp is not None and not exp.empty else {}
 
     rows = []
-    for i, row in latest.reset_index(drop=True).iterrows():
-        expected = row.get("roll_median_6")
-        expected = float(expected) if pd.notna(expected) else 0.0
-        ly = row.get("lag_12")
-        if pd.notna(ly):
-            expected = float(ly)
-        volume = float(row.get("volume_mt") or 0)
-        months_on = int(row.get("months_on_file") or 0)
-        comparable = int(row.get("yoy_comparable") or 0)
-        z = row.get("zscore_own")
-        z = float(z) if pd.notna(z) else 0.0
-        kinds = []
-        # New / newly listed shops are not dumps or lapses.
+    for _, row in latest.iterrows():
+        sid = str(row["store_id"])
+        expected = float(exp_map.get(sid, 0.0) or 0.0)
+        volume = float(pd.to_numeric(row.get("volume_mt"), errors="coerce") or 0.0)
+        months_on = int(pd.to_numeric(row.get("months_on_file"), errors="coerce") or 0)
         if months_on <= 1:
-            continue
-        if expected > 0 and volume >= expected * 2.5 and volume >= 0.05:
+            continue  # first month on file: nothing to compare against
+        kinds: list[str] = []
+        if expected > 1e-9 and volume >= expected * LOADING_MULT and volume >= MIN_MATERIAL_MT:
             kinds.append("trade_loading")
-        # Incomplete MTD: a quiet shop may still bill before month-end.
         if not mtd_open:
-            if expected > 0.05 and volume <= expected * 0.4:
+            if expected >= MIN_MATERIAL_MT and volume <= expected * DROP_OFF_SHARE:
                 kinds.append("drop_off")
-            if volume == 0 and (row.get("billed_rate_12") or 0) >= 0.5 and comparable:
-                kinds.append("lapse")
-        cv = row.get("cv_6m")
-        if pd.notna(cv) and float(cv) >= 1.2 and volume >= 0.05:
+            bill_rate = pd.to_numeric(row.get("billed_rate_12"), errors="coerce")
+            if (
+                volume <= 1e-9
+                and expected >= QUIET_MIN_EXPECTED_MT
+                and pd.notna(bill_rate)
+                and float(bill_rate) >= QUIET_MIN_BILL_RATE
+                and "drop_off" not in kinds
+            ):
+                kinds.append("quiet_month")
+        cv = pd.to_numeric(row.get("cv_6m"), errors="coerce")
+        if pd.notna(cv) and float(cv) >= LUMPY_CV and volume >= MIN_MATERIAL_MT:
             kinds.append("lumpy")
-        if if_flag[i] and not kinds:
-            kinds.append("statistical_outlier")
         if not kinds:
             continue
         primary = kinds[0]
-        severity = "high"
-        if primary in {"trade_loading", "lapse"} and (volume >= 0.2 or expected >= 0.2 or abs(z) >= 2.5):
-            severity = "critical"
-        elif primary == "drop_off" and expected >= 0.15:
-            severity = "critical"
-        elif scores[i] < np.quantile(scores, 0.85) if len(scores) else True:
+        big = volume >= CRITICAL_MT or expected >= CRITICAL_MT
+        if primary in {"trade_loading", "drop_off", "quiet_month"}:
+            severity = "critical" if big else "high"
+        else:
             severity = "medium"
+        rel = abs(volume - expected) / expected if expected > 1e-9 else (volume / MIN_MATERIAL_MT if volume else 0.0)
+        z = pd.to_numeric(row.get("zscore_own"), errors="coerce")
         rows.append(
             {
-                "store_id": row["store_id"],
-                "period": period,
+                "store_id": sid,
+                "period": str(period),
                 "kind": primary,
-                "score": float(scores[i]),
+                "score": float(rel),
                 "severity": severity,
                 "volume_mt": volume,
                 "expected_mt": expected,
                 "details_json": pd.Series(
                     {
                         "kinds": kinds,
-                        "zscore_own": z,
-                        "mom_pct": row.get("mom_pct"),
-                        "cv_6m": row.get("cv_6m"),
-                        "top_sku_share": row.get("top_sku_share"),
+                        "zscore_own": float(z) if pd.notna(z) else None,
+                        "mom_pct": _opt(row.get("mom_pct")),
+                        "cv_6m": _opt(cv),
+                        "top_sku_share": _opt(row.get("top_sku_share")),
                         "dsr_name": row.get("dsr_name"),
                         "section": row.get("section"),
                         "store_name": row.get("store_name"),
+                        "rule": primary,
                     }
                 ).to_json(),
             }
@@ -232,13 +202,34 @@ def detect_anomalies(
     return pd.DataFrame(rows)
 
 
+def _opt(value) -> float | None:
+    v = pd.to_numeric(value, errors="coerce")
+    return None if v is None or pd.isna(v) else float(v)
+
+
 def cluster_shops(features: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> pd.DataFrame:
-    if shop_month.empty:
+    """RFM-style outlet segments from fixed, explainable thresholds.
+
+    Recency (months since last bill), frequency (share of the last twelve
+    months billed), monetary (mean monthly MT), trend (last three months vs
+    the three before, labelled relative to the market median so a seasonal
+    dip does not turn every door into Declining Core), breadth (SKU count)
+    and cv. The label rules
+    are in ``_label_segment``; ``cluster_id`` is a stable code for that label so
+    the same shop gets the same segment on every run with the same data.
+    """
+    if shop_month is None or shop_month.empty or not period:
         return pd.DataFrame()
     hist = shop_month.copy()
-    periods = sorted(hist["period"].unique())
+    hist["store_id"] = hist["store_id"].astype(str)
+    hist["volume_mt"] = pd.to_numeric(hist.get("volume_mt"), errors="coerce").fillna(0.0)
+    if "billed" not in hist.columns:
+        hist["billed"] = (hist["volume_mt"] > 0).astype(int)
+    if "sku_count" not in hist.columns:
+        hist["sku_count"] = 0
+    periods = sorted(hist["period"].astype(str).unique())
     last12 = periods[-12:]
-    window = hist[hist["period"].isin(last12)]
+    window = hist[hist["period"].astype(str).isin(last12)]
     snap = (
         window.groupby("store_id", as_index=False)
         .agg(
@@ -250,9 +241,14 @@ def cluster_shops(features: pd.DataFrame, shop_month: pd.DataFrame, period: str)
             cv=("volume_mt", lambda s: float(s.std() / s.mean()) if s.mean() else 0.0),
         )
     )
-    rec = features[features["period"] == period][["store_id", "recency_months", "roll_mean_3", "lag_3", "months_on_file", "yoy_comparable"]]
-    snap = snap.merge(rec, on="store_id", how="left")
-    # Trend: last 3 billed months vs prior 3
+    rec_cols = [c for c in ("recency_months", "months_on_file") if c in features.columns] if features is not None else []
+    if rec_cols and not features.empty:
+        rec = features.loc[features["period"].astype(str) == str(period), ["store_id", *rec_cols]].copy()
+        rec["store_id"] = rec["store_id"].astype(str)
+        snap = snap.merge(rec.drop_duplicates("store_id"), on="store_id", how="left")
+    for c in ("recency_months", "months_on_file"):
+        if c not in snap.columns:
+            snap[c] = np.nan
     ordered = hist.sort_values(["store_id", "period"])
     last3 = ordered.groupby("store_id").tail(3).groupby("store_id")["volume_mt"].mean()
 
@@ -264,24 +260,20 @@ def cluster_shops(features: pd.DataFrame, shop_month: pd.DataFrame, period: str)
         return float("nan")
 
     prior = ordered.groupby("store_id")["volume_mt"].apply(_prior3)
-    snap = snap.merge(last3.rename("recent3"), on="store_id", how="left")
+    snap["recent3"] = snap["store_id"].map(last3)
     snap["prior3"] = snap["store_id"].map(prior)
-    snap["trend"] = np.where(snap["prior3"] > 0, (snap["recent3"] - snap["prior3"]) / snap["prior3"], 0)
-    snap["recency_months"] = snap["recency_months"].fillna(99)
+    snap["trend"] = np.where(snap["prior3"] > 0, (snap["recent3"] - snap["prior3"]) / snap["prior3"], 0.0)
+    # Label on the trend *relative to the market*: when every shop is down 25%
+    # because the season turned, nobody is "Declining Core" — the ones that are
+    # down 25% more than their peers are.
+    market = float(pd.Series(snap["trend"]).replace([np.inf, -np.inf], np.nan).dropna().median() or 0.0) if len(snap) >= 8 else 0.0
+    snap["trend_vs_market"] = snap["trend"] - market
+    snap["recency_months"] = pd.to_numeric(snap["recency_months"], errors="coerce").fillna(99)
+    snap["months_on_file"] = pd.to_numeric(snap["months_on_file"], errors="coerce").fillna(99)
     snap["cv"] = snap["cv"].replace([np.inf, -np.inf], 0).fillna(0)
-    feat_cols = ["recency_months", "frequency", "monetary", "trend", "breadth", "cv"]
-    X = snap[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-    k = _choose_k(Xs)
-    km = KMeans(n_clusters=k, random_state=CLUSTER_RANDOM_STATE, n_init=10)
-    labels = km.fit_predict(Xs) if len(snap) >= k else np.zeros(len(snap), dtype=int)
-    snap["cluster_id"] = labels
     snap["segment"] = [_label_segment(r) for r in snap.itertuples(index=False)]
-    snap["last_period"] = period
-    ensure_dirs()
-    if len(snap) >= k:
-        joblib.dump({"model": km, "scaler": scaler, "k": k}, MODEL_DIR / "kmeans.joblib")
+    snap["cluster_id"] = snap["segment"].map(SEGMENT_CODES).fillna(len(SEGMENT_CODES)).astype(int)
+    snap["last_period"] = str(period)
     return snap[
         [
             "store_id",
@@ -297,39 +289,30 @@ def cluster_shops(features: pd.DataFrame, shop_month: pd.DataFrame, period: str)
             "last_period",
             "last_volume",
         ]
-    ]
+    ].reset_index(drop=True)
 
 
-def _choose_k(Xs: np.ndarray) -> int:
-    n = len(Xs)
-    if n < 12:
-        return 2 if n >= 4 else 1
-    best_k, best_score = 4, -1
-    for k in range(3, min(7, n // 4 + 1)):
-        km = KMeans(n_clusters=k, random_state=CLUSTER_RANDOM_STATE, n_init=8)
-        labels = km.fit_predict(Xs)
-        if len(set(labels)) < 2:
-            continue
-        score = silhouette_score(Xs, labels)
-        if score > best_score:
-            best_k, best_score = k, score
-    return best_k
+def _num_attr(row, name: str, default: float) -> float:
+    v = pd.to_numeric(getattr(row, name, None), errors="coerce")
+    return default if v is None or pd.isna(v) else float(v)
 
 
 def _label_segment(row) -> str:
-    recency = getattr(row, "recency_months", 99) or 99
-    freq = getattr(row, "frequency", 0) or 0
-    money = getattr(row, "monetary", 0) or 0
-    trend = getattr(row, "trend", 0) or 0
-    cv = getattr(row, "cv", 0) or 0
-    months_on = getattr(row, "months_on_file", 99) or 99
+    # A shop that billed this month has recency 0 — that is the freshest value,
+    # not a missing one, so defaults apply only to None / NaN.
+    recency = _num_attr(row, "recency_months", 99)
+    freq = _num_attr(row, "frequency", 0)
+    money = _num_attr(row, "monetary", 0)
+    trend = _num_attr(row, "trend_vs_market", _num_attr(row, "trend", 0))
+    cv = _num_attr(row, "cv", 0)
+    months_on = _num_attr(row, "months_on_file", 99)
     if months_on <= 2:
         return "New / Ramp-up"
     if recency >= 4 and freq >= 0.3:
         return "Churn Risk"
     if recency >= 4 and freq < 0.3:
         return "Dormant"
-    if cv >= 1.3 and money >= 0.05:
+    if cv >= 1.3 and money >= MIN_MATERIAL_MT:
         return "Lumpy / Loaded"
     if money >= 0.15 and freq >= 0.6 and trend >= 0:
         return "Star Account"
