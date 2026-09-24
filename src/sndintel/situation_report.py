@@ -166,6 +166,7 @@ def scorecards_for_period(
 
 def load_units_for_period(conn: Any, period: str) -> pd.DataFrame:
     """Warehouse scorecards for one month. Rebuilds when the cached units are a different month."""
+    from sndintel.lineage import load_shop_day
     from sndintel.storage import read_sql
 
     period = str(period or "")
@@ -191,7 +192,7 @@ def load_units_for_period(conn: Any, period: str) -> pd.DataFrame:
         period,
         shop_targets=_table("SELECT * FROM shop_targets"),
         visits=_table("SELECT * FROM shop_visits"),
-        shop_day=_table("SELECT * FROM shop_day"),
+        shop_day=load_shop_day(conn),
         mtd_obs=_table("SELECT * FROM mtd_observations"),
         cached_units=units,
     )

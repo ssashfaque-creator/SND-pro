@@ -14,6 +14,7 @@ from rich.table import Table
 from sndintel import __version__
 from sndintel.config import SAMPLE_DIR, DATA_DIR, DB_PATH, APP_DIR
 from sndintel.ingest.pipeline import load_brief, load_kpis, load_ledger, rescore_warehouse, run_pipeline
+from sndintel.lineage import load_lineage, load_shop_day
 from sndintel.mtd import banner_text, period_state
 from sndintel.sampledata import generate_demo_files
 from sndintel.storage import connect, init_db, read_sql
@@ -330,7 +331,7 @@ def actions(limit: int = typer.Option(15, help="How many call-list shops to prin
             shop_month = read_sql(conn, "SELECT * FROM shop_month")
             stores = read_sql(conn, "SELECT * FROM stores")
             try:
-                shop_day = read_sql(conn, "SELECT * FROM shop_day")
+                shop_day = load_shop_day(conn)
             except Exception:
                 shop_day = pd.DataFrame()
             try:
@@ -339,7 +340,7 @@ def actions(limit: int = typer.Option(15, help="How many call-list shops to prin
                 visits = pd.DataFrame()
             ledger = read_sql(conn, "SELECT * FROM period_ledger")
             period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
-            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period, lineage=load_lineage(conn))
     if not pack.headline:
         console.print("No action list yet. Ingest Outlet Date Wise and run [bold]snd-intel rescore[/].")
         raise typer.Exit(1)
@@ -522,7 +523,7 @@ def shops(
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
         stores = read_sql(conn, "SELECT * FROM stores")
         try:
-            shop_day = read_sql(conn, "SELECT * FROM shop_day")
+            shop_day = load_shop_day(conn)
         except Exception:
             shop_day = pd.DataFrame()
         try:
@@ -547,7 +548,7 @@ def shops(
         except Exception:
             action = None
         if action is None or not getattr(action, "headline", None) or str(getattr(action, "period", "") or "") != str(period):
-            action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+            action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period, lineage=load_lineage(conn))
     book = build_shop_book(
         action=action,
         shop_month=shop_month,
@@ -632,7 +633,7 @@ def export_situation(
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
         stores = read_sql(conn, "SELECT * FROM stores")
         try:
-            shop_day = read_sql(conn, "SELECT * FROM shop_day")
+            shop_day = load_shop_day(conn)
         except Exception:
             shop_day = pd.DataFrame()
         try:
@@ -650,7 +651,7 @@ def export_situation(
             except Exception:
                 action = None
             if action is None or not getattr(action, "headline", None):
-                action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+                action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period, lineage=load_lineage(conn))
     pack = build_situation_pack(units, action=action, ledger=ledger, period=period)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -699,7 +700,7 @@ def export_ops(
             shop_month = read_sql(conn, "SELECT * FROM shop_month")
             stores = read_sql(conn, "SELECT * FROM stores")
             try:
-                shop_day = read_sql(conn, "SELECT * FROM shop_day")
+                shop_day = load_shop_day(conn)
             except Exception:
                 shop_day = pd.DataFrame()
             try:
@@ -708,7 +709,7 @@ def export_ops(
                 visits = pd.DataFrame()
             ledger = read_sql(conn, "SELECT * FROM period_ledger")
             period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
-            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period, lineage=load_lineage(conn))
         else:
             try:
                 visits = read_sql(conn, "SELECT * FROM shop_visits")
