@@ -544,6 +544,34 @@ CREATE TABLE IF NOT EXISTS action_outcomes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_action_outcomes_period ON action_outcomes(period, listed_at);
+
+CREATE TABLE IF NOT EXISTS pop_lineage (
+    old_id TEXT PRIMARY KEY,
+    new_id TEXT NOT NULL,
+    method TEXT,
+    confidence TEXT,
+    score REAL,
+    gap_days INTEGER,
+    old_first TEXT,
+    old_last TEXT,
+    new_first TEXT,
+    old_name TEXT,
+    new_name TEXT,
+    detail TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pop_retired (
+    store_id TEXT PRIMARY KEY,
+    store_name TEXT,
+    distributor TEXT,
+    dsr_name TEXT,
+    city TEXT,
+    first_bill TEXT,
+    last_bill TEXT,
+    n_candidates INTEGER,
+    best_candidate TEXT,
+    reason TEXT
+);
 """
 
 
@@ -676,6 +704,10 @@ def init_db(path: Optional[Path] = None) -> Path:
         ("not_yet_due_mt", "REAL"),
         ("pipeline_expected_mt", "REAL"),
         ("recommended_action", "TEXT"),
+        ("in_universe", "INTEGER"),
+        ("continues_codes", "TEXT"),
+        ("superseded_by", "TEXT"),
+        ("run_rate_mt", "REAL"),
         ):
             _ensure_column(conn, "action_shops", col, ddl)
         _ensure_column(conn, "action_units", "n_lapse", "INTEGER")

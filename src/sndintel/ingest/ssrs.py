@@ -449,7 +449,8 @@ def collapse_sales_facts(df: pd.DataFrame) -> pd.DataFrame:
     if "period" in out.columns:
         out["period"] = out["period"].astype(str).str.strip()
     out["volume_mt"] = pd.to_numeric(out.get("volume_mt"), errors="coerce")
-    out = out.loc[out["volume_mt"].notna() & (out["volume_mt"] > 0)].copy()
+    # Negative lines are returns; they net inside the shop-SKU-month below.
+    out = out.loc[out["volume_mt"].notna() & (out["volume_mt"] != 0)].copy()
     if out.empty:
         return out
 
@@ -471,6 +472,8 @@ def collapse_sales_facts(df: pd.DataFrame) -> pd.DataFrame:
     grouped = out.groupby(key, as_index=False, sort=False).agg(agg)
     if "_prefer_mtd" in grouped.columns:
         grouped = grouped.drop(columns=["_prefer_mtd"])
+    # A month that nets to exactly zero (sale fully returned) is no fact.
+    grouped = grouped.loc[pd.to_numeric(grouped["volume_mt"], errors="coerce").fillna(0).abs() > 1e-12]
     return grouped.reset_index(drop=True)
 
 
@@ -541,7 +544,7 @@ def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
     df["period"] = [period_key(y, m) for y, m in zip(df["year"], df["month"])]
     df["volume_mt"] = df["volume_mt"].fillna(0.0).astype(float)
     df["store_id"] = df["store_id"].astype(str).str.strip()
-    df = df[df["volume_mt"] > 0]
+    df = df[df["volume_mt"] != 0]
     n_before = len(df)
     grouped = collapse_sales_facts(df)
     n_dropped = n_before - len(grouped)

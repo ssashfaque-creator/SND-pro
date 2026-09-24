@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 from typing import Union
 
@@ -137,9 +138,24 @@ def looks_like_store_id(value) -> bool:
     return digits >= 6 and letters <= 4 and 6 <= len(text) <= 32
 
 
+_TOTAL_LABEL = re.compile(r"^(grand|sub|running|page|net)?\s*totals?\s*:?$")
+
+
 def looks_like_total(value) -> bool:
-    text = cell_str(value).lower()
-    return "total" in text
+    """A total / subtotal *label*, not any name that happens to contain 'total'.
+
+    "Total", "Grand Total", "Karachi Total", "Total for Ali" are labels.
+    "TOTAL PUMP", "STAR MART TOTAL PUMP" and "TOTAL M/STORE" are shops
+    (Total is a fuel brand) and must be kept.
+    """
+    text = " ".join(cell_str(value).lower().split())
+    if not text or "total" not in text:
+        return False
+    if _TOTAL_LABEL.match(text):
+        return True
+    if text.endswith(" total") or text.endswith(" totals") or text.endswith(" total:"):
+        return True
+    return text.startswith("total for ") or text.startswith("total of ") or text.startswith("totals for ")
 
 
 def period_key(year: int, month: int) -> str:
@@ -167,3 +183,28 @@ def prior_periods(period: str, n: int = 3) -> list[str]:
     if not period or n <= 0:
         return []
     return [shift_period(str(period), -i) for i in range(int(n), 0, -1)]
+
+
+def panel_start(shop_month: pd.DataFrame | None) -> str | None:
+    """First period on file, or None when nothing is loaded."""
+    if shop_month is None or shop_month.empty or "period" not in shop_month.columns:
+        return None
+    periods = shop_month["period"].dropna().astype(str)
+    periods = periods[periods.str.len() >= 7]
+    return str(periods.min()) if not periods.empty else None
+
+
+def window_periods(period: str, n: int, shop_month: pd.DataFrame | None = None, start: str | None = None) -> list[str]:
+    """``prior_periods`` clipped to the months the data on file can speak for.
+
+    A month before the first period on file is *unknown*, not a zero: with
+    extracts from May onward, July's last-3 window is May–June (divisor 2),
+    not April–June with April counted as nothing sold. Inside the panel a
+    missing month is still a real zero. ``start`` overrides the panel start
+    read from ``shop_month``.
+    """
+    window = prior_periods(period, n)
+    first = start or panel_start(shop_month)
+    if not first:
+        return window
+    return [p for p in window if p >= str(first)]

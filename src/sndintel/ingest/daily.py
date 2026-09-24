@@ -92,10 +92,17 @@ def parse_outlet_date_wise(path: str | Path) -> tuple[pd.DataFrame, ParseReport]
     vol.columns = pd.Index([date_cols[c] for c in vol.columns])
     vol.index = pd.MultiIndex.from_arrays([store_id.to_numpy(), store_name.to_numpy()], names=["store_id", "store_name"])
     stacked = vol.stack()
-    stacked = stacked[stacked.notna() & (stacked > 0)]
+    # Returns / credit notes post as negative tons. They stay on the shop-day
+    # so the month nets to the extract's total instead of overstating billed.
+    stacked = stacked[stacked.notna() & (stacked != 0)]
     if stacked.empty:
-        report.warnings.append("Outlet Date Wise had POPs but no positive daily volume")
+        report.warnings.append("Outlet Date Wise had POPs but no daily volume")
         return pd.DataFrame(columns=SALES_COLUMNS), report
+    n_returns = int((stacked < 0).sum())
+    if n_returns:
+        report.warnings.append(
+            f"{n_returns} shop-day cells are negative (returns); they net against the same shop's month"
+        )
 
     long = stacked.reset_index()
     long.columns = ["store_id", "store_name", "sale_date", "volume_mt"]

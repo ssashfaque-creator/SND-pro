@@ -93,6 +93,8 @@ def format_period_label(
     mon = dt.strftime("%b")
     if open_ and as_of_day and days_in_month:
         return f"{month} MTD · billed through {int(as_of_day)} {mon} ({int(days_in_month)}-day month)"
+    if as_of_day and days_in_month and int(as_of_day) < int(days_in_month):
+        return f"{month} · closed month · billed through {int(as_of_day)} {mon} only"
     return f"{month} · closed month"
 
 
@@ -108,6 +110,7 @@ def period_state(ledger: pd.DataFrame | None, period: str | None) -> dict[str, A
         "execution_date": None,
         "source_file": None,
         "label": period or "",
+        "partial": False,
     }
     if not period or ledger is None or ledger.empty or "period" not in ledger.columns:
         return empty
@@ -130,6 +133,9 @@ def period_state(ledger: pd.DataFrame | None, period: str | None) -> dict[str, A
     elif period:
         label = format_period_label(period, open_=False, as_of_day=as_of_i, days_in_month=days_i)
     exec_raw = row.get("execution_date")
+    # A closed month the warehouse only saw through day N (a later month
+    # arrived before the rest of this one). Billed is N days; Expected is 31.
+    partial = bool((not open_) and as_of_i and days_i and as_of_i < days_i)
     return {
         "period": period,
         "status": status,
@@ -140,6 +146,7 @@ def period_state(ledger: pd.DataFrame | None, period: str | None) -> dict[str, A
         "execution_date": None if pd.isna(exec_raw) else str(exec_raw),
         "source_file": None if pd.isna(row.get("source_file")) else str(row.get("source_file")),
         "label": label,
+        "partial": partial,
     }
 
 

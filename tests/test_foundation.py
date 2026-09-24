@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from sndintel.ingest.pipeline import combine_sales_frames, run_pipeline
-from sndintel.mtd import parse_execution_date
+from sndintel.mtd import parse_execution_date, period_state
 from sndintel.storage import connect, read_sql
 
 from tests.test_mtd_refresh import HISTORY, _fact, _shops_xlsx, _write_ssrs_csv
@@ -76,11 +76,24 @@ def test_open_month_closes_when_a_later_month_arrives(tmp_path):
     led = _ledger(db)
     assert led.loc["2026-09", "status"] == "mtd_open"
     assert led.loc["2026-08", "status"] == "closed"
-    assert int(led.loc["2026-08", "as_of_day"]) == 31
+    # The warehouse only ever saw August through the 20th: the month closes as
+    # "billed through 20 Aug", it is not silently promoted to a 31-day month.
+    assert int(led.loc["2026-08", "as_of_day"]) == 20
+    assert period_state(led.reset_index(), "2026-08")["partial"] is True
+    assert "billed through 20 Aug" in period_state(led.reset_index(), "2026-08")["label"]
 
-    # Re-dropping the August cut later cannot re-open a finished month.
+    # Re-dropping the August cut later cannot re-open a finished month, nor
+    # promote it to a full month.
     run_pipeline(_write_ssrs_csv(tmp_path / "aug2.csv", HISTORY, "20/08/2026 18:00:00"), shop_path=shops, db_path=db)
     assert _ledger(db).loc["2026-08", "status"] == "closed"
+    assert int(_ledger(db).loc["2026-08", "as_of_day"]) == 20
+
+    # A full-month August extract (run in September) does complete the month.
+    run_pipeline(_write_ssrs_csv(tmp_path / "aug3.csv", HISTORY, "02/09/2026 09:00:00"), shop_path=shops, db_path=db)
+    led = _ledger(db)
+    assert led.loc["2026-08", "status"] == "closed"
+    assert int(led.loc["2026-08", "as_of_day"]) == 31
+    assert period_state(led.reset_index(), "2026-08")["partial"] is False
 
 
 def test_off_master_billed_pops_are_kept_flagged_and_national_ties_to_extract(tmp_path):
