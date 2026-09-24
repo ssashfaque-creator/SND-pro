@@ -30,7 +30,7 @@ from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibl
 from sndintel.fmt import excel_number_format, fmt_mt, round_mt
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
-from sndintel.io_utils import prior_periods, shift_period
+from sndintel.io_utils import shift_period, window_periods
 from sndintel.mtd import period_state
 from sndintel.season import elapsed_month_frac, fit_seasonality, fit_shop_expected, reconcile_expected
 
@@ -52,7 +52,7 @@ DRIVER_LABEL = {
 
 GLOSSARY = [
     ("Billed this period", "Secondary volume in the month being scored (MTD if the month is still open)."),
-    ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. This is always a full-month run-rate, even when billed is MTD."),
+    ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. Months before the first extract on file are unknown, not zero: with data from May, July's AMS is (May + June) ÷ 2. This is always a full-month run-rate, even when billed is MTD."),
     ("vs AMS", "This period minus AMS × elapsed calendar days (day 20 of 31 is billed − AMS × 20/31). Negative = behind the recent run-rate. The AMS column itself stays the full-month number. Expected can use a different intra-month fraction when Outlet Date Wise teaches the country’s usual billed-by-day shape."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month). Zero means no August last year — it does not mean Expected should be zero."),
     ("Expected this month", "Recent run-rate: mean of the three calendar months immediately before this period (same window as AMS), blended with the last-six-month median, paced if MTD is open. The pace is the country’s usual billed share by that calendar day (Outlet Date Wise, one national curve — not a per-store or per-city shape). Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
@@ -67,7 +67,8 @@ GLOSSARY = [
     ("Remarks", "Four bullets: trend vs AMS, vs Expected, and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; drop size vs expected drop vs national average. Expected drop is Expected volume ÷ Expected billed shops — same last-3 / last-6 run-rate as Expected sales, not this month’s shop count and not paced."),
     ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
     ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
-    ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
+    ("Live universe", "The Universe Shop List is the complete door list. POP code is the shop. Names/DSR/distributor/city follow the current list. Billed POPs not on the list still count in volume (flagged off-master) but not in coverage."),
+    ("Retired / superseded POP code", "A re-coded shop. Retired = billing history but not on the universe list; where a same-name live code started as it stopped (same distributor, DSR / code route), the old history is merged into the live code and the shop is counted once. Superseded = still on the universe list but re-coded the same way; not counted as a door until the list retires it. Neither is a lost door or a miss."),
     ("Shop lists", "Summary pack: top 50 most serious lagging doors (after dropping gaps ≤ 0.25 MT), ranked by how far behind their own Expected they are for their size — not the biggest Gap tons. The rest of the hole is one remainder line. Detailed pack still lists every door above 0.25 MT."),
     ("AMS = 0 distributors / DSRs", "Hidden everywhere in the report. No recent three-month run-rate, so they are not a call."),
     (
@@ -900,14 +901,16 @@ def ams_last_n(
 ) -> pd.DataFrame:
     """Mean monthly volume of the n calendar months immediately before ``period``.
 
-    Scoring 2026-08 is (May + June + July) / 3. A missing month counts as 0, so
-    the divisor stays n — we do not skip a hole and pull in last year. Duplicate
-    store-period rows are collapsed before summing. ``ledger`` is unused; the
-    window is calendar months, not "last n closed periods that exist".
+    Scoring 2026-08 is (May + June + July) / 3. A missing month inside the
+    panel counts as 0, so the divisor stays n — we do not skip a hole and pull
+    in last year. Months before the first extract on file are unknown and are
+    left out of the window (and the divisor). Duplicate store-period rows are
+    collapsed before summing. ``ledger`` is unused; the window is calendar
+    months, not "last n closed periods that exist".
     """
     del ledger
     cols = keys + ["ams_3m"]
-    window = prior_periods(period, n)
+    window = window_periods(period, n, shop_month)
     if shop_month is None or shop_month.empty or not period or not window:
         return pd.DataFrame(columns=cols)
     hist = shop_month.copy()

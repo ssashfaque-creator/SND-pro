@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from sndintel.io_utils import prior_periods
+from sndintel.io_utils import window_periods
 
 NATIONAL_DAY_MIN_MONTHS = 2
 NATIONAL_DAY_MIN_DAYS = 8
@@ -87,8 +87,10 @@ def fit_seasonality(shop_month: pd.DataFrame, period: str) -> SeasonFit:
     nat["month"] = nat["period"].astype(str).str.slice(5, 7).astype(int)
     nat_idx = _iterative_month_index(nat)
     n_same = int((nat["month"] == month).sum())
-    recent_ps = prior_periods(period, 3)
-    longer_ps = prior_periods(period, 6)
+    # Windows stop at the first month on file: an April the extract does not
+    # cover is unknown, not a zero month.
+    recent_ps = window_periods(period, 3, hist)
+    longer_ps = window_periods(period, 6, hist)
     expected_nat, _, _, _ = _recent_level(nat, recent_ps, longer_ps)
     nat_metrics = _period_volume_and_shops(hist, [])
     expected_drop_nat = _expected_drop_size(nat_metrics, recent_ps, longer_ps)
@@ -419,8 +421,8 @@ def expected_for_keys(
     if grouped.empty:
         return empty
     grouped["month"] = grouped["period"].astype(str).str.slice(5, 7).astype(int)
-    recent_ps = prior_periods(period, 3)
-    longer_ps = prior_periods(period, 6)
+    recent_ps = window_periods(period, 3, hist)
+    longer_ps = window_periods(period, 6, hist)
     rows = []
     for key_vals, g in grouped.groupby(keys, dropna=False):
         if not isinstance(key_vals, tuple):
@@ -602,9 +604,9 @@ def fit_shop_expected(
             city_full[str(r["city"])] = float(r.get("expected_full_mt") or 0.0)
 
     hist = winsorise_shop_months(hist.copy())
-    recent_list = prior_periods(period, 3)
+    recent_list = window_periods(period, 3, hist)
     recent_ps = set(recent_list)
-    longer_ps = set(prior_periods(period, 6))
+    longer_ps = set(window_periods(period, 6, hist))
     n_per = hist.groupby("store_id")["period"].nunique().rename("n_periods")
     in_recent = hist[hist["period"].astype(str).isin(recent_ps)]
     in_longer = hist[hist["period"].astype(str).isin(longer_ps)]
