@@ -31,6 +31,7 @@ from sndintel.briefing import (
 )
 from sndintel.shop_book import (
     MIX_OTHER,
+    ams_label,
     build_shop_book,
     excel_bytes as shop_excel_bytes,
     list_shop_book_entities,
@@ -51,6 +52,7 @@ from sndintel import __version__
 from sndintel.config import DATA_DIR, DB_PATH, INCOMING_DIR, MASTER_DIR, ensure_dirs
 from sndintel.fmt import fmt_mt
 from sndintel.ingest.pipeline import clear_billed_sales, rescore_warehouse, run_pipeline
+from sndintel.lineage import apply_lineage, load_lineage
 from sndintel.mtd import banner_text, format_period_label, period_state
 from sndintel.monday import monday_summary_sheets
 from sndintel.ops import (
@@ -196,6 +198,14 @@ def load_all():
             data["shop_day"] = read_sql(conn, "SELECT * FROM shop_day")
         except Exception:
             data["shop_day"] = pd.DataFrame()
+        # Retired POP codes are re-keyed to their live successor, the same way
+        # the pipeline does before scoring, so cycles and flags see one door.
+        data["lineage"] = load_lineage(conn)
+        data["shop_day"] = apply_lineage(data["shop_day"], data["lineage"])
+        try:
+            data["retired"] = read_sql(conn, "SELECT * FROM pop_retired")
+        except Exception:
+            data["retired"] = pd.DataFrame()
         try:
             data["shop_targets"] = read_sql(conn, "SELECT * FROM shop_targets")
         except Exception:
@@ -865,6 +875,7 @@ def _page_this_week(data, period, mtd, ledger):
             visits=data.get("visits"),
             ledger=ledger,
             period=period,
+            lineage=data.get("lineage"),
         )
     if not pack.headline and pack.country.empty:
         st.warning("No action list yet. Rebuild after daily sales are in the warehouse.")
@@ -1013,6 +1024,7 @@ def _load_action(data, period, ledger):
         visits=data.get("visits"),
         ledger=ledger,
         period=period,
+        lineage=data.get("lineage"),
     )
 
 
@@ -1416,40 +1428,87 @@ def _page_shop_book(data, period, mtd, ledger):
         if has_plan:
             cols[5].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.2f}")
     else:
-        n_cols = 6 if has_plan else 4
+        n_cols = 7 if has_plan else 5
         cols = st.columns(n_cols)
         cols[0].metric("Billed (MT)", f"{float(kpis.get('billed_mt') or 0):.2f}")
         cols[1].metric("Expected (MT)", f"{float(kpis.get('expected_mt') or 0):.2f}")
-        cols[2].metric("Gap vs Expected (MT)", f"{float(kpis.get('gap_mt') or 0):.2f}")
-        cols[3].metric("Issue shops", int(kpis.get("n_issues") or 0))
+        cols[2].metric(f"{ams_label(kpis)} (MT)", f"{float(kpis.get('ams_3m_mt') or 0):.2f}")
+        cols[3].metric("Gap vs Expected (MT)", f"{float(kpis.get('gap_mt') or 0):.2f}")
+        cols[4].metric("Issue shops", int(kpis.get("n_issues") or 0))
         if has_plan:
-            cols[4].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.2f}")
-            cols[5].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.2f}")
-    if kpis.get("cover_from_scorecard"):
+            cols[5].metric("Target (MT)", f"{float(kpis.get('target_mt') or 0):.2f}")
+            cols[6].metric("vs Target (MT)", f"{float(kpis.get('vs_target_mt') or 0):.2f}")
+    st.caption(
+        "Cover Billed / Expected / Gap are the sum of this pack's shops, each on its own run-rate, and equal the mix Total. "
+        f"{ams_label(kpis)} is the plain average of the prior months on file (up to three) for the same shops. "
+        "Retired and superseded POP codes are outside the cover."
+    )
+    official = kpis.get("official_expected_mt")
+    factor = kpis.get("expected_factor")
+    if official is not None and factor is not None and abs(float(factor) - 1.0) > 0.005:
         st.caption(
-            "Cover Billed / Expected / Gap are the shops in this pack and add to the mix Total. "
-            "Shop Expected is scaled to this scope’s official Expected (Situation cascade). "
-            "Target is the plan book. Shop Target is only a matched POP."
+            f"Situation cascade Expected for this scope is {float(official):.2f} MT (shop-level sum × {float(factor):.2f}). "
+            "Shops are judged on their own run-rate, not rescaled to that figure."
         )
 
     with st.expander("How to read this pack", expanded=False):
         for line in book.how_to_read:
             st.write("• " + line)
 
+    if book.rollup is not None and not book.rollup.empty:
+        st.markdown("##### Where the gap sits")
+        st.caption(
+            "One row per unit below this scope, largest gap first. Universe doors = doors on the universe file; "
+            "Missed = live shops short of Expected; Lost = doors that stopped; Tail = small doors judged in the coverage panel; "
+            "Retired codes = retired (off-universe, no successor) and superseded (re-coded, still listed) codes — not doors, outside the cover."
+        )
+        _shop_book_table(book.rollup, height=min(420, 60 + 35 * len(book.rollup)))
+
     st.markdown("##### Issue mix")
     quiet = int(kpis.get("n_quiet") or 0)
-    if quiet:
-        st.caption(
-            f"{quiet:,} universe doors with no bill and no run-rate are omitted from named mix rows (they are 0 on Total). "
-            "Mix Total billed, Expected, and Gap match the cover and Situation cascade for this scope. "
-            f"{MIX_OTHER} is Expected under 0.05 MT. Lapsed (lost door) billed is 0."
-        )
-    else:
-        st.caption(
-            "Mix Total billed, Expected, and Gap (Expected − billed) match the cover and Situation cascade for this scope. "
-            f"{MIX_OTHER} is Expected under 0.05 MT. Lapsed (lost door) billed is 0."
-        )
+    st.caption(
+        "Rows add to the Total: Total billed, Expected and Gap equal the cover, Total Shops is the sum of the rows. "
+        f"{MIX_OTHER} are the doors outside each DSR's top 80% by size, added back as one row. Lapsed (lost door) billed is 0."
+        + (f" {quiet:,} universe doors with no bill and no run-rate add nothing and are not counted." if quiet else "")
+    )
     _shop_book_table(book.mix, height=220)
+
+    n_ret = int(kpis.get("n_retired") or 0)
+    n_sup = int(kpis.get("n_superseded") or 0)
+    n_merged = int(kpis.get("n_merged") or 0)
+    if n_ret or n_sup or n_merged or (book.flags is not None and not book.flags.empty):
+        with st.expander(
+            f"POP codes: {n_merged:,} re-coded shops merged · {n_sup:,} superseded codes still on the universe · "
+            f"{n_ret:,} retired codes off the universe",
+            expanded=False,
+        ):
+            st.write(
+                "The universe file is the complete door list. Where a same-name code started billing as an older code stopped "
+                "(same distributor and DSR / code route), the old history is merged into the live code — one shop, counted once, "
+                "flagged “Continues retired code”. **Superseded** = the old code is still listed on the universe file; it is not "
+                "counted as a door — retire it there. **Retired** = the old code is off the universe file and no live code took over; "
+                "it is never an issue and its run-rate is outside Expected."
+            )
+            if book.flags is not None and not book.flags.empty:
+                st.markdown("**Flagged codes in this scope**")
+                _shop_book_table(book.flags, height=min(360, 60 + 35 * len(book.flags)))
+            if book.retired is not None and not book.retired.empty:
+                st.markdown("**Superseded and retired codes in this scope (superseded first, then largest run-rate)**")
+                _shop_book_table(book.retired, height=min(360, 60 + 35 * len(book.retired)))
+    if book.bridge is not None and not book.bridge.empty:
+        with st.expander("Door bridge vs last month", expanded=False):
+            st.caption(
+                "Retained billed both months. Dropped billed last month and not this (valued at last month's bill). "
+                "New never billed before; Reactivated came back after a quiet month."
+            )
+            _shop_book_table(book.bridge, height=min(420, 60 + 35 * len(book.bridge)))
+    if book.tail is not None and not book.tail.empty:
+        with st.expander("Tail coverage", expanded=False):
+            st.caption(
+                "Small doors per DSR: billed doors against the usual count (mean of the three prior months). "
+                "Doors short is the coverage hole to close on the beat."
+            )
+            _shop_book_table(book.tail, height=min(420, 60 + 35 * len(book.tail)))
 
     view = st.radio(
         "Shop list",
@@ -1863,7 +1922,7 @@ def _page_shops(data, period):
 def _page_warehouse(data):
     st.title("Warehouse")
     st.markdown(
-        f"- App version **{__version__}**. If this is still 0.9.x (not 0.10.0), curl did not land the new ZIP.\n"
+        f"- App version **{__version__}**. If this is still 0.10.x or older (not 0.11.0), curl did not land the new ZIP.\n"
         f"- Code can be replaced any time. **Do not** keep `warehouse.db` inside the unzipped app folder.\n"
         f"- Data directory: `{DATA_DIR}`\n"
         f"- Database: `{DB_PATH}`"
