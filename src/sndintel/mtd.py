@@ -9,14 +9,8 @@ from typing import Any, Optional
 import pandas as pd
 
 
-def parse_execution_date(params: dict | None) -> Optional[datetime]:
-    if not params:
-        return None
-    raw = params.get("execution_date")
-    if not raw:
-        return None
-    time_part = params.get("execution_time") or "00:00:00"
-    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+def _try_parse(raw: str, time_part: str, fmts: tuple[str, ...]) -> Optional[datetime]:
+    for fmt in fmts:
         try:
             if "%H" in fmt:
                 return datetime.strptime(f"{raw} {time_part}", fmt)
@@ -24,6 +18,38 @@ def parse_execution_date(params: dict | None) -> Optional[datetime]:
         except ValueError:
             continue
     return None
+
+
+def parse_execution_date(params: dict | None, periods: list[str] | None = None) -> Optional[datetime]:
+    """Execution date from the SSRS chrome, day-first by default.
+
+    SSRS prints the date in the server culture. Day-first (en-GB / en-PK) is
+    the default; when the day-first reading is impossible (month > 12) the
+    month-first reading is used. When both readings are valid and ``periods``
+    are known, the reading whose month is actually on the extract wins —
+    an extract cannot have been run before its newest month.
+    """
+    if not params:
+        return None
+    raw = str(params.get("execution_date") or "").strip()
+    if not raw:
+        return None
+    time_part = str(params.get("execution_time") or "00:00:00").strip()
+    dmy = _try_parse(raw, time_part, ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y"))
+    mdy = _try_parse(raw, time_part, ("%m/%d/%Y %H:%M:%S", "%m/%d/%Y", "%m-%d-%Y %H:%M:%S", "%m-%d-%Y"))
+    if dmy is None and mdy is None:
+        return _try_parse(raw, time_part, ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"))
+    if dmy is None:
+        return mdy
+    if mdy is None or mdy == dmy:
+        return dmy
+    if periods:
+        latest = max(str(p) for p in periods if p)
+        dmy_ok = f"{dmy.year:04d}-{dmy.month:02d}" >= latest
+        mdy_ok = f"{mdy.year:04d}-{mdy.month:02d}" >= latest
+        if mdy_ok and not dmy_ok:
+            return mdy
+    return dmy
 
 
 def open_mtd_period(periods: list[str], execution: Optional[datetime]) -> Optional[str]:
@@ -67,6 +93,8 @@ def format_period_label(
     mon = dt.strftime("%b")
     if open_ and as_of_day and days_in_month:
         return f"{month} MTD · billed through {int(as_of_day)} {mon} ({int(days_in_month)}-day month)"
+    if as_of_day and days_in_month and int(as_of_day) < int(days_in_month):
+        return f"{month} · closed month · billed through {int(as_of_day)} {mon} only"
     return f"{month} · closed month"
 
 
@@ -82,6 +110,7 @@ def period_state(ledger: pd.DataFrame | None, period: str | None) -> dict[str, A
         "execution_date": None,
         "source_file": None,
         "label": period or "",
+        "partial": False,
     }
     if not period or ledger is None or ledger.empty or "period" not in ledger.columns:
         return empty
@@ -104,6 +133,9 @@ def period_state(ledger: pd.DataFrame | None, period: str | None) -> dict[str, A
     elif period:
         label = format_period_label(period, open_=False, as_of_day=as_of_i, days_in_month=days_i)
     exec_raw = row.get("execution_date")
+    # A closed month the warehouse only saw through day N (a later month
+    # arrived before the rest of this one). Billed is N days; Expected is 31.
+    partial = bool((not open_) and as_of_i and days_i and as_of_i < days_i)
     return {
         "period": period,
         "status": status,
@@ -114,6 +146,7 @@ def period_state(ledger: pd.DataFrame | None, period: str | None) -> dict[str, A
         "execution_date": None if pd.isna(exec_raw) else str(exec_raw),
         "source_file": None if pd.isna(row.get("source_file")) else str(row.get("source_file")),
         "label": label,
+        "partial": partial,
     }
 
 

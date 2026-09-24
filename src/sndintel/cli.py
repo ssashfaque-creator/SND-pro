@@ -14,6 +14,7 @@ from rich.table import Table
 from sndintel import __version__
 from sndintel.config import SAMPLE_DIR, DATA_DIR, DB_PATH, APP_DIR
 from sndintel.ingest.pipeline import load_brief, load_kpis, load_ledger, rescore_warehouse, run_pipeline
+from sndintel.lineage import load_lineage, load_shop_day
 from sndintel.mtd import banner_text, period_state
 from sndintel.sampledata import generate_demo_files
 from sndintel.storage import connect, init_db, read_sql
@@ -96,7 +97,7 @@ def rescore():
     """Rebuild city → shop scorecards from the warehouse. Does not re-read a sales file."""
     result = rescore_warehouse()
     console.print_json(data=result)
-    brief()
+    brief(limit=20)
 
 
 @app.command()
@@ -109,7 +110,7 @@ def demo(
     console.print(f"Wrote sample files to {SAMPLE_DIR}")
     result = run_pipeline(paths["sales"], shop_path=paths["shops"])
     console.print_json(data={k: v for k, v in result.items() if k != "warnings"})
-    brief()
+    brief(limit=20)
 
 
 @app.command()
@@ -132,10 +133,14 @@ def brief(limit: int = typer.Option(20, help="How many ranked insights to show")
         if state["open"] and pd.notna(row.get("run_rate_yoy_pct")):
             yoy_txt = f"run-rate {row['run_rate_yoy_pct']:+.1f}%"
         console.print(banner_text(ledger, row["period"]))
+        mom_val = row["comparable_mom_pct"] if pd.notna(row.get("comparable_mom_pct")) else row["mom_pct"]
+        mom_txt = f"{float(mom_val):+.1f}%" if pd.notna(mom_val) else "n/a"
+        if isinstance(yoy_txt, (int, float)) and pd.notna(yoy_txt):
+            yoy_txt = f"{float(yoy_txt):+.1f}%"
         console.print(
             f"[bold]Period {row['period']}[/]  volume {vol_label}  "
             f"strike {row['strike_rate']*100:.0f}%  billed {int(row['billed_outlets'])}/{int(row['universe_outlets'])}  "
-            f"MoM {row['comparable_mom_pct'] if pd.notna(row.get('comparable_mom_pct')) else (row['mom_pct'] if pd.notna(row['mom_pct']) else 'n/a')}  "
+            f"MoM {mom_txt}  "
             f"YoY {yoy_txt}"
         )
     with connect() as conn:
@@ -326,7 +331,7 @@ def actions(limit: int = typer.Option(15, help="How many call-list shops to prin
             shop_month = read_sql(conn, "SELECT * FROM shop_month")
             stores = read_sql(conn, "SELECT * FROM stores")
             try:
-                shop_day = read_sql(conn, "SELECT * FROM shop_day")
+                shop_day = load_shop_day(conn)
             except Exception:
                 shop_day = pd.DataFrame()
             try:
@@ -335,7 +340,7 @@ def actions(limit: int = typer.Option(15, help="How many call-list shops to prin
                 visits = pd.DataFrame()
             ledger = read_sql(conn, "SELECT * FROM period_ledger")
             period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
-            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period, lineage=load_lineage(conn))
     if not pack.headline:
         console.print("No action list yet. Ingest Outlet Date Wise and run [bold]snd-intel rescore[/].")
         raise typer.Exit(1)
@@ -518,7 +523,7 @@ def shops(
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
         stores = read_sql(conn, "SELECT * FROM stores")
         try:
-            shop_day = read_sql(conn, "SELECT * FROM shop_day")
+            shop_day = load_shop_day(conn)
         except Exception:
             shop_day = pd.DataFrame()
         try:
@@ -543,7 +548,7 @@ def shops(
         except Exception:
             action = None
         if action is None or not getattr(action, "headline", None) or str(getattr(action, "period", "") or "") != str(period):
-            action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+            action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period, lineage=load_lineage(conn))
     book = build_shop_book(
         action=action,
         shop_month=shop_month,
@@ -628,7 +633,7 @@ def export_situation(
         ledger = read_sql(conn, "SELECT * FROM period_ledger ORDER BY period")
         stores = read_sql(conn, "SELECT * FROM stores")
         try:
-            shop_day = read_sql(conn, "SELECT * FROM shop_day")
+            shop_day = load_shop_day(conn)
         except Exception:
             shop_day = pd.DataFrame()
         try:
@@ -646,7 +651,7 @@ def export_situation(
             except Exception:
                 action = None
             if action is None or not getattr(action, "headline", None):
-                action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+                action = build_action_pack(shop_month, stores, shop_day, visits, ledger, period, lineage=load_lineage(conn))
     pack = build_situation_pack(units, action=action, ledger=ledger, period=period)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -695,7 +700,7 @@ def export_ops(
             shop_month = read_sql(conn, "SELECT * FROM shop_month")
             stores = read_sql(conn, "SELECT * FROM stores")
             try:
-                shop_day = read_sql(conn, "SELECT * FROM shop_day")
+                shop_day = load_shop_day(conn)
             except Exception:
                 shop_day = pd.DataFrame()
             try:
@@ -704,7 +709,7 @@ def export_ops(
                 visits = pd.DataFrame()
             ledger = read_sql(conn, "SELECT * FROM period_ledger")
             period = latest_period(shop_month) if shop_month is not None and not shop_month.empty else ""
-            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period)
+            pack = build_action_pack(shop_month, stores, shop_day, visits, ledger, period, lineage=load_lineage(conn))
         else:
             try:
                 visits = read_sql(conn, "SELECT * FROM shop_visits")

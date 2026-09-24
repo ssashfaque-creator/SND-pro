@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from sndintel.io_utils import shift_period
+from sndintel.materiality import unit_material_mt
 from sndintel.season import intra_month_fraction  # re-export for callers / tests
 
 
@@ -248,12 +249,23 @@ def apply_shift_share(
 
 
 def _situation_label(r: pd.Series) -> str:
-    iso = float(r.get("isolated_mt") or 0)
+    """Lagging / with market / outperforming from the *true* gap versus Expected.
+
+    The Empirical-Bayes residual (``isolated_mt``) orders the lists; it does
+    not decide the label. A unit that billed less than its Expected by a
+    material amount is lagging whatever the shrinkage says — otherwise the
+    printed Gap and the label contradict each other on the same row.
+    """
     exp = float(r.get("expected_mt") or r.get("ly_mt") or 0)
-    material = max(0.5, 0.02 * exp) if exp >= 8 else max(0.15, 0.05 * max(exp, 0.0))
-    if iso <= -material:
+    comp = r.get("competitive_mt")
+    if comp is None or pd.isna(comp):
+        vol = r.get("volume_mt")
+        comp = (float(vol) - exp) if vol is not None and not pd.isna(vol) and exp else r.get("isolated_mt")
+    gap = float(comp or 0)
+    material = unit_material_mt(exp)
+    if gap <= -material:
         return "lagging"
-    if iso >= material:
+    if gap >= material:
         return "outperforming"
     return "with_market"
 

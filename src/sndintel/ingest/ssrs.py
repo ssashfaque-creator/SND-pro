@@ -425,12 +425,19 @@ def _resolve_mtd(df: pd.DataFrame, yg_cols: list[str]) -> pd.Series:
 
 
 def collapse_sales_facts(df: pd.DataFrame) -> pd.DataFrame:
-    """One fact per shop + SKU + month. Duplicate lines are copies, not extra volume.
+    """One fact per shop + SKU + month.
 
-    Shop SKU Wise MTD is already a month total. Summing identical (or near-identical)
-    lines writes one warehouse row at 2×, so billed and AMS both look double versus
-    the user's extract. Rebuild cannot un-sum that; this collapse must run at parse
-    time and again when reading the warehouse.
+    Shop SKU Wise MTD is already a month total, so an *identical* line (same
+    shop, SKU, month, hierarchy, and volume — a whitespace copy or a repeated
+    tablix row) is a copy, not extra volume, and is dropped. A line for the same
+    shop + SKU + month that carries a *different* volume is real: the SSRS matrix
+    groups Distributor → DSR → POP, so a POP served by two DSRs in one month
+    appears twice and both lines add up to the extract's Grand Total.
+
+    Total lines are recognised structurally (an SKU label that reads as a
+    total). No arithmetic guess is made — with carton-quantised volumes
+    (0.005 + 0.005 = 0.010) a "SKU equal to the sum of the others" is routine
+    and deleting it silently understates the shop.
     """
     if df is None or df.empty:
         return df if df is not None else pd.DataFrame()
@@ -442,55 +449,32 @@ def collapse_sales_facts(df: pd.DataFrame) -> pd.DataFrame:
     if "period" in out.columns:
         out["period"] = out["period"].astype(str).str.strip()
     out["volume_mt"] = pd.to_numeric(out.get("volume_mt"), errors="coerce")
-    out = out.loc[out["volume_mt"].notna() & (out["volume_mt"] > 0)].copy()
+    # Negative lines are returns; they net inside the shop-SKU-month below.
+    out = out.loc[out["volume_mt"].notna() & (out["volume_mt"] != 0)].copy()
     if out.empty:
         return out
 
-    dup_cols = [c for c in ("store_id", "sku", "period", "volume_mt") if c in out.columns]
+    key = [c for c in ("store_id", "sku", "period") if c in out.columns]
+    if "_prefer_mtd" in out.columns:
+        # When the MTD measure exists for a key, the year-group fallback rows
+        # for that same key describe the same volume and must not add to it.
+        out["_prefer_mtd"] = out["_prefer_mtd"].fillna(False).astype(bool)
+        has_mtd = out.groupby(key)["_prefer_mtd"].transform("max").astype(bool)
+        out = out.loc[~has_mtd | out["_prefer_mtd"]].copy()
+
+    hier = [c for c in ("distributor", "dsr_name", "section") if c in out.columns]
+    dup_cols = key + hier + ["volume_mt"]
     out = out.drop_duplicates(dup_cols, keep="first")
 
-    if "_prefer_mtd" in out.columns:
-        out["_prefer_mtd"] = out["_prefer_mtd"].fillna(False).astype(bool)
-        out = out.sort_values("_prefer_mtd", ascending=False, kind="mergesort")
-
-    key = [c for c in ("store_id", "sku", "period") if c in out.columns]
     extra = [c for c in out.columns if c not in key]
-    grouped = out.groupby(key, as_index=False, sort=False).agg({c: "first" for c in extra})
-    grouped = _drop_embedded_shop_totals(grouped)
+    agg = {c: "first" for c in extra}
+    agg["volume_mt"] = "sum"
+    grouped = out.groupby(key, as_index=False, sort=False).agg(agg)
     if "_prefer_mtd" in grouped.columns:
         grouped = grouped.drop(columns=["_prefer_mtd"])
+    # A month that nets to exactly zero (sale fully returned) is no fact.
+    grouped = grouped.loc[pd.to_numeric(grouped["volume_mt"], errors="coerce").fillna(0).abs() > 1e-12]
     return grouped.reset_index(drop=True)
-
-
-def _drop_embedded_shop_totals(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop a SKU whose volume is the sum of the other SKUs at that shop-month.
-
-    SSRS sometimes repeats the shop total as an extra product line. Do not drop
-    when only two SKUs have the same volume — that would wipe both real lines.
-    """
-    if df is None or df.empty:
-        return df
-    if not {"store_id", "period", "volume_mt"}.issubset(df.columns):
-        return df
-    if len(df) < 3:
-        return df
-    work = df.reset_index(drop=True)
-    drop: list[int] = []
-    for _, part in work.groupby(["store_id", "period"], sort=False):
-        if len(part) < 3:
-            continue
-        vols = pd.to_numeric(part["volume_mt"], errors="coerce").fillna(0.0)
-        total = float(vols.sum())
-        matches = [
-            int(idx)
-            for idx, val in vols.items()
-            if (total - float(val)) > 1e-9 and abs(float(val) - (total - float(val))) <= 1e-6
-        ]
-        if len(matches) == 1:
-            drop.append(matches[0])
-    if not drop:
-        return work
-    return work.drop(index=drop).reset_index(drop=True)
 
 
 def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
@@ -560,7 +544,7 @@ def _normalize_sales(mapped: pd.DataFrame, report: ParseReport) -> pd.DataFrame:
     df["period"] = [period_key(y, m) for y, m in zip(df["year"], df["month"])]
     df["volume_mt"] = df["volume_mt"].fillna(0.0).astype(float)
     df["store_id"] = df["store_id"].astype(str).str.strip()
-    df = df[df["volume_mt"] > 0]
+    df = df[df["volume_mt"] != 0]
     n_before = len(df)
     grouped = collapse_sales_facts(df)
     n_dropped = n_before - len(grouped)

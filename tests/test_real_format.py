@@ -183,17 +183,19 @@ def test_collapse_prefers_mtd_over_year_group_backfill():
     assert abs(float(out.iloc[0]["volume_mt"]) - 0.04) < 1e-9
 
 
-def test_embedded_shop_total_sku_is_dropped_but_two_equal_skus_are_kept():
+def test_real_sku_equal_to_sum_of_others_is_kept_and_labelled_totals_are_dropped():
+    """No arithmetic guessing: 0.10 + 0.20 = 0.30 is a normal carton pattern, not a total line."""
     tot = pd.DataFrame(
         [
             {"store_id": "T1", "sku": "Oil A", "period": "2026-07", "volume_mt": 0.10},
             {"store_id": "T1", "sku": "Oil B", "period": "2026-07", "volume_mt": 0.20},
             {"store_id": "T1", "sku": "Combo Pack", "period": "2026-07", "volume_mt": 0.30},
+            {"store_id": "T1", "sku": "Hameed GS Total", "period": "2026-07", "volume_mt": 0.60},
         ]
     )
     out = collapse_sales_facts(tot)
-    assert set(out["sku"]) == {"Oil A", "Oil B"}
-    assert abs(float(out["volume_mt"].sum()) - 0.30) < 1e-9
+    assert set(out["sku"]) == {"Oil A", "Oil B", "Combo Pack"}
+    assert abs(float(out["volume_mt"].sum()) - 0.60) < 1e-9
 
     twins = pd.DataFrame(
         [
@@ -204,6 +206,33 @@ def test_embedded_shop_total_sku_is_dropped_but_two_equal_skus_are_kept():
     kept = collapse_sales_facts(twins)
     assert len(kept) == 2
     assert abs(float(kept["volume_mt"].sum()) - 0.20) < 1e-9
+
+
+def test_same_pop_sku_month_under_two_dsrs_adds_but_exact_copies_do_not():
+    two_dsrs = pd.DataFrame(
+        [
+            {"store_id": "T1", "sku": "Oil A", "period": "2026-07", "volume_mt": 0.10, "dsr_name": "Ali"},
+            {"store_id": "T1", "sku": "Oil A", "period": "2026-07", "volume_mt": 0.25, "dsr_name": "Bilal"},
+            {"store_id": "T1", "sku": "Oil A", "period": "2026-07", "volume_mt": 0.25, "dsr_name": "Bilal"},
+        ]
+    )
+    out = collapse_sales_facts(two_dsrs)
+    assert len(out) == 1
+    assert abs(float(out.iloc[0]["volume_mt"]) - 0.35) < 1e-9
+
+
+def test_mtd_measure_rows_win_over_year_group_fallback_rows_for_the_same_key():
+    mixed = pd.DataFrame(
+        [
+            {"store_id": "T1", "sku": "Oil A", "period": "2026-07", "volume_mt": 0.30, "_prefer_mtd": True},
+            {"store_id": "T1", "sku": "Oil A", "period": "2026-07", "volume_mt": 0.28, "_prefer_mtd": False},
+            {"store_id": "T1", "sku": "Oil B", "period": "2026-07", "volume_mt": 0.05, "_prefer_mtd": False},
+        ]
+    )
+    out = collapse_sales_facts(mixed).set_index("sku")
+    assert abs(float(out.loc["Oil A", "volume_mt"]) - 0.30) < 1e-9
+    assert abs(float(out.loc["Oil B", "volume_mt"]) - 0.05) < 1e-9
+    assert "_prefer_mtd" not in out.columns
 
 
 def test_rescore_collapses_duplicate_sku_keys_in_warehouse(tmp_path):

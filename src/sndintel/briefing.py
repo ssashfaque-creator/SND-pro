@@ -27,9 +27,10 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from sndintel.config import EXPECTED_FORMULA
 from sndintel.coverage import allocate_recoverable_drivers, attach_remarks, sibling_z_frame
+from sndintel.fmt import excel_number_format, fmt_mt, round_mt
 from sndintel.hierarchy import _shop_gaps
 from sndintel.isolate import empirical_bayes, k_from_ly
-from sndintel.io_utils import prior_periods, shift_period
+from sndintel.io_utils import shift_period, window_periods
 from sndintel.mtd import period_state
 from sndintel.season import elapsed_month_frac, fit_seasonality, fit_shop_expected, reconcile_expected
 
@@ -51,7 +52,7 @@ DRIVER_LABEL = {
 
 GLOSSARY = [
     ("Billed this period", "Secondary volume in the month being scored (MTD if the month is still open)."),
-    ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. This is always a full-month run-rate, even when billed is MTD."),
+    ("AMS last 3 months", "Average monthly secondary volume of the three calendar months immediately before this period — (May + June + July) ÷ 3 when scoring August. A month with no volume counts as 0, so we never skip a hole and pull in last year. Months before the first extract on file are unknown, not zero: with data from May, July's AMS is (May + June) ÷ 2. This is always a full-month run-rate, even when billed is MTD."),
     ("vs AMS", "This period minus AMS × elapsed calendar days (day 20 of 31 is billed − AMS × 20/31). Negative = behind the recent run-rate. The AMS column itself stays the full-month number. Expected can use a different intra-month fraction when Outlet Date Wise teaches the country’s usual billed-by-day shape."),
     ("Same month last year", "What this unit billed in the same calendar month a year ago (full closed month). Zero means no August last year — it does not mean Expected should be zero."),
     ("Expected this month", "Recent run-rate: mean of the three calendar months immediately before this period (same window as AMS), blended with the last-six-month median, paced if MTD is open. The pace is the country’s usual billed share by that calendar day (Outlet Date Wise, one national curve — not a per-store or per-city shape). Same method at country, city, distributor, DSR, and shop. Calendar-month seasonality is not applied — a city with no August history still expects its recent monthly run-rate. Children’s Expecteds are then scaled so they add to the parent."),
@@ -66,7 +67,8 @@ GLOSSARY = [
     ("Remarks", "Four bullets: trend vs AMS, vs Expected, and YoY; visit coverage vs country; productivity (billed ÷ visited) vs country; drop size vs expected drop vs national average. Expected drop is Expected volume ÷ Expected billed shops — same last-3 / last-6 run-rate as Expected sales, not this month’s shop count and not paced."),
     ("Visit %", "Universe shops visited this period ÷ universe. A billed shop counts as visited even if the visit file missed it."),
     ("Strike %", "Billed shops ÷ universe shops on the live universe list."),
-    ("Live universe", "The Universe Shop List is the only book that can sell. POP code is the shop. Names/DSR/distributor/city follow the current list. Closed POPs (not on the list) are dropped from history for scoring."),
+    ("Live universe", "The Universe Shop List is the complete door list. POP code is the shop. Names/DSR/distributor/city follow the current list. Billed POPs not on the list still count in volume (flagged off-master) but not in coverage."),
+    ("Retired / superseded POP code", "A re-coded shop. Retired = billing history but not on the universe list; where a same-name live code started as it stopped (same distributor, DSR / code route), the old history is merged into the live code and the shop is counted once. Superseded = still on the universe list but re-coded the same way; not counted as a door until the list retires it. Neither is a lost door or a miss."),
     ("Shop lists", "Summary pack: top 50 most serious lagging doors (after dropping gaps ≤ 0.25 MT), ranked by how far behind their own Expected they are for their size — not the biggest Gap tons. The rest of the hole is one remainder line. Detailed pack still lists every door above 0.25 MT."),
     ("AMS = 0 distributors / DSRs", "Hidden everywhere in the report. No recent three-month run-rate, so they are not a call."),
     (
@@ -118,7 +120,7 @@ CALCULATION_NOTES = [
     ),
     (
         "Rounding and lists",
-        "MT, shop counts, and percents print as whole numbers. From-columns still add to Gap after rounding. Drop size stays two decimals. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names volume top-10 and seriousness top-10 for distributors and DSRs, whales, then the top 50 most serious shops. Remainder lines are the tail.",
+        "MT prints to two decimals — never whole tons, a 1 MT step is a DSR-week. Shop counts and percents are whole numbers. From-columns still add to Gap after rounding. Prose writes volumes under 0.1 MT in kg. Distributors and DSRs with AMS = 0 are hidden. The summary pack then names volume top-10 and seriousness top-10 for distributors and DSRs, whales, then the top 50 most serious shops. Remainder lines are the tail.",
     ),
     (
         "Top-N lists",
@@ -443,7 +445,7 @@ def build_strategy_pack(
     shop_note = (
         f"Top {SUMMARY_SHOP_N} most serious lagging shops (miss versus own Expected given size). "
         f"{int(lag_meta.get('n_hidden') or 0)} other doors totalling "
-        f"{float(lag_meta.get('hidden_mt') or 0):.0f} MT gap are the remainder line "
+        f"{fmt_mt(lag_meta.get('hidden_mt'))} gap are the remainder line "
         f"(includes gaps ≤ {hole_floor:.2f} MT)."
     )
     presented_dists = _present_with_remainder(
@@ -666,7 +668,7 @@ def focus_pack(pack: StrategyPack, report_type: str, entity: str) -> StrategyPac
 
 
 def score_shops(shop_month: pd.DataFrame, cities: pd.DataFrame, period: str, pace: float) -> pd.DataFrame:
-    """Shop hole versus its own Expected. Recoverable = that miss after EB shrink."""
+    """Shop hole versus its own Expected. Gap = Expected − billed; EB shrink only orders the list."""
     if shop_month is None or shop_month.empty or not period:
         return pd.DataFrame()
     yoy = shift_period(period, -12)
@@ -699,7 +701,9 @@ def score_shops(shop_month: pd.DataFrame, cities: pd.DataFrame, period: str, pac
     k_shop = k_from_ly(gaps["ly_mt"], 0.05)
     size = ly_s.where(ly_s >= exp, exp)
     gaps["isolated_mt"] = [empirical_bayes(c, s, k_shop) for c, s in zip(gaps["competitive_mt"], size)]
-    gaps["recoverable_mt"] = gaps["isolated_mt"].clip(upper=0).abs()
+    # One Gap definition across every pack: Expected − billed, floored at 0.
+    # The shrunk residual stays as isolated_mt for ordering only.
+    gaps["recoverable_mt"] = (exp - vol).clip(lower=0)
     gaps["store_name"] = gaps["store_name"].replace("", pd.NA).fillna(gaps["store_id"])
     return gaps.loc[gaps["recoverable_mt"] > 0].copy()
 
@@ -848,20 +852,20 @@ def _append_remainder(
     top_n = meta.get("top_n")
     if top_n:
         rest[name_field] = (
-            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            f"Not listed — {n_hidden} {noun} totalling {fmt_mt(hidden_mt)} gap. "
             f"Ranked by how serious the miss is versus own Expected; only the top {int(top_n)} are named on this sheet."
         )
     elif name_field == "Shop":
         rest[name_field] = (
-            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            f"Not listed — {n_hidden} {noun} totalling {fmt_mt(hidden_mt)} gap. "
             "Gaps of 0.25 MT or less, not a first call."
         )
     else:
         rest[name_field] = (
-            f"Not listed — {n_hidden} {noun} totalling {hidden_mt:.0f} MT gap. "
+            f"Not listed — {n_hidden} {noun} totalling {fmt_mt(hidden_mt)} gap. "
             "The rest of the hole after the named rows."
         )
-    rest["Gap (MT)"] = _round_num(hidden_mt)
+    rest["Gap (MT)"] = _round_mt_num(hidden_mt)
     extra = pd.DataFrame([rest])
     if table is None or table.empty:
         return extra
@@ -897,14 +901,16 @@ def ams_last_n(
 ) -> pd.DataFrame:
     """Mean monthly volume of the n calendar months immediately before ``period``.
 
-    Scoring 2026-08 is (May + June + July) / 3. A missing month counts as 0, so
-    the divisor stays n — we do not skip a hole and pull in last year. Duplicate
-    store-period rows are collapsed before summing. ``ledger`` is unused; the
-    window is calendar months, not "last n closed periods that exist".
+    Scoring 2026-08 is (May + June + July) / 3. A missing month inside the
+    panel counts as 0, so the divisor stays n — we do not skip a hole and pull
+    in last year. Months before the first extract on file are unknown and are
+    left out of the window (and the divisor). Duplicate store-period rows are
+    collapsed before summing. ``ledger`` is unused; the window is calendar
+    months, not "last n closed periods that exist".
     """
     del ledger
     cols = keys + ["ams_3m"]
-    window = prior_periods(period, n)
+    window = window_periods(period, n, shop_month)
     if shop_month is None or shop_month.empty or not period or not window:
         return pd.DataFrame(columns=cols)
     hist = shop_month.copy()
@@ -1187,11 +1193,25 @@ def render_html(pack: StrategyPack, detailed: bool = False) -> str:
 
 # ----- internals -----
 
+def true_gap_mt(frame: pd.DataFrame) -> pd.Series:
+    """Gap (MT) printed on every pack: Expected − billed, floored at 0.
+
+    ``isolated_mt`` (the Empirical-Bayes shrunk residual) is kept for ranking
+    and the situation label's ordering, but is never printed as the gap — a
+    reader adds the column and expects it to meet the scope's gap.
+    """
+    if frame is None or frame.empty:
+        return pd.Series(dtype=float)
+    exp = pd.to_numeric(frame.get("expected_mt"), errors="coerce") if "expected_mt" in frame.columns else pd.Series(0.0, index=frame.index)
+    vol = pd.to_numeric(frame.get("volume_mt"), errors="coerce") if "volume_mt" in frame.columns else pd.Series(0.0, index=frame.index)
+    return (exp.fillna(0.0) - vol.fillna(0.0)).clip(lower=0)
+
+
 def _grain(units: pd.DataFrame, grain: str) -> pd.DataFrame:
     out = units[units["grain"] == grain].copy()
     if out.empty:
         return out
-    out["recoverable_mt"] = pd.to_numeric(out.get("isolated_mt"), errors="coerce").fillna(0).clip(upper=0).abs()
+    out["recoverable_mt"] = true_gap_mt(out)
     drop = pd.to_numeric(out.get("from_drop_size_mt"), errors="coerce")
     if drop.isna().all():
         drop = pd.to_numeric(out.get("velocity_effect_mt"), errors="coerce")
@@ -1296,8 +1316,17 @@ def _round_num(val: Any) -> Any:
         return val
 
 
+def _round_mt_num(val: Any) -> Any:
+    v = round_mt(val)
+    return pd.NA if v is None else v
+
+
 def _round_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Whole numbers for MT, counts, and percents. From-columns still sum to Gap."""
+    """Two decimals for MT (never integer MT), whole numbers for counts and percents.
+
+    The three From-columns are nudged so they still sum to Gap after rounding —
+    the largest driver absorbs the rounding residue.
+    """
     if df is None or df.empty:
         return df
     out = df.copy()
@@ -1312,30 +1341,25 @@ def _round_display(df: pd.DataFrame) -> pd.DataFrame:
         if col == "Remarks":
             continue
         name = str(col)
-        if name == "Drop size (MT)":
-            out[col] = [
-                (round(float(v), 2) if v is not None and pd.notna(v) else pd.NA) for v in out[col]
-            ]
+        if "(MT)" in name:
+            out[col] = [_round_mt_num(v) for v in out[col]]
             continue
-        if "(MT)" in name or name.endswith("%") or name in count_cols:
+        if name.endswith("%") or name in count_cols:
             out[col] = [_round_num(v) for v in out[col]]
     if rec_col in out.columns and len(from_cols) == 3:
         for i in out.index:
             rec = out.loc[i, rec_col]
-            rec_i = int(rec) if rec is not None and pd.notna(rec) else 0
+            rec_c = int(round(float(rec) * 100)) if rec is not None and pd.notna(rec) else 0
             parts = []
             for c in from_cols:
                 v = out.loc[i, c]
-                parts.append(int(v) if v is not None and pd.notna(v) else 0)
-            if rec_i != 0:
-                target = rec_i
-            else:
-                target = int(round(sum(parts)))
+                parts.append(int(round(float(v) * 100)) if v is not None and pd.notna(v) else 0)
+            target = rec_c if rec_c != 0 else sum(parts)
             diff = target - sum(parts)
             if diff:
                 j = max(range(len(parts)), key=lambda k: abs(parts[k]))
                 parts[j] += diff
-                out.loc[i, from_cols[j]] = parts[j]
+                out.loc[i, from_cols[j]] = parts[j] / 100.0
     return out
 
 
@@ -1718,24 +1742,12 @@ def _excel_value(value: Any) -> Any:
 
 
 def _format_metric_cell(cell, header: str) -> None:
-    h = str(header)
-    if h == "Drop size (MT)":
-        cell.number_format = "0.00"
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
+    """Two-decimal MT (signed for directional columns), whole kg/counts/percents, right aligned."""
+    fmt = excel_number_format(header)
+    if fmt is None:
         return
-    if "(MT)" in h:
-        cell.number_format = (
-            "+0;-0;0"
-            if h.startswith("Extra") or h.startswith("vs ") or h.startswith("From ") or "Gap" in h
-            else "#,##0"
-        )
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
-    elif h.endswith("%") or "Strike" in h:
-        cell.number_format = "0"
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
-    elif h in {"Billed shops", "Visited shops", "Universe", "Visits MTD"}:
-        cell.number_format = "#,##0"
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
+    cell.number_format = fmt
+    cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="right")
 
 
 def row_tone(row: pd.Series) -> str:

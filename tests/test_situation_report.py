@@ -479,7 +479,7 @@ def test_national_cover_explains_gap_split():
     closed_units = attach_plan(closed_units, targets, pace=1.0)
     pack = build_situation_pack(closed_units, ledger=ledger, period="2026-08")
     blob = " ".join([pack.headline, pack.weather] + list(pack.situation) + list(pack.plan_lines))
-    assert "Gap versus Expected" in blob or "met Expected" in blob
+    assert "Gap versus Expected" in blob or "met Expected" in blob or "beat Expected by" in blob
     assert "Missed quota" in blob or "missed the monthly target" in blob.lower()
     assert "stretch" in blob.lower()
     gb = pack.gap_breakdown

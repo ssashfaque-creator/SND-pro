@@ -10,7 +10,6 @@ fastapi>=0.111
 uvicorn>=0.30
 typer>=0.12
 rich>=13.7
-joblib>=1.4
 python-dateutil>=2.9
 pydantic>=2.7
 pytest>=8.2

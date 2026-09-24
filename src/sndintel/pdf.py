@@ -37,6 +37,7 @@ from sndintel.briefing import (
     row_tone,
 )
 from sndintel.config import EXPECTED_FORMULA
+from sndintel.fmt import fmt_cell
 
 NAVY = colors.HexColor("#0F172A")
 SLATE = colors.HexColor("#475569")
@@ -144,7 +145,7 @@ def write_pdf(pack: StrategyPack, path: Path | str | BytesIO, detailed: bool = F
         canvas.drawString(
             10 * mm,
             5 * mm,
-            f"Figures in MT are whole numbers. From drop / unvisited / unbilled add to Gap. {EXPECTED_FORMULA}.",
+            f"MT to two decimals, kg under 0.1 MT. From drop / unvisited / unbilled add to Gap. {EXPECTED_FORMULA}.",
         )
         canvas.drawRightString(pagesize[0] - 10 * mm, 5 * mm, f"Page {doc_.page}")
         canvas.restoreState()
@@ -276,7 +277,7 @@ def _glossary_flowables(pack: StrategyPack, styles: dict[str, ParagraphStyle], d
         Paragraph("Glossary", styles["h2"]),
         Paragraph(
             "Read this page first. Every later table uses these words. "
-            "Figures in MT are whole numbers; drop size is two decimals. "
+            "MT figures carry two decimals (never whole tons); volumes under 0.1 MT are written in kg. "
             "From drop / unvisited / unbilled add to Gap.",
             styles["note"],
         ),
@@ -464,19 +465,8 @@ def _cell(val: Any, col: str, styles: dict[str, ParagraphStyle]) -> Paragraph:
 
 
 def _pdf_cell_text(val: Any, col: str) -> str:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return "—"
-    if isinstance(val, (int, float)) and col == "Drop size (MT)":
-        return f"{float(val):.2f}"
-    if isinstance(val, (int, float)) and "(MT)" in col:
-        n = int(round(float(val)))
-        if col in SIGNED_MT or col.startswith("vs ") or col.startswith("From "):
-            return f"{n:+,}"
-        return f"{n:,}"
-    if isinstance(val, (int, float)) and (col.endswith("%") or "Strike" in col):
-        return f"{int(round(float(val)))}"
-    if isinstance(val, (int, float)) and col in {"Billed shops", "Visited shops", "Universe", "Visits MTD"}:
-        return f"{int(round(float(val))):,}"
-    if isinstance(val, float):
-        return f"{int(round(val)):,}"
-    return str(val)
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and "(MT)" in col and col in SIGNED_MT:
+        if val is None or pd.isna(val):
+            return "—"
+        return f"{float(val):+,.2f}"
+    return fmt_cell(val, col)

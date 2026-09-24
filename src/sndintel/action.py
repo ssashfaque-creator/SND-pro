@@ -28,16 +28,21 @@ from sndintel.demand import (
     ACTION_LIFT,
     ACTION_RECOVER,
     DUE_RATIO,
+    LAPSE_MIN_DAYS,
     LAPSE_MULTIPLIER,
+    lapse_cutoff_days,
     attach_demand_cycles,
     attach_pipeline,
     classify_demand_actions,
 )
-from sndintel.io_utils import prior_periods, shift_period
+from sndintel.io_utils import shift_period, window_periods
 from sndintel.mtd import period_state
 from sndintel.nextdrop import attach_next_drop
 from sndintel.season import fit_seasonality, fit_shop_expected
 
+ACTION_RETIRED = "Retired code"
+ACTION_SUPERSEDED = "Superseded code"
+OFF_BEAT_ACTIONS = frozenset({ACTION_RETIRED, ACTION_SUPERSEDED})
 SHOP_FLOOR_MT = 0.25
 SHRINK_K = 4.0
 SUMMARY_DIST_N = 15
@@ -98,12 +103,16 @@ def build_action_pack(
     visits: pd.DataFrame | None = None,
     ledger: pd.DataFrame | None = None,
     period: str | None = None,
+    lineage: pd.DataFrame | None = None,
 ) -> ActionPack:
     """Score every universe door for due / another-visit / lapsing / hold.
 
     Ask is the 90-day expected drop when the depletion ratio is ≥ 0.8 and the
     shop is not lapsed. Official Expected is still last-3 / last-6 for Gap.
     0-history universe doors stay Due with Ask 0 so they count in visit %.
+    ``lineage`` (accepted retired → live POP pairs) marks the live codes whose
+    history was merged; ``shop_month`` / ``shop_day`` are expected to already be
+    re-keyed by the pipeline.
     """
     if shop_month is None or shop_month.empty:
         return empty_action_pack(period or "")
@@ -128,6 +137,7 @@ def build_action_pack(
         pack.open_mtd = open_mtd
         pack.label = mtd.get("label") or period
         return pack
+    shops = _attach_lineage(shops, lineage)
 
     daily = _prepare_daily(shop_day)
     has_daily = not daily.empty
@@ -147,6 +157,7 @@ def build_action_pack(
 
     shops = apply_city_driver_priority(shops)
     shops = _attach_rest_of_month(shops, days_left, open_mtd, days_in_month)
+    shops = _retire_off_universe(shops)
     shops["instruction"] = [_instruction(r) for r in shops.itertuples(index=False)]
     shops["value_score"] = _value_score(shops)
     shops = shops.sort_values(["value_score", "week_target_mt", "days_overdue"], ascending=False)
@@ -442,7 +453,9 @@ def _shop_expected_full(shop_month: pd.DataFrame, period: str) -> pd.DataFrame:
     full = pd.to_numeric(out.get("expected_full_mt"), errors="coerce")
     paced = pd.to_numeric(out.get("expected_mt"), errors="coerce")
     out["expected_mt"] = full.where(full.notna() & (full > 0), paced).fillna(0.0)
-    recent = prior_periods(period, 3)
+    # Same window Expected used: months before the first extract are unknown,
+    # so the plain average divides by the months on file, not by three.
+    recent = window_periods(period, 3, shop_month)
     hist = shop_month[shop_month["period"].astype(str).isin(recent)].copy()
     if hist.empty:
         out["ams_3m"] = 0.0
@@ -515,7 +528,100 @@ def _shop_frame(
         if col not in out.columns:
             out[col] = ""
         out[col] = out[col].fillna("").astype(str)
+    # On / off the live universe. With no universe loaded every code is live.
+    if not uni.empty:
+        out["in_universe"] = out["store_id"].astype(str).isin(set(uni["store_id"].astype(str))).astype(int)
+    else:
+        out["in_universe"] = 1
     return out.reset_index(drop=True)
+
+
+def _retire_off_universe(shops: pd.DataFrame) -> pd.DataFrame:
+    """Off-universe and superseded codes with no bill this month leave the beat.
+
+    The universe file is the complete door list. A code with history that is
+    not on it and did not bill is a retired code: not due, not lapsed, Ask 0,
+    and its run-rate is kept aside as ``run_rate_mt`` (Expected 0) so the
+    pipeline, roll-ups and door counts only describe universe doors. A code
+    off the universe that *did* bill stays: its volume is real. A code that
+    is still listed but was superseded by a same-name successor (lineage) is
+    handled the same way under ``ACTION_SUPERSEDED`` — its history already sits
+    on the successor, so counting it as a door would double the shop.
+    """
+    out = shops.copy()
+    out["run_rate_mt"] = pd.to_numeric(out.get("expected_mt"), errors="coerce").fillna(0.0)
+    if "in_universe" not in out.columns:
+        return out
+    off = pd.to_numeric(out["in_universe"], errors="coerce").fillna(1).astype(int).eq(0)
+    billed = pd.to_numeric(out.get("billed_mt"), errors="coerce").fillna(0.0) > 0
+    if "superseded_by" in out.columns:
+        superseded = out["superseded_by"].fillna("").astype(str).str.strip().ne("")
+    else:
+        superseded = pd.Series(False, index=out.index)
+    retired = off & ~billed
+    # A superseded code's bills are already re-keyed to its successor, so it
+    # never bills under its own code here; it leaves the beat the same way.
+    superseded = superseded & ~retired & ~billed
+    if not (retired.any() or superseded.any()):
+        return out
+    out.loc[retired, "action"] = ACTION_RETIRED
+    out.loc[retired, "recommended_action"] = "Retired code — fix the universe"
+    out.loc[superseded, "action"] = ACTION_SUPERSEDED
+    out.loc[superseded, "recommended_action"] = "Superseded code — retire it in the universe"
+    if superseded.any() and "superseded_last_bill" in out.columns:
+        if "last_bill_date" not in out.columns:
+            out["last_bill_date"] = ""
+        have = out["last_bill_date"].fillna("").astype(str).str.strip().ne("")
+        fill = superseded & ~have
+        out.loc[fill, "last_bill_date"] = out.loc[fill, "superseded_last_bill"].fillna("").astype(str)
+    retired = retired | superseded
+    out.loc[retired, "is_lapsed"] = False
+    if "coming_due" in out.columns:
+        out.loc[retired, "coming_due"] = False
+    for col in (
+        "expected_mt",
+        "remaining_mt",
+        "light_mt",
+        "should_have_mt",
+        "behind_pace_mt",
+        "week_target_mt",
+        "due_unvisited_mt",
+        "drop_variance_mt",
+        "not_yet_due_mt",
+        "pipeline_expected_mt",
+        "n_orders_left",
+    ):
+        if col in out.columns:
+            out.loc[retired, col] = 0.0
+    return out
+
+
+def _attach_lineage(shops: pd.DataFrame, lineage: pd.DataFrame | None) -> pd.DataFrame:
+    """Lineage columns per code.
+
+    ``continues_codes``: the old POP codes whose history this live code now
+    carries. ``superseded_by``: for a code that is still listed on the
+    universe but was merged into a successor, the successor's code — its
+    history has moved there, so it must not count as a door of its own.
+    """
+    from sndintel.lineage import continues_map, lineage_map
+
+    out = shops.copy()
+    out["continues_codes"] = ""
+    out["superseded_by"] = ""
+    cont = continues_map(lineage)
+    if not cont:
+        return out
+    ids = out["store_id"].astype(str)
+    out["continues_codes"] = ids.map(lambda s: ", ".join(sorted(cont.get(s, [])))).fillna("")
+    out["superseded_by"] = ids.map(lineage_map(lineage)).fillna("")
+    # The superseded code's own bills now sit on the successor, so remember
+    # when it last billed under its own code for the shop book's panel.
+    last = {}
+    if isinstance(lineage, pd.DataFrame) and "old_last" in lineage.columns:
+        last = {str(o): str(d or "") for o, d in zip(lineage["old_id"], lineage["old_last"].fillna(""))}
+    out["superseded_last_bill"] = ids.map(last).fillna("")
+    return out
 
 
 def _latest_attrs(shop_month: pd.DataFrame, stores: pd.DataFrame | None, period: str) -> pd.DataFrame:
@@ -550,8 +656,8 @@ def _latest_attrs(shop_month: pd.DataFrame, stores: pd.DataFrame | None, period:
 
 def _attach_trend(shops: pd.DataFrame, shop_month: pd.DataFrame, period: str) -> pd.DataFrame:
     out = shops.copy()
-    recent = prior_periods(period, 3)
-    prior = prior_periods(shift_period(period, -3), 3)
+    recent = window_periods(period, 3, shop_month)
+    prior = window_periods(shift_period(period, -3), 3, shop_month)
     hist = shop_month.copy()
     hist["store_id"] = hist["store_id"].astype(str)
     r = hist[hist["period"].astype(str).isin(recent)].groupby("store_id")["volume_mt"].mean()
@@ -629,6 +735,22 @@ def _instruction(row: Any) -> str:
     cycle_s = f"{int(round(float(cycle)))} days" if pd.notna(cycle) else "its usual gap"
     since_s = f"{int(round(float(since)))} days" if pd.notna(since) else "unknown"
     last_bit = f" Last billed {last}." if last else ""
+    if action == ACTION_RETIRED:
+        sid = str(getattr(row, "store_id", "") or "")
+        run_rate = float(getattr(row, "run_rate_mt", 0) or 0)
+        return (
+            f"{name} ({sid}) is not on the universe file and no live code took over its name. "
+            f"Off the beat: not due, not lapsed, Ask 0; its {_kg_text(run_rate)} run-rate is outside Expected.{last_bit} "
+            f"Still open? Add it to the universe. Re-coded? Retire it there under the new code."
+        )
+    if action == ACTION_SUPERSEDED:
+        sid = str(getattr(row, "store_id", "") or "")
+        new_id = str(getattr(row, "superseded_by", "") or "")
+        return (
+            f"{name} ({sid}) was re-coded to {new_id}: it stopped billing when the new code started under the same "
+            f"DSR / route. Its history now sits on {new_id}, so this code is not a door.{last_bit} "
+            f"Retire {sid} in the universe file so the shop is listed once."
+        )
     if action == ACTION_CALL:
         if ams <= 1e-9 and float(getattr(row, "expected_drop_mt", 0) or 0) <= 1e-9:
             return (
@@ -654,7 +776,8 @@ def _instruction(row: Any) -> str:
         )
     if action == ACTION_RECOVER:
         if pd.notna(cycle):
-            cut = f"(cut-off is {int(LAPSE_MULTIPLIER)}× the {cycle_s} cycle)"
+            cut_days = int(round(lapse_cutoff_days(float(cycle), measured=True)))
+            cut = f"(cut-off is {cut_days} days: {int(LAPSE_MULTIPLIER)}× the {cycle_s} cycle, never under {int(LAPSE_MIN_DAYS)})"
         else:
             cut = "(no purchase in the last 90 days)"
         return f"Lapsed — lost door: {name} has been quiet {since_s} {cut}. Ask is 0.{last_bit}"
@@ -755,6 +878,11 @@ def action_buckets(shops: pd.DataFrame) -> dict[str, float]:
     if shops is None or shops.empty:
         return empty
     g = shops
+    if "action" in g.columns:
+        # Retired / superseded codes are not doors: no Expected, no Ask.
+        g = g.loc[~g["action"].astype(str).isin(OFF_BEAT_ACTIONS)]
+        if g.empty:
+            return empty
     ask = pd.to_numeric(g["week_target_mt"], errors="coerce").fillna(0) if "week_target_mt" in g.columns else pd.Series(0.0, index=g.index)
     action = g["action"] if "action" in g.columns else pd.Series("", index=g.index)
     coming = g["coming_due"].fillna(False) if "coming_due" in g.columns else pd.Series(False, index=g.index)
@@ -1393,6 +1521,11 @@ def _sql_shops_to_raw(df: pd.DataFrame | None) -> pd.DataFrame:
     for flag in ("is_lapsed", "is_cold_start"):
         if flag in out.columns:
             out[flag] = pd.to_numeric(out[flag], errors="coerce").fillna(0).astype(bool)
+    if "in_universe" in out.columns:
+        out["in_universe"] = pd.to_numeric(out["in_universe"], errors="coerce").fillna(1).astype(int)
+    for col in ("continues_codes", "superseded_by"):
+        if col in out.columns:
+            out[col] = out[col].fillna("").astype(str)
     return out
 
 
@@ -1453,6 +1586,10 @@ def _raw_shops_to_sql(df: pd.DataFrame, period: str) -> pd.DataFrame:
         "not_yet_due_mt",
         "pipeline_expected_mt",
         "recommended_action",
+        "in_universe",
+        "continues_codes",
+        "superseded_by",
+        "run_rate_mt",
     ]
     for col in cols:
         if col not in out.columns:

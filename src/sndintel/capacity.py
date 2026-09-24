@@ -130,7 +130,7 @@ def present_capacity_table(df: pd.DataFrame, n: int = 15) -> pd.DataFrame:
             "Visit %": [None if pd.isna(v) else int(round(float(v) * 100)) for v in show.get("visit_rate", [])],
             "Strike of visits %": [None if pd.isna(v) else int(round(float(v) * 100)) for v in show.get("strike_of_visits", [])],
             "Span ×": [None if pd.isna(v) else round(float(v), 1) for v in show.get("span_unique", [])],
-            "Gap (MT)": [None if pd.isna(v) else round(float(v), 0) for v in rec],
+            "Gap (MT)": [None if pd.isna(v) else round(float(v), 2) for v in rec],
             "Why": list(show.get("why", [])),
         }
     )
